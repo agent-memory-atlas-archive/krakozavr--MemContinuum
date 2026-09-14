@@ -2128,6 +2128,38 @@ second `for-path` call fetching that text separately, so one hook run walks
 the store at most once per candidate, and makes exactly one `for-path`
 invocation for whichever candidate matches.
 
+**A `git worktree` of a wired code root is remapped, not indexed.**
+`MEMCONTINUUM_CODE_ROOTS`/`MEMCONTINUUM_STRIP_PREFIX` name absolute paths fixed
+at repo-init time, so a `git worktree add` checkout is a different absolute
+directory nothing wired — every candidate above (raw path, cwd-relative,
+STRIP_PREFIX forms) comes up empty for a file edited there, the same way a
+genuinely unbound file does. `mc_remap_worktree_path` (`hooks/mc-path-lib.sh`)
+is tried exactly once, only after every other candidate has already failed:
+if the edited file's `git rev-parse --git-common-dir` matches a configured
+code root's own `.git`, the file is treated as though it were the same path
+in the main checkout (fed back through the same candidate list above) —
+the worktree's own content is never read into the index; only the path is
+remapped. A worktree of some OTHER, unwired repo is never remapped onto
+this project's records (`git rev-parse` still confirms a worktree, but no
+configured root's `.git` matches) — logged as `worktree-unwired`; when git
+itself cannot settle the question, `worktree-unresolved`. The same remap
+runs in `hooks/ledger-post-edit.sh`'s own root-containment check, once it
+too has already found nothing — there the ledger row is recorded under the
+main-checkout path/root (so `memidx.py unmapped --code-root` sees it), with
+`content_sha256` still read from the file that was actually edited and the
+real path kept visible on the row as `worktree_path`. Both remap attempts
+cost nothing beyond a single `git rev-parse` for the rare case where a `.git`
+entry exists somewhere on the file's ancestor chain at all — a file already
+under a configured root, or not in any git checkout whatsoever, never spawns
+git. This closes the gap in each hook's own logic; it does not change which
+paths the harness LAUNCHES either hook for at all — `pre-edit-chain.sh`'s
+settings-level `"if"` filter is still a literal, per-code-root path glob
+(`templates/code-root-filter-pair.json.tmpl`), so a worktree checked out as
+a sibling of the wired root (rather than inside it) never reaches the script
+in the first place under the current settings rendering; `ledger-post-edit.sh`
+has no such filter (design R6, "fires for EVERY tool") and closes the gap
+end-to-end.
+
 **A positive match off a non-`current` index stays usable; a negative claim
 does not.** `upgrade-required`, `stale`, and `quarantined` all warn and
 proceed — a hit found there is real evidence, not withheld just because the

@@ -802,6 +802,170 @@ class TestPreEditChainRootAndStaleWarning(unittest.TestCase):
         self.assertIn("--with-chain-text", for_path_calls[0], for_path_calls[0])
 
 
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPreEditChainWorktreeGap(unittest.TestCase):
+    """Worktree gap fix (docs/internal/SESSION-HANDOFF-releases-0.3-to-0.6.md
+    SS"0.2.0 final" item 1): mc_remap_worktree_path (hooks/mc-path-lib.sh),
+    tried only once every existing candidate has already failed for
+    FILE_PATH itself. repo_a is wired (MEMCONTINUUM_STRIP_PREFIX names it);
+    repo_b is a second, real git repo that is never wired at all -- its own
+    worktree must never be remapped onto repo_a's records."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-hook-worktree-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+        self.memtool_home = str(Path(self.tmp) / "memcontinuum-home")
+        os.makedirs(self.memtool_home, exist_ok=True)
+        self.project = "hookwttest"
+        args = type(
+            "Args", (), dict(
+                root=str(SCHEMA_FIXTURE_ROOT), project=self.project,
+                db=str(Path(self.memtool_home) / f"{self.project}.sqlite"),
+                full=True, no_embed=True,
+            ),
+        )()
+        memidx.cmd_reindex(args)
+
+        def _git_repo(path, files):
+            path.mkdir(parents=True)
+            for rel, content in files.items():
+                fp = path / rel
+                fp.parent.mkdir(parents=True, exist_ok=True)
+                fp.write_text(content)
+            for cmd in (
+                ["git", "init", "-q"],
+                ["git", "config", "user.email", "t@t.local"],
+                ["git", "config", "user.name", "t"],
+            ):
+                subprocess.run(cmd, cwd=path, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=path, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+
+        # repo_a: the wired code root -- its tree matches fixtures/schema's
+        # own code_refs (src/core/scan/scan_plan.py -> TOP-0042).
+        self.repo_a = Path(self.tmp) / "repo-a"
+        _git_repo(self.repo_a, {"src/core/scan/scan_plan.py": "# a\n"})
+        self.repo_a_wt = Path(self.tmp) / "repo-a-wt"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "wt-a", str(self.repo_a_wt)],
+            cwd=self.repo_a, check=True,
+        )
+
+        # repo_b: a real repo, never wired -- its worktree must stay unwired.
+        self.repo_b = Path(self.tmp) / "repo-b"
+        _git_repo(self.repo_b, {"src/other.py": "# b\n"})
+        self.repo_b_wt = Path(self.tmp) / "repo-b-wt"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "wt-b", str(self.repo_b_wt)],
+            cwd=self.repo_b, check=True,
+        )
+
+    def _env(self, **overrides):
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+            MEMCONTINUUM_STRIP_PREFIX=str(self.repo_a) + "/",
+        )
+        env.update(overrides)
+        return env
+
+    def _payload(self, file_path, cwd="/some/unrelated/parent-dir"):
+        return json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Edit",
+                "cwd": cwd,
+                "tool_input": {"file_path": file_path},
+            }
+        )
+
+    def _last_outcome_line(self, log_text):
+        matching = [l for l in log_text.splitlines() if "outcome=" in l]
+        self.assertTrue(matching, log_text)
+        return matching[-1]
+
+    def test_worktree_of_wired_repo_gets_same_chain_as_main(self):
+        wt_path = str(self.repo_a_wt / "src" / "core" / "scan" / "scan_plan.py")
+        proc, _ = run_hook(self._payload(wt_path), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout.strip(), "expected additionalContext, got nothing")
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("TOP-0042", ctx)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn("outcome=matched", self._last_outcome_line(log_text))
+
+    def test_main_checkout_of_wired_repo_still_matches_unchanged(self):
+        main_path = str(self.repo_a / "src" / "core" / "scan" / "scan_plan.py")
+        proc, _ = run_hook(self._payload(main_path), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertIn("TOP-0042", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_worktree_of_unwired_repo_distinct_outcome_no_chain(self):
+        wt_path = str(self.repo_b_wt / "src" / "other.py")
+        proc, _ = run_hook(self._payload(wt_path), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn("outcome=worktree-unwired", self._last_outcome_line(log_text))
+
+    def test_main_checkout_miss_pays_no_git_call(self):
+        """requirement 1: a lookup on a path already inside a configured
+        root pays no extra `git` call. A fake `git` that both leaves a
+        marker AND fails outright proves both halves at once: if it were
+        ever invoked, either the marker or a crash would show it."""
+        fake_git_dir = Path(self.tmp) / "fake-git-bin-noop"
+        fake_git_dir.mkdir()
+        marker = Path(self.tmp) / "git-was-called"
+        fake_git = fake_git_dir / "git"
+        fake_git.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n")
+        fake_git.chmod(0o755)
+
+        miss_path = self.repo_a / "src" / "core" / "scan" / "unbound.py"
+        miss_path.write_text("# unbound, no code_ref binds this\n")
+        env = self._env(PATH=f"{fake_git_dir}:{os.environ.get('PATH', '')}")
+        proc, _ = run_hook(self._payload(str(miss_path)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        self.assertFalse(marker.exists(), "git must not be invoked for a path already under a configured root")
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn("outcome=no-match", self._last_outcome_line(log_text))
+
+    def test_git_failure_on_worktree_gives_unresolved_not_crash(self):
+        fake_git_dir = Path(self.tmp) / "fake-git-bin-fail"
+        fake_git_dir.mkdir()
+        fake_git = fake_git_dir / "git"
+        fake_git.write_text("#!/bin/sh\nexit 128\n")
+        fake_git.chmod(0o755)
+
+        wt_path = str(self.repo_a_wt / "src" / "core" / "scan" / "scan_plan.py")
+        env = self._env(PATH=f"{fake_git_dir}:{os.environ.get('PATH', '')}")
+        proc, _ = run_hook(self._payload(wt_path), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn("outcome=worktree-unresolved", self._last_outcome_line(log_text))
+
+    def test_stats_counts_the_new_outcomes(self):
+        wt_path = str(self.repo_b_wt / "src" / "other.py")
+        run_hook(self._payload(wt_path), self._env())
+        # memidx.py stats is dynamic per outcome name (kind="pre-edit"
+        # tallies every outcome string it sees, no fixed list) -- exercised
+        # end-to-end via the CLI, matching how a real operator would check.
+        result = subprocess.run(
+            [VENV_PYTHON, str(TOOLS_DIR / "memidx.py"), "stats",
+             "--home", self.memtool_home, "--project", self.project, "--json"],
+            capture_output=True, text=True, env=clean_env(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        pre_edit_outcomes = payload.get("pre_edit", {}).get("outcomes", {})
+        self.assertIn("worktree-unwired", pre_edit_outcomes, payload)
+
+
 class TestF6RenderedTimeout(unittest.TestCase):
     """The OUTER Claude Code backstop: `code-root-filter-pair.json.tmpl`
     renders `"timeout": 5` on both the Edit and Write PreToolUse command
