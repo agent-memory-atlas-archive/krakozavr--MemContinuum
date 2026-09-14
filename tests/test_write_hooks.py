@@ -1163,6 +1163,21 @@ class TestLedgerPostEditWorktreeGap(HookTestBase):
             cwd=self.repo_b, check=True,
         )
 
+    def _env(self, **overrides):
+        # Resolved, same convention test_bash_edit_under_a_worktree_code_
+        # root_is_still_diffed already uses (and real repo-init.sh wiring
+        # always does, via os.path.realpath at render time): on macOS CI,
+        # tempfile's own tmpdir sits behind a /var -> /private/var symlink,
+        # so an UNRESOLVED MEMCONTINUUM_CODE_ROOT here would silently diverge
+        # from mc_remap_worktree_path's own `cd && pwd -P` resolution the
+        # instant it's compared -- resolving up front keeps this test class
+        # platform-independent rather than accidentally Linux-only.
+        return self.base_env(
+            MEMCONTINUUM_CODE_ROOT=str(self.code_root.resolve()),
+            MEMCONTINUUM_CODE_ROOTS=json.dumps([str(self.code_root.resolve())]),
+            **overrides,
+        )
+
     def _last_outcome_line(self, log_text):
         matching = [l for l in log_text.splitlines() if "ledger outcome=" in l]
         self.assertTrue(matching, log_text)
@@ -1172,10 +1187,10 @@ class TestLedgerPostEditWorktreeGap(HookTestBase):
         session_id = "s-ledger-wt-wired"
         wt_file = str(self.code_root_wt / "src" / "mapped.py")
         payload = self.post_tool_use_payload(session_id, wt_file)
-        proc, _ = run_script(LEDGER_HOOK, payload, self.base_env())
+        proc, _ = run_script(LEDGER_HOOK, payload, self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
-        main_path = str(self.code_root / "src" / "mapped.py")
+        main_path = str((self.code_root / "src" / "mapped.py").resolve())
         state = self.load_state(session_id)
         entry = [e for e in state["ledger"] if e["path"] == main_path]
         self.assertEqual(len(entry), 1, state.get("ledger"))
@@ -1197,10 +1212,10 @@ class TestLedgerPostEditWorktreeGap(HookTestBase):
         wt_target = self.code_root_wt / "src" / "mapped.py"
         wt_target.write_text("# mapped, changed ONLY in the worktree\n")
         payload = self.post_tool_use_payload(session_id, str(wt_target))
-        proc, _ = run_script(LEDGER_HOOK, payload, self.base_env())
+        proc, _ = run_script(LEDGER_HOOK, payload, self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         state = self.load_state(session_id)
-        main_path = str(self.code_root / "src" / "mapped.py")
+        main_path = str((self.code_root / "src" / "mapped.py").resolve())
         entry = [e for e in state["ledger"] if e["path"] == main_path][0]
         expected_sha = hashlib.sha256(wt_target.read_bytes()).hexdigest()
         self.assertEqual(entry["content_sha256"], expected_sha)
@@ -1208,12 +1223,12 @@ class TestLedgerPostEditWorktreeGap(HookTestBase):
     def test_worktree_path_cleared_on_a_later_main_checkout_edit(self):
         session_id = "s-ledger-wt-clear"
         wt_file = str(self.code_root_wt / "src" / "mapped.py")
-        run_script(LEDGER_HOOK, self.post_tool_use_payload(session_id, wt_file), self.base_env())
-        main_path = str(self.code_root / "src" / "mapped.py")
+        run_script(LEDGER_HOOK, self.post_tool_use_payload(session_id, wt_file), self._env())
+        main_path = str((self.code_root / "src" / "mapped.py").resolve())
         state = self.load_state(session_id)
         self.assertIn("worktree_path", [e for e in state["ledger"] if e["path"] == main_path][0])
 
-        run_script(LEDGER_HOOK, self.post_tool_use_payload(session_id, main_path), self.base_env())
+        run_script(LEDGER_HOOK, self.post_tool_use_payload(session_id, main_path), self._env())
         state2 = self.load_state(session_id)
         entry2 = [e for e in state2["ledger"] if e["path"] == main_path][0]
         self.assertNotIn("worktree_path", entry2)
@@ -1222,7 +1237,7 @@ class TestLedgerPostEditWorktreeGap(HookTestBase):
         session_id = "s-ledger-wt-unwired"
         wt_file = str(self.repo_b_wt / "src" / "other.py")
         payload = self.post_tool_use_payload(session_id, wt_file)
-        proc, _ = run_script(LEDGER_HOOK, payload, self.base_env())
+        proc, _ = run_script(LEDGER_HOOK, payload, self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "")
         state = self.load_state(session_id)
@@ -1242,11 +1257,14 @@ class TestLedgerPostEditWorktreeGap(HookTestBase):
         session_id = "s-ledger-wt-nogit"
         fpath = str(self.code_root / "src" / "mapped.py")
         payload = self.post_tool_use_payload(session_id, fpath)
-        env = self.base_env(PATH=f"{fake_git_dir}:{os.environ.get('PATH', '')}")
+        env = self._env(PATH=f"{fake_git_dir}:{os.environ.get('PATH', '')}")
         proc, _ = run_script(LEDGER_HOOK, payload, env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse(marker.exists(), "git must not be invoked for a path already under a configured root")
         state = self.load_state(session_id)
+        # No remap fires here (already under the configured root) -- the
+        # ledger row's path is FILE_PATH exactly as passed in, same as
+        # every pre-existing (non-worktree) ledger test already asserts.
         self.assertIn(fpath, [e["path"] for e in state.get("ledger", [])])
 
     def test_outside_scope_edit_pays_no_git_call(self):
@@ -1264,7 +1282,7 @@ class TestLedgerPostEditWorktreeGap(HookTestBase):
         session_id = "s-ledger-wt-nogit-outside"
         fpath = "/tmp/somewhere/else/not-in-any-repo.py"
         payload = self.post_tool_use_payload(session_id, fpath)
-        env = self.base_env(PATH=f"{fake_git_dir}:{os.environ.get('PATH', '')}")
+        env = self._env(PATH=f"{fake_git_dir}:{os.environ.get('PATH', '')}")
         proc, _ = run_script(LEDGER_HOOK, payload, env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse(marker.exists())
@@ -1281,7 +1299,7 @@ class TestLedgerPostEditWorktreeGap(HookTestBase):
         session_id = "s-ledger-wt-gitfail"
         wt_file = str(self.code_root_wt / "src" / "mapped.py")
         payload = self.post_tool_use_payload(session_id, wt_file)
-        env = self.base_env(PATH=f"{fake_git_dir}:{os.environ.get('PATH', '')}")
+        env = self._env(PATH=f"{fake_git_dir}:{os.environ.get('PATH', '')}")
         proc, _ = run_script(LEDGER_HOOK, payload, env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "")
