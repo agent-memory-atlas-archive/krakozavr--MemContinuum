@@ -2508,7 +2508,16 @@ class TestNoMachineIdentifyingContent(unittest.TestCase):
         disallowed = {rel: hits for rel, hits in offenders.items() if rel != "LICENSE"}
         self.assertEqual(
             disallowed, {},
-            f"machine-identifying content found outside the allowed LICENSE exception: {disallowed}",
+            "machine-identifying content found outside the allowed LICENSE "
+            f"exception: {disallowed}. This is not a local-only artifact: "
+            "each offending path is either already tracked, or untracked "
+            "and NOT gitignored -- one `git add -A` away from reaching "
+            "history in what may become a public repo (this project has "
+            "forced a history rewrite over exactly this before). Fix by "
+            "either gitignoring the path (if it is per-machine install "
+            "wiring, not project source) or scrubbing the machine-specific "
+            "content from it (if it must stay tracked or untracked-but-"
+            "visible) -- never by weakening this test.",
         )
 
     def test_untracked_offender_is_reported(self):
