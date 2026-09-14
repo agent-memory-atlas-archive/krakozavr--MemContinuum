@@ -4,7 +4,9 @@ __pycache__/
 .venv/
 fixtures/records/
 memory/
-.venv/
 docs/internal/
-.claude/skills/
+# per-machine install wiring rendered by scripts/repo-init.sh (rules,
+# skills, settings, and any ad hoc backups) -- never project source; root
+# only, so a nested .claude/ inside a fixture/corpus tree is unaffected
+/.claude/
 tests/mac_smoke.local
