@@ -1202,7 +1202,7 @@ class TestSkillHonesty(unittest.TestCase):
     def test_undecided_names_all_four_options_exactly(self):
         options = self._state_options(SKILL.read_text(), "**`undecided`**", "**`partial-wired`**")
         self.assertEqual(options, [
-            "Yes, with code retrieval — records, plus decisions surfaced before edits under the named code root",
+            "Yes, with code retrieval — records, plus decisions surfaced automatically when edits touch the named code root",
             "Yes, rationale only — records, no code retrieval",
             "No — record the decline; this repo is never asked again",
             "Not now — nothing is recorded; run `/memcontinuum` again to decide",
@@ -2211,6 +2211,425 @@ class TestNoRephrasedAskPromiseMutations(unittest.TestCase):
         )
         self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
         self._assert_guard_catches("UPDATE_SH", mutated)
+
+
+# --------------------------------------------------------------------------
+# Pre-edit delivery-ordering claim (TOP-0131 L2): the README, DESIGN.md,
+# INTERNALS.md, and SKILL.md all claimed, in different words, that the
+# governing decision chain reaches the model BEFORE it edits the file the
+# chain governs. Measured false on both Claude Code and Codex 0.154.0: a
+# PreToolUse hook matches on tool_input, which exists only once the model
+# has already emitted the Edit/Write call with its final content, so no
+# pre-tool hook on either runtime can shape the content of the edit that
+# triggered it. What remains true, and is what the corrected prose says
+# instead: the hook's lookup still runs, and completes, before that edit
+# reaches disk, and what it finds arrives with that same tool call's
+# result -- in the same turn, before the agent's next action -- governing
+# what happens next rather than the edit that triggered the lookup.
+#
+# Shape-anchored, same disclosed-limit design as PROMISE_TO_BE_ASKED_
+# PATTERNS above: a delivery verb (hand/inject/deliver/surface/pull) within
+# a handful of words of "before" and an edit-touching verb, in either
+# order. Deliberately does NOT flag a bare "before it touches/edits/
+# writes" with no delivery verb nearby -- that shape covers genuinely
+# accurate sentences this fix leaves standing (the hook itself running
+# before the file changes, "run code-search before writing a new helper",
+# memory-search's by-hand for-path advice) and flagging it would make the
+# guard fire on prose nobody asked to change. A real rephrase of the
+# retired claim almost always pairs a delivery verb with "before" close
+# enough to catch; a novel rephrase using neither is not caught here and
+# needs a reviewer, same disclosed gap TestNoRephrasedAskPromise names for
+# its own claim.
+PRE_EDIT_DELIVERY_PATTERNS = [
+    # "hands/injects/delivers/surfaces/pulls ... before ... touches/edits/
+    # writes/reaches disk"
+    re.compile(
+        r"\b(?:hands?|handed|injects?|injected|delivers?|delivered|"
+        r"surfaces?|surfaced|pulls?|pulled)\b"
+        r"(?:\s+\S+){0,6}\s+before\s+(?:\S+\s+){0,4}"
+        r"(?:touch(?:es)?|edits?|writ(?:e|es|ing|ten)|reaches?\s+disk)\b",
+        re.IGNORECASE,
+    ),
+    # "before ... touches/edits/writes ... hands/injects/delivers" -- the
+    # reverse clause order the retired README sentences actually used
+    # ("handed to them before they touch a file")
+    re.compile(
+        r"\bbefore\b(?:\s+\S+){0,6}\s+"
+        r"(?:touch(?:es)?|edits?|writ(?:e|es|ing|ten))\b"
+        r"(?:\s+\S+){0,20}\s+"
+        r"(?:hands?|handed|injects?|injected|delivers?|delivered)\b",
+        re.IGNORECASE,
+    ),
+]
+
+def _pre_edit_delivery_offenders(path):
+    """Every PRE_EDIT_DELIVERY_PATTERNS hit in `path`, whitespace-
+    normalized first (the same hard-wrap reasoning as
+    `_ask_promise_offenders` above)."""
+    normalized = " ".join(path.read_text().split())
+    offenders = []
+    for pattern in PRE_EDIT_DELIVERY_PATTERNS:
+        for m in pattern.finditer(normalized):
+            snippet = normalized[max(0, m.start() - 30):m.end() + 30]
+            offenders.append(f"{path.name}: ...{snippet}...")
+    return offenders
+
+
+class TestNoRephrasedPreEditDeliveryClaim(unittest.TestCase):
+    """Semantic companion to TestPreEditDeliveryClaimCorrected's exact-
+    phrase pins, same relationship TestNoRephrasedAskPromise has to
+    TestConsentIsManualNotAutomatic: the exact-phrase pins catch the
+    retired sentences returning verbatim; this catches the same claim
+    coming back in different words across README.md, docs/DESIGN.md,
+    docs/INTERNALS.md, skills/memcontinuum/SKILL.md, skills/memory-search/
+    SKILL.md, and hooks/install-hooks.md.
+
+    hooks/pre-edit-chain.sh's own header is deliberately NOT scanned here:
+    its first line ("before an Edit/Write touches a file, look up ...") is
+    an accurate description of when THAT SCRIPT runs (before the edit
+    reaches disk), and shell-comment provenance is outside this module's
+    public-docs scan by its own top-of-file rule; the delivery-point
+    clarification this fix added right below that line is a code
+    annotation, not user-facing prose, and is checked directly in
+    TestPreEditChainHeaderAnnotated below instead.
+
+    Reads the bare module globals README/DESIGN/INTERNALS/SKILL/
+    SEARCH_SKILL/INSTALL_HOOKS at call time (not a pre-bound list), same as
+    TestNoRephrasedAskPromise's own method -- a first version of this test
+    built a module-level list of these six Path objects once at import
+    time, which meant TestPreEditDeliveryClaimMutations pointing the
+    module global at a mutated temp file left that list holding the
+    ORIGINAL path anyway, silently. Caught by this class's own mutation
+    tests failing to fail; fixed by inlining the tuple in the method body
+    below, exactly the shape that already lets Python resolve each bare
+    name against the module's current global on every call."""
+
+    def test_no_doc_claims_the_chain_is_delivered_before_the_edit(self):
+        offenders = []
+        for doc in (README, DESIGN, INTERNALS, SKILL, SEARCH_SKILL, INSTALL_HOOKS):
+            offenders.extend(_pre_edit_delivery_offenders(doc))
+        self.assertEqual(
+            offenders, [],
+            "user-facing text claims the governing decision chain reaches "
+            "the model before it edits the file the chain governs (TOP-0131 "
+            "L2): a PreToolUse hook matches on tool_input, which exists "
+            "only once the model has already emitted the Edit/Write call "
+            f"with its final content -- nothing here may claim otherwise: {offenders}",
+        )
+
+
+class TestPreEditDeliveryClaimCorrected(unittest.TestCase):
+    """Exact-phrase pins for TOP-0131 L2: the retired before-the-edit
+    phrasing must never come back in README.md, docs/DESIGN.md,
+    docs/INTERNALS.md, or skills/memcontinuum/SKILL.md, and each file's
+    corrected paragraph must keep naming the load-bearing facts -- that the
+    model has already composed the edit by the time the hook runs, and
+    that what the hook finds arrives with that same call's result, in the
+    same turn, governing what happens next rather than the edit that
+    triggered the lookup."""
+
+    def test_readme_retired_phrasing_gone(self):
+        text = README.read_text()
+        self.assertNotRegex(
+            text,
+            r"Before\s+one\s+of\s+those\s+touches\s+a\s+file,\s+a\s+hook\s+"
+            r"looks\s+up\s+whatever\s+decision\s+governs\s+that\s+file\s+"
+            r"and\s+hands\s+it\s+over",
+            "README must not claim the hook hands over the governing "
+            "decision before the edit touches the file -- the tool call "
+            "already carries its final content by the time the hook runs.",
+        )
+        self.assertNotRegex(
+            text,
+            r"handed\s+to\s+them\s+before\s+they\s+touch\s+a\s+file\s+with\s+"
+            r"the\s+Edit\s+or\s+Write\s+tools",
+            "README must not claim subagents are handed the decision "
+            "history before they touch a file with Edit/Write.",
+        )
+
+    def test_readme_corrected_substance_present(self):
+        text = README.read_text()
+        normalized = " ".join(text.split())
+        self.assertIn(
+            "the model has already composed the edit's own content", normalized
+        )
+        self.assertIn("cannot have shaped that particular edit", normalized)
+        self.assertIn(
+            "after the subagent has already composed the edit, not before it",
+            normalized,
+        )
+        self.assertIn("same turn", normalized)
+
+    def test_design_retired_phrasing_gone(self):
+        text = DESIGN.read_text()
+        self.assertNotRegex(
+            text,
+            r"injects\s+it\s+as\s+context\s+\*at\s+the\s+moment\s+of\s+the\s+"
+            r"edit\*,\s+before\s+any\s+code\s+gets\s+written",
+            "DESIGN.md must not claim the hook injects context at the "
+            "moment of the edit, before any code gets written.",
+        )
+
+    def test_design_corrected_substance_present(self):
+        text = DESIGN.read_text()
+        normalized = " ".join(text.split())
+        self.assertIn(
+            "a tool call already carries its final content the instant "
+            "the model emits it",
+            normalized,
+        )
+        self.assertIn("cannot shape that particular edit", normalized)
+        self.assertIn("forced, automatic retrieval", normalized)
+
+    def test_internals_retired_phrasing_gone(self):
+        text = INTERNALS.read_text()
+        self.assertNotRegex(
+            text,
+            r"Structured\s+edits\s+get\s+pre-retrieval,\s+before\s+the\s+"
+            r"edit\s+happens",
+            "docs/INTERNALS.md must not claim structured edits get "
+            "pre-retrieval before the edit happens.",
+        )
+
+    def test_internals_corrected_substance_present(self):
+        text = INTERNALS.read_text()
+        normalized = " ".join(text.split())
+        self.assertIn(
+            "the tool call already carries its final content by the time "
+            "the hook runs",
+            normalized,
+        )
+        self.assertIn("governs the agent's next move", normalized)
+
+    def test_skill_retired_phrasing_gone(self):
+        text = SKILL.read_text()
+        self.assertNotRegex(
+            text,
+            r"decisions\s+surfaced\s+before\s+edits\s+under\s+the\s+named\s+"
+            r"code\s+root",
+            "SKILL.md's code-retrieval option must not claim decisions are "
+            "surfaced before edits.",
+        )
+
+    def test_skill_corrected_substance_present(self):
+        text = SKILL.read_text()
+        normalized = " ".join(text.split())
+        self.assertIn(
+            "decisions surfaced automatically when edits touch the named "
+            "code root",
+            normalized,
+        )
+
+
+class TestPreEditChainHeaderAnnotated(unittest.TestCase):
+    """hooks/pre-edit-chain.sh's own header describes the delivery point
+    (its first line: "before an Edit/Write touches a file ... inject the
+    compressed chain view(s) as additionalContext") -- accurate about when
+    the script runs, silent on when the model actually sees its output.
+    Project rule: code that does not behave as the reader would infer from
+    its own comment gets annotated at its source (TOP-0131 L2), not left
+    to the public docs alone to correct."""
+
+    def test_header_names_the_actual_delivery_point(self):
+        text = (TOOLS_DIR / "hooks" / "pre-edit-chain.sh").read_text()
+        # Strip each line's leading "# " comment marker before collapsing
+        # whitespace -- a bare join-then-split would otherwise leave a
+        # stray "#" token wherever a sentence wraps onto the next comment
+        # line, splitting a pinned phrase that spans a wrap in two.
+        uncommented = "\n".join(
+            line[1:] if line.startswith("#") else line
+            for line in text.splitlines()
+        )
+        normalized = " ".join(uncommented.split())
+        self.assertIn("Delivery point", text)
+        self.assertIn(
+            "no PreToolUse hook on either runtime can shape the content of "
+            "the edit that triggered it",
+            normalized,
+        )
+        self.assertIn("TOP-0131", text)
+
+
+class TestPreEditDeliveryClaimMutations(unittest.TestCase):
+    """Proves the two classes above actually catch what they claim to,
+    against the REAL production test methods -- same house rule
+    TestSkillHonestyMutations and TestNoRephrasedAskPromiseMutations follow
+    above: a test that pins a string is not a guard until something has
+    tried to defeat it. Two defeats per corrected file: restoring the
+    retired sentence verbatim (must fail the exact-phrase pin), and
+    replacing the corrected sentence with a same-shape rephrase that uses
+    none of the retired sentence's own words (must fail the semantic
+    guard, proving it is not just a second copy of the exact-phrase
+    check)."""
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _mutated_doc(varname, mutated_text):
+        """Point the module-level global named `varname` ("README",
+        "DESIGN", "INTERNALS", or "SKILL") at a temp file holding
+        `mutated_text` for the duration of the `with` block, then restore
+        it -- same helper shape as TestNoRephrasedAskPromiseMutations's own
+        `_mutated_doc`, generalized to whichever four globals this claim's
+        tests read."""
+        module = sys.modules[__name__]
+        real_path = getattr(module, varname)
+        fd, tmp_name = tempfile.mkstemp(suffix=".md")
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(mutated_text)
+            setattr(module, varname, tmp_path)
+            yield
+        finally:
+            setattr(module, varname, real_path)
+            tmp_path.unlink(missing_ok=True)
+
+    def _assert_pin_catches(self, varname, mutated_text, test_name):
+        with self._mutated_doc(varname, mutated_text):
+            test = TestPreEditDeliveryClaimCorrected(test_name)
+            with self.assertRaises(
+                AssertionError,
+                msg=f"TestPreEditDeliveryClaimCorrected.{test_name} did "
+                    "not fail against the mutation",
+            ):
+                getattr(test, test_name)()
+
+    def _assert_semantic_guard_catches(self, varname, mutated_text):
+        with self._mutated_doc(varname, mutated_text):
+            test = TestNoRephrasedPreEditDeliveryClaim(
+                "test_no_doc_claims_the_chain_is_delivered_before_the_edit"
+            )
+            with self.assertRaises(
+                AssertionError,
+                msg="TestNoRephrasedPreEditDeliveryClaim did not fail "
+                    "against the mutation",
+            ):
+                test.test_no_doc_claims_the_chain_is_delivered_before_the_edit()
+
+    def test_readme_restoring_retired_wording_is_caught(self):
+        text = README.read_text()
+        corrected = (
+            "Before one of those edits reaches disk, a hook\n"
+            "looks up whatever decision governs that file — but by the time the hook runs,\n"
+            "the model has already composed the edit's own content, so what the hook finds\n"
+            "cannot have shaped that particular edit. It comes back with that same tool\n"
+            "call's result, in the same turn: the agent sees the governing chain before\n"
+            "doing anything else, in time to keep its next move consistent with it, even\n"
+            "though the edit that triggered the lookup already happened."
+        )
+        self.assertIn(corrected, text, "fixture stale: corrected paragraph not found")
+        old = (
+            "Before one of those touches a file, a hook looks\n"
+            "up whatever decision governs that file and hands it over."
+        )
+        mutated = text.replace(corrected, old, 1)
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_pin_catches("README", mutated, "test_readme_retired_phrasing_gone")
+
+    def test_readme_rephrase_is_caught_by_semantic_guard(self):
+        text = README.read_text()
+        corrected = (
+            "the agent sees the governing chain before\n"
+            "doing anything else, in time to keep its next move consistent with it, even\n"
+            "though the edit that triggered the lookup already happened."
+        )
+        self.assertIn(corrected, text, "fixture stale: corrected sentence not found")
+        # Same claim, none of the retired sentence's own words: the
+        # exact-phrase pin above would not catch this, only the guard's
+        # delivery-verb/before/edit-verb shape can.
+        rephrase = (
+            "the store delivers the governing chain to the agent before it "
+            "edits the file that chain governs."
+        )
+        mutated = text.replace(corrected, rephrase, 1)
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_semantic_guard_catches("README", mutated)
+
+    def test_design_restoring_retired_wording_is_caught(self):
+        text = DESIGN.read_text()
+        corrected = (
+            "looks up whatever the file being edited is governed by and hands the result\n"
+            "back automatically, for every edit made through the Edit and Write tools —\n"
+            "no agent has to remember to ask."
+        )
+        self.assertIn(corrected, text, "fixture stale: corrected sentence not found")
+        old = (
+            "looks up whatever the file being edited is governed by and injects it as\n"
+            "context *at the moment of the edit*, before any code gets written — for\n"
+            "edits made through the Edit and Write tools."
+        )
+        mutated = text.replace(corrected, old, 1)
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_pin_catches("DESIGN", mutated, "test_design_retired_phrasing_gone")
+
+    def test_design_rephrase_is_caught_by_semantic_guard(self):
+        text = DESIGN.read_text()
+        marker = "That is\nforced, automatic retrieval,"
+        self.assertIn(marker, text, "fixture stale: marker not found")
+        rephrase = (
+            "This hook delivers that ruling to the agent before it writes the "
+            "file the ruling governs. That is\nforced, automatic retrieval,"
+        )
+        mutated = text.replace(marker, rephrase, 1)
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_semantic_guard_catches("DESIGN", mutated)
+
+    def test_internals_restoring_retired_wording_is_caught(self):
+        text = INTERNALS.read_text()
+        corrected = (
+            "edits get automatic retrieval — the hook's lookup runs and completes before\n"
+            "the edit reaches disk — but only for the `Edit` and `Write` tools, and only"
+        )
+        self.assertIn(corrected, text, "fixture stale: corrected sentence not found")
+        old = (
+            "edits get pre-retrieval, before the edit happens, but only for the `Edit`\n"
+            "and `Write` tools"
+        )
+        mutated = text.replace(corrected, old, 1)
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_pin_catches("INTERNALS", mutated, "test_internals_retired_phrasing_gone")
+
+    def test_internals_rephrase_is_caught_by_semantic_guard(self):
+        text = INTERNALS.read_text()
+        marker = "**The detector is deliberately unlike the others.**"
+        self.assertIn(marker, text, "fixture stale: marker not found")
+        rephrase = (
+            "The engine hands the governing chain to the agent before it writes "
+            "the file, every time.\n\n" + marker
+        )
+        mutated = text.replace(marker, rephrase, 1)
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_semantic_guard_catches("INTERNALS", mutated)
+
+    def test_skill_restoring_retired_wording_is_caught(self):
+        text = SKILL.read_text()
+        corrected = (
+            "1. Yes, with code retrieval — records, plus decisions surfaced automatically\n"
+            "   when edits touch the named code root"
+        )
+        self.assertIn(corrected, text, "fixture stale: corrected option not found")
+        old = (
+            "1. Yes, with code retrieval — records, plus decisions surfaced before edits\n"
+            "   under the named code root"
+        )
+        mutated = text.replace(corrected, old, 1)
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_pin_catches("SKILL", mutated, "test_skill_retired_phrasing_gone")
+
+    def test_skill_rephrase_is_caught_by_semantic_guard(self):
+        text = SKILL.read_text()
+        corrected = (
+            "1. Yes, with code retrieval — records, plus decisions surfaced automatically\n"
+            "   when edits touch the named code root"
+        )
+        self.assertIn(corrected, text, "fixture stale: corrected option not found")
+        rephrase = (
+            "1. Yes, with code retrieval — records; the store hands each ruling to the "
+            "agent before it edits the code root it governs"
+        )
+        mutated = text.replace(corrected, rephrase, 1)
+        self.assertNotEqual(mutated, text, "fixture stale: nothing matched")
+        self._assert_semantic_guard_catches("SKILL", mutated)
 
 
 if __name__ == "__main__":

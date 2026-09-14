@@ -3,6 +3,16 @@
 # decision-chain topic references it (memidx.py for-path) and, if so, inject
 # the compressed chain view(s) as additionalContext.
 #
+# Delivery point (measured, both Claude Code and Codex 0.154.0, TOP-0131
+# L2): "before an Edit/Write touches a file" above is about when THIS SCRIPT
+# runs, not when the model sees additionalContext. A PreToolUse hook matches
+# on tool_input, which exists only once the model has already emitted the
+# Edit/Write call with its final old_string/new_string -- so no PreToolUse
+# hook on either runtime can shape the content of the edit that triggered
+# it. What this script's output CAN still do: run before that edit reaches
+# disk, and arrive with that same tool call's result in the same turn --
+# governing the agent's next move, not the one that triggered the lookup.
+#
 # Contract (docs/DESIGN.md SS3.1, SS8):
 #   - reads the PreToolUse JSON payload on stdin, extracts tool_input.file_path
 #   - no match / any failure  -> exit 0, no stdout (never blocks the edit)

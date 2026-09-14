@@ -83,8 +83,8 @@ and the habit of writing records.
 
 **`undecided`** — four options:
 
-1. Yes, with code retrieval — records, plus decisions surfaced before edits
-   under the named code root
+1. Yes, with code retrieval — records, plus decisions surfaced automatically
+   when edits touch the named code root
 2. Yes, rationale only — records, no code retrieval
 3. No — record the decline; this repo is never asked again
 4. Not now — nothing is recorded; run `/memcontinuum` again to decide
