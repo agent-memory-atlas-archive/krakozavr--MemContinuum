@@ -899,10 +899,13 @@ class TestLedgerPostEdit(HookTestBase):
         whole run is bounded to the watchdog's own ~2s budget; if the guard
         fell through unguarded, nothing bounds the 6s sleep and the run
         takes ~6s instead."""
-        self.assertFalse(
-            (HOOKS_DIR / ".." / ".venv" / "bin" / "python").resolve().exists(),
-            "this test relies on no engine .venv existing in this checkout",
-        )
+        if (HOOKS_DIR / ".." / ".venv" / "bin" / "python").resolve().exists():
+            self.skipTest(
+                "an engine .venv exists in this checkout (INC-0125) -- this "
+                "test can only prove python resolves through the "
+                "config-pointer chain when no engine venv exists to mask a "
+                "broken chain; see tests/test_env_gate.py"
+            )
         hang_py = Path(self.td) / "hang-python-config-guard"
         hang_py.write_text(
             "#!/usr/bin/env bash\n"
@@ -939,7 +942,21 @@ class TestLedgerPostEdit(HookTestBase):
         MC_GUARD_PY unresolvable (env unset, no engine .venv) -- the guard
         then falls through UNGUARDED and the hang wrapper's 6s sleep is NOT
         bounded by any watchdog, proving the boundedness assertion above is
-        load-bearing, not decoration."""
+        load-bearing, not decoration.
+
+        Carries the same no-engine-.venv precondition as the test above
+        (found missing here, INC-0125): with a real engine .venv present,
+        the broken watchdog's own final fallback (<engine>/.venv/bin/python)
+        resolves to a working interpreter and the run IS bounded, which
+        would read as this control failing to reproduce the pre-fix
+        behavior rather than as an unmet precondition."""
+        if (HOOKS_DIR / ".." / ".venv" / "bin" / "python").resolve().exists():
+            self.skipTest(
+                "an engine .venv exists in this checkout (INC-0125) -- this "
+                "test can only prove the guard falls through unbounded when "
+                "no engine venv exists for its own final fallback to find; "
+                "see tests/test_env_gate.py"
+            )
         original = (HOOKS_DIR / "mc-watchdog.sh").read_text()
         needle = (
             'MEMCONTINUUM_HOME="${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}"\n'

@@ -519,10 +519,13 @@ class TestPreEditChainHook(unittest.TestCase):
         way this hook can resolve a python at all -- proven end to end (the
         hook actually injects the real chain), not just by inspecting the
         resolved path."""
-        self.assertFalse(
-            (TOOLS_DIR / ".venv" / "bin" / "python").exists(),
-            "this test relies on no engine .venv existing in this checkout",
-        )
+        if (TOOLS_DIR / ".venv" / "bin" / "python").exists():
+            self.skipTest(
+                "an engine .venv exists in this checkout (INC-0125) -- this "
+                "test can only prove python resolves through the "
+                "config-pointer chain when no engine venv exists to mask a "
+                "broken chain; see tests/test_env_gate.py"
+            )
         config_sh = Path(self.memtool_home) / "config.sh"
         config_sh.write_text(f'MEMCONTINUUM_PYTHON="{VENV_PYTHON}"\n')
         self.addCleanup(lambda: config_sh.unlink(missing_ok=True))
@@ -558,10 +561,13 @@ class TestPreEditChainHook(unittest.TestCase):
         unresolved. Must follow through to the REAL config.sh at the
         pointed-at home to find it -- proven end to end, not by inspecting
         a resolved path."""
-        self.assertFalse(
-            (TOOLS_DIR / ".venv" / "bin" / "python").exists(),
-            "this test relies on no engine .venv existing in this checkout",
-        )
+        if (TOOLS_DIR / ".venv" / "bin" / "python").exists():
+            self.skipTest(
+                "an engine .venv exists in this checkout (INC-0125) -- this "
+                "test can only prove python resolves through the "
+                "config-pointer chain when no engine venv exists to mask a "
+                "broken chain; see tests/test_env_gate.py"
+            )
         fake_home = Path(self.tmp) / "r2-fake-home"
         default_mc_home = fake_home / ".memcontinuum"
         default_mc_home.mkdir(parents=True)
@@ -1603,10 +1609,13 @@ class TestPostCommitReindexHook(unittest.TestCase):
         single-source step stopped at the pointer and never found it, so
         the reindex silently failed (logged, never blocking the commit --
         but the index then never actually updates)."""
-        self.assertFalse(
-            (TOOLS_DIR / ".venv" / "bin" / "python").exists(),
-            "this test relies on no engine .venv existing in this checkout",
-        )
+        if (TOOLS_DIR / ".venv" / "bin" / "python").exists():
+            self.skipTest(
+                "an engine .venv exists in this checkout (INC-0125) -- this "
+                "test can only prove python resolves through the "
+                "config-pointer chain when no engine venv exists to mask a "
+                "broken chain; see tests/test_env_gate.py"
+            )
         tmp = tempfile.mkdtemp(prefix="memcontinuum-postcommit-test-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         fake_home = Path(tmp) / "fake-home"

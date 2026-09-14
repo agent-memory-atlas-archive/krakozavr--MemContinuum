@@ -3493,7 +3493,22 @@ class TestEveryUnfinishedApplyRowFailsTheWalk(unittest.TestCase):
         write_row(self.home, self.repo, "wired", note=f"store={self.store}")
 
     def test_apply_exits_nonzero_on_an_unrecoverable_row(self):
-        proc = run(UPDATE_SH, ["--apply"], self.home)
+        # --no-machine (same idiom as the G4 test above, INC-0117's
+        # reasoning): this class is plain unittest.TestCase, not
+        # UpdateTestBase, so nothing here gates on $MEMCONTINUUM_PYTHON --
+        # and the machine layer is refreshed by DEFAULT on a bare --apply.
+        # Without --no-machine, a sandboxed HOME with no machine layer yet
+        # reads "stale" and this call refreshes it for real: with no
+        # MEMCONTINUUM_PYTHON resolvable anywhere (this test's whole
+        # point is a row this command cannot resolve, not python
+        # resolution), memcontinuum-update.sh invokes the REAL, uncopied
+        # memcontinuum-setup.sh at $ENGINE_ROOT with no --python, which
+        # bootstraps a real venv at THIS CHECKOUT's own .venv -- INC-0125,
+        # the two-day false negative on tests/test_hooks.py's and
+        # tests/test_repo_init.py's config-pointer-chain guards. This
+        # assertion is about the unrecoverable-row exit code, not the
+        # machine layer -- --no-machine keeps it that way.
+        proc = run(UPDATE_SH, ["--apply", "--no-machine"], self.home)
         self.assertIn("unrecoverable", proc.stdout, proc.stdout)
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
