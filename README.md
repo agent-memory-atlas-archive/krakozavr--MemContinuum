@@ -46,8 +46,13 @@ same check can run again in CI for a
 guarantee `git commit --no-verify` cannot bypass locally.
 
 Retrieval is **automatic** for edits made with the Edit and Write tools, not
-left to anyone's discipline. Before one of those touches a file, a hook looks
-up whatever decision governs that file and hands it over. Every hook here
+left to anyone's discipline. Before one of those edits reaches disk, a hook
+looks up whatever decision governs that file — but by the time the hook runs,
+the model has already composed the edit's own content, so what the hook finds
+cannot have shaped that particular edit. It comes back with that same tool
+call's result, in the same turn: the agent sees the governing chain before
+doing anything else, in time to keep its next move consistent with it, even
+though the edit that triggered the lookup already happened. Every hook here
 fails open: a missing index, a missing python, a failed lookup, or the hook
 running too long means the hook stays silent (or, on a timeout specifically,
 says outright that retrieval timed out rather than staying silent) — never
@@ -132,11 +137,14 @@ it types as `inbox` and `search` leaves it out of results by default
 (`--include-inbox` widens back) until the orchestrator promotes it into a real
 record.
 
-Subagents get the relevant decision history handed to them before they touch a
-file with the Edit or Write tools; they do not have to go looking for it. A
-subagent that changes a file from the shell instead gets no such hand-off —
-the edit still reaches the ledger afterwards, from the tree diff, same as any
-other shell-made change.
+Subagents get the relevant decision history handed to them automatically when
+they touch a file with the Edit or Write tools; they do not have to go
+looking for it. That hand-off lands with the edit's own tool result — after
+the subagent has already composed the edit, not before it — so it governs
+what the subagent does next in the same turn, not the content of the edit
+that triggered the lookup. A subagent that changes a file from the shell
+instead gets no such hand-off — the edit still reaches the ledger afterwards,
+from the tree diff, same as any other shell-made change.
 
 The engine and the store are plain CLI tools and markdown files, so nothing here
 is locked to Claude Code — other agent stacks can adopt the same store. The
