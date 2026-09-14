@@ -12,12 +12,24 @@ how much coverage silently vanished, unless the operator explicitly opts
 into an ungated run with $MEMCONTINUUM_ALLOW_UNGATED=1 -- CI already sets
 $MEMCONTINUUM_PYTHON (.github/workflows/tests.yml), so this never fires
 there.
+
+INC-0125 adds the second half of the same idea: a real engine .venv/ next
+to this checkout is ALSO an unstated precondition, in the other direction --
+six tests across tests/test_hooks.py, tests/test_repo_init.py and
+tests/test_write_hooks.py exist to prove a python resolves through the
+config-pointer chain specifically when no engine venv is present to mask a
+broken chain, and silently skip that proof (now correctly -- they used to
+FAIL, which is the bug this file's second guard exists to catch) whenever
+one exists. The same $MEMCONTINUUM_ALLOW_UNGATED=1 opt-out covers it: "I
+accept the skipped coverage" means the same thing whichever direction the
+missing precondition points.
 """
 import os
 import unittest
 from pathlib import Path
 
 TESTS_DIR = Path(__file__).resolve().parent
+TOOLS_DIR = TESTS_DIR.parent
 
 
 def _venv_gated_test_classes():
@@ -68,4 +80,43 @@ class TestSuiteRefusesToSkipTheVenvGateSilently(unittest.TestCase):
             "section. Set $MEMCONTINUUM_PYTHON to a venv python with the pinned "
             "dependencies installed, or set $MEMCONTINUUM_ALLOW_UNGATED=1 to run "
             "without it anyway, accepting the skipped coverage."
+        )
+
+
+class TestSuiteRefusesAnEngineVenvSilently(unittest.TestCase):
+    """INC-0125: the suite polluted its own checkout with a real engine
+    .venv/ (tests/test_update.py's TestEveryUnfinishedApplyRowFailsTheWalk
+    used to reach memcontinuum-update.sh's real, uncopied sibling
+    memcontinuum-setup.sh with no python resolvable anywhere, and that
+    script bootstraps a venv at its own $SCRIPT_DIR/.venv by default --
+    fixed by passing --no-machine, since that test is about a row's exit
+    code, not the machine layer). Six tests exist specifically to prove the
+    pre-edit hook and the post-commit reindex resolve a python through the
+    config-pointer chain with NO engine venv present, and for two days they
+    silently FAILED instead of proving anything, read as environmental
+    noise. They now SKIP instead when the precondition they cannot control
+    is unmet (see tests/test_hooks.py, tests/test_repo_init.py,
+    tests/test_write_hooks.py) -- but a skip is still silently-missing
+    coverage. This guard states the precondition loudly instead of letting
+    a runner infer it from six skips with no obvious common cause."""
+
+    def test_no_engine_venv_or_explicitly_waived(self):
+        venv_python = TOOLS_DIR / ".venv" / "bin" / "python"
+        if not venv_python.exists():
+            return  # the common case -- nothing to guard
+        if os.environ.get("MEMCONTINUUM_ALLOW_UNGATED", "") == "1":
+            return  # explicit operator opt-in -- accepted, not silent
+        self.fail(
+            f"an engine .venv exists at {venv_python}: six tests across "
+            "tests/test_hooks.py, tests/test_repo_init.py and "
+            "tests/test_write_hooks.py cannot prove what they exist to prove "
+            "(that a python resolves through the config-pointer chain with "
+            "no engine venv present) and will silently skip instead of "
+            "running. Remove it -- memcontinuum-setup.sh and "
+            "scripts/repo-init.sh's --bootstrap-venv both default to "
+            "creating it at THIS checkout's own .venv/, never a disposable "
+            "directory, whenever something invokes either with no --python "
+            "and none resolvable (see INC-0125) -- or set "
+            "$MEMCONTINUUM_ALLOW_UNGATED=1 to run anyway, accepting the "
+            "skipped coverage."
         )
