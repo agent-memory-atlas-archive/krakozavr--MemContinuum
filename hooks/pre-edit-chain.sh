@@ -543,9 +543,11 @@ done
 # so it never reaches this script -- see this file's own header). Fixed:
 # still zero extra `git` calls for the ordinary in-root case (no nested
 # worktree at all -- by far the common shape of an in-root miss), via
-# mc_nested_worktree_gitfile's bash-only ancestor walk; the one `git`
-# call inside mc_remap_worktree_path is paid only when that walk actually
-# finds a nested `.git` FILE between FILE_PATH and the matching root.
+# mc_nested_worktree_gitfile's bash-only ancestor walk; mc_remap_worktree_path's
+# own calls -- one identity call for FILE_PATH itself, plus one more per
+# configured root while it searches for a match -- are paid only when that
+# walk actually finds a nested `.git` FILE between FILE_PATH and the
+# matching root.
 if [ -z "$MATCHED_CANDIDATE" ] && [ "$ANY_QUERY_SUCCEEDED" -eq 1 ] && [ -n "${MEMCONTINUUM_STRIP_PREFIX:-}" ]; then
     WT_ROOTS=""
     declare -a WT_ROOT_ARR=()
