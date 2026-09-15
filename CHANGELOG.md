@@ -33,12 +33,14 @@
   retrieval and the same ledger entry a main-checkout edit gets. A
   worktree checked out as a sibling of the root gets the ledger entry
   only, because the hook that matches on the edited path never fires
-  there under current settings. Two new hook.log outcomes name a
-  worktree the underlying git question cannot resolve cleanly, instead of
-  falling back to an ordinary no-match or out-of-scope line that looks the
-  same as a genuine one. A project that wants retrieval inside its own
-  worktrees should keep them under the code root (`<root>/.worktrees/`,
-  ignored by the project), rather than as siblings of it.
+  there under current settings. Two new hook.log outcomes replace the old
+  silent fallback into an ordinary no-match or out-of-scope line, which
+  looked the same as a genuine one: `worktree-unwired` names a confirmed
+  worktree whose own main repository is not itself a configured root, and
+  `worktree-unresolved` names one git itself could not settle. A project
+  that wants retrieval inside its own worktrees should keep them under the
+  code root (`<root>/.worktrees/`, ignored by the project), rather than as
+  siblings of it.
 
 ### Code index
 - The code-tree walk that feeds `code-reindex` no longer descends into a
