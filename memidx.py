@@ -3640,6 +3640,41 @@ def is_binary_file(path: Path) -> bool:
     return b"\0" in chunk
 
 
+def _prune_dirnames_for_code_walk(dirpath, dirnames, skip_dirs):
+    """`dirnames` filter shared by every os.walk-based code-tree walker
+    below (iter_code_files, iter_code_source_files, code_census): drops
+    the caller's own noise-dir name set (`skip_dirs`) AND any directory
+    that is itself a linked worktree's own toplevel -- recognized by a
+    `.git` FILE, not directory, sitting directly inside it (e.g.
+    `<root>/.worktrees/feat/`; an ORDINARY checkout's `.git` is a
+    directory and is unaffected by this check).
+
+    Worktree-gap round 2 (Codex's "code index check" instruction): a
+    linked worktree checked out INSIDE a configured code root is now the
+    layout hooks/mc-path-lib.sh's mc_remap_worktree_path gives retrieval
+    and ledger coverage to (fix round 2 report, "the code-index answer").
+    Without this exclusion, the SAME os.walk that indexes `root`'s own
+    tracked tree would also descend into the worktree and index its
+    (possibly different-branch, possibly uncommitted) content as if it
+    were part of `root`'s own -- a false attribution the write-side fix
+    is careful never to cause (mc_remap_worktree_path's own header: "it
+    never causes worktree CONTENT to be indexed"). One `os.path.isfile`
+    stat per candidate directory -- the same per-directory cost class the
+    existing name-set membership test here already pays.
+
+    Known, accepted side effect (named, not silently absorbed): a git
+    SUBMODULE checkout also has a `.git` FILE at its own top (pointing at
+    `<superproject>/.git/modules/<name>`), so this same predicate also
+    excludes a submodule's content from the code index. No fixture or
+    real project this repo's own tests cover currently wires a submodule
+    under a code root; if one ever does, its content stops being indexed
+    by this rule too -- see docs/INTERNALS.md and this task's own report."""
+    return [
+        d for d in dirnames
+        if d not in skip_dirs and not os.path.isfile(os.path.join(dirpath, d, ".git"))
+    ]
+
+
 def iter_code_files(code_root: Path):
     """Every non-binary file under `code_root`, noise dirs pruned (Task 6:
     chunkers.UNIVERSAL_SKIP_DIRS -- the same set CODE_SKIP_DIR_NAMES
@@ -3647,9 +3682,11 @@ def iter_code_files(code_root: Path):
     yields EVERY language, not just wired ones: `drift`'s
     pattern-absent/no-bypass/single-definition invariants (check_invariant,
     below) scan non-language files too (binding point 7) -- the language
-    filter lives in resolve_symbol_to_path's own loop, not here."""
+    filter lives in resolve_symbol_to_path's own loop, not here. Also
+    prunes a nested linked worktree's own toplevel -- see
+    _prune_dirnames_for_code_walk."""
     for dirpath, dirnames, filenames in os.walk(code_root):
-        dirnames[:] = [d for d in dirnames if d not in chunkers.UNIVERSAL_SKIP_DIRS]
+        dirnames[:] = _prune_dirnames_for_code_walk(dirpath, dirnames, chunkers.UNIVERSAL_SKIP_DIRS)
         for fname in filenames:
             fpath = Path(dirpath) / fname
             if is_binary_file(fpath):
@@ -5103,6 +5140,12 @@ def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter
     the strength of -- see chunkers.common_skip_dirs and
     TestSkipDirOwnLanguageRule.
 
+    Worktree-gap round 2: the walk also prunes any directory that is
+    itself a linked worktree's own toplevel (a `.git` FILE directly
+    inside it, e.g. `<root>/.worktrees/feat/`) -- see
+    _prune_dirnames_for_code_walk's own docstring for why and for the
+    accepted submodule-content side effect.
+
     `skipped`, when passed a Counter, is mutated in place: every walked file
     that is NOT yielded because its extension is unsupported (no language
     at all) or resolves to a lang outside the wired set (engine-supported
@@ -5122,7 +5165,7 @@ def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter
     wired_set = set(wired)
     skip_dirs = CODE_SKIP_DIR_NAMES | chunkers.common_skip_dirs(wired)
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        dirnames[:] = _prune_dirnames_for_code_walk(dirpath, dirnames, skip_dirs)
         for fname in sorted(filenames):
             path = Path(dirpath) / fname
             lang = lang_for_source_file(path)
@@ -6083,7 +6126,10 @@ def code_census(root: Path) -> dict:
     Directory pruning: the walk prunes CODE_SKIP_DIR_NAMES (an alias of
     chunkers.UNIVERSAL_SKIP_DIRS -- see that set's own docstring for the
     member list and rationale) -- the same universal noise set
-    iter_code_source_files prunes, and nothing wider. A SUPPORTED file is
+    iter_code_source_files prunes, and nothing wider -- plus a nested
+    linked worktree's own toplevel (worktree-gap round 2; see
+    _prune_dirnames_for_code_walk's own docstring for why and for the
+    accepted submodule-content side effect). A SUPPORTED file is
     then dropped only when an ancestor directory on its root-relative path
     sits in ITS OWN language's skip_dirs (chunkers.path_is_skipped_for_lang
     against `_root_relative_parts`, the same per-file test and path helper
@@ -6111,7 +6157,7 @@ def code_census(root: Path) -> dict:
         row["files"] += 1
 
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        dirnames[:] = _prune_dirnames_for_code_walk(dirpath, dirnames, skip_dirs)
         for fname in sorted(filenames):
             path = Path(dirpath) / fname
             # lang_for_source_file is the one resolution rule the whole
