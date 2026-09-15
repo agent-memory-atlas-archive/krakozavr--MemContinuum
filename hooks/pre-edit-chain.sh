@@ -29,6 +29,37 @@
 #     PreToolUse hooks spawn shells that re-source .bashrc, which re-exports a
 #     Windows-site-packages PYTHONPATH that breaks the venv's own packages.
 #
+# The worktree gap (docs/internal/SESSION-HANDOFF-releases-0.3-to-0.6.md
+# SS"0.2.0 final" item 1): once every candidate below (raw path, cwd-
+# relative, STRIP_PREFIX forms) has failed for FILE_PATH itself,
+# mc_remap_worktree_path (hooks/mc-path-lib.sh) is tried: if FILE_PATH
+# sits inside a `git worktree` whose MAIN checkout is one of the roots
+# MEMCONTINUUM_STRIP_PREFIX names, it is remapped to its main-checkout-
+# equivalent path and fed back through the SAME candidate machinery -- never
+# onto an unwired repo's records, and never by indexing the worktree's own
+# content. Two outcomes name the ways this can still fail visibly instead of
+# collapsing into a plain `no-match`: `worktree-unwired` (confirmed to be a
+# worktree, but its main repo isn't a configured root) and
+# `worktree-unresolved` (git itself could not settle the question).
+#
+# This closes the gap in THIS SCRIPT's own logic; it cannot make the harness
+# LAUNCH the script for a file outside every "if" glob repo-init.sh renders
+# (templates/code-root-filter-pair.json.tmpl scopes each invocation's "if"
+# to one literal code-root path) -- a worktree checked out as a SIBLING of
+# the wired root never reaches this script at all under current wiring, so
+# it gets NO retrieval here (ledger-post-edit.sh, which has no such filter,
+# still ledgers it -- see that hook's own header). One checked out INSIDE
+# the wired root (e.g. `<root>/.worktrees/x`) DOES reach this script, and
+# gets full retrieval -- round 1 of this fix claimed this case was "closed
+# end-to-end" while its own callers still silently skipped the remap for
+# ANY FILE_PATH already physically under a configured root (Grok's round-2
+# BLOCKER finding): the in-root worktree case is what that round-2 fix
+# actually closes; round 1 only wired the machinery for it. A project that
+# wants retrieval for its own worktrees should therefore keep them INSIDE
+# the code root (e.g. `<root>/.worktrees/`, gitignored by that project) --
+# a sibling worktree stays ledger-only until the settings-rendering
+# follow-up (see this task's own report) widens the "if" glob itself.
+#
 # Env:
 #   MEMCONTINUUM_ROOT     store markdown root; used to derive a default
 #                    project name ($(basename "$MEMCONTINUUM_ROOT")) when
@@ -308,7 +339,18 @@ MATCHED_TOPIC_COUNT="0"
 MATCHED_TOPIC_IDS=""
 CHAIN_TEXT=""
 ANY_QUERY_SUCCEEDED=0
-for candidate in "${CANDIDATES[@]}"; do
+# try_candidate CANDIDATE -- queries for-path for exactly one candidate and,
+# on a match, sets the MATCHED_* globals above and returns 0 (a `break`-
+# worthy match); returns 1 on no-match or a failed query (ANY_QUERY_SUCCEEDED
+# still records whether the QUERY itself ran, same as the inline loop this
+# was factored out of). Factored into a function (worktree gap fix,
+# docs/internal/SESSION-HANDOFF-releases-0.3-to-0.6.md SS"0.2.0 final" item
+# 1) so the SAME query logic can be reused for the worktree-remapped
+# candidates below without a second copy of this body -- bash 3.2 has no
+# namerefs, so this operates on the same globals the original inline loop
+# always did, not a passed-by-reference array.
+try_candidate() {
+    local candidate="$1"
     FORPATH_ARGS=(for-path "$candidate" --project "$PROJECT" --db "$DB_PATH")
     [ -n "${MEMCONTINUUM_ROOT:-}" ] && FORPATH_ARGS+=(--root "$MEMCONTINUUM_ROOT")
     FORPATH_ARGS+=(--json --with-chain-text)
@@ -328,7 +370,7 @@ for candidate in "${CANDIDATES[@]}"; do
         finish "index-error"
     fi
     if [ $RC -ne 0 ]; then
-        continue
+        return 1
     fi
     ANY_QUERY_SUCCEEDED=1
     # --json --with-chain-text always wraps as an object -- {"results":
@@ -465,9 +507,122 @@ for field in (matched, state, topic_count, topics_field, chain_text):
         MATCHED_TOPIC_COUNT="$CANDIDATE_TOPIC_COUNT"
         MATCHED_TOPIC_IDS="$CANDIDATE_TOPIC_IDS"
         CHAIN_TEXT="$CANDIDATE_CHAIN_TEXT"
-        break
+        return 0
     fi
+    return 1
+}
+
+for candidate in "${CANDIDATES[@]}"; do
+    try_candidate "$candidate" && break
 done
+
+# --- worktree gap: reached ONLY once every existing candidate has already
+# failed for FILE_PATH itself (docs/internal/SESSION-HANDOFF-releases-0.3-
+# to-0.6.md SS"0.2.0 final" item 1) ---------------------------------------
+# pre-edit-chain.sh deliberately never sources hooks/memlib.sh (the
+# mkdir/config.sh/MC_PY cost that would add on every already-a-miss lookup
+# is exactly what this hook's own header explains it exists to avoid) --
+# so the "configured code roots" it can check a remap against are read
+# from MEMCONTINUUM_STRIP_PREFIX instead of mc_code_roots. repo-init.sh
+# renders exactly ONE STRIP_PREFIX entry per invocation (= the single code
+# root that invocation's settings.json "if" filter is already scoped to,
+# templates/code-root-filter-pair.json.tmpl), so this is a faithful reading
+# of "the configured roots this invocation knows about", not a
+# looser/lossier stand-in for mc_code_roots. A hand-wired STRIP_PREFIX that
+# is not really a repo root can never produce a false remap either way --
+# mc_remap_worktree_path's own match test is exact common-dir identity,
+# never a prefix/substring test (see its header in hooks/mc-path-lib.sh)
+# -- it would just make the remap silently not fire.
+#
+# Round 2 fix (Grok BLOCKER): a FILE_PATH already physically under one of
+# these roots used to skip this whole block outright -- wrong for a
+# worktree checked out INSIDE the root (e.g. `<root>/.worktrees/feat/`),
+# the ONLY worktree location the settings-level "if" glob
+# (templates/code-root-filter-pair.json.tmpl) ever lets THIS SCRIPT be
+# invoked for at all (a sibling worktree's Edit never matches that glob,
+# so it never reaches this script -- see this file's own header). Fixed:
+# still zero extra `git` calls for the ordinary in-root case (no nested
+# worktree at all -- by far the common shape of an in-root miss), via
+# mc_nested_worktree_gitfile's bash-only ancestor walk; the one `git`
+# call inside mc_remap_worktree_path is paid only when that walk actually
+# finds a nested `.git` FILE between FILE_PATH and the matching root.
+if [ -z "$MATCHED_CANDIDATE" ] && [ "$ANY_QUERY_SUCCEEDED" -eq 1 ] && [ -n "${MEMCONTINUUM_STRIP_PREFIX:-}" ]; then
+    WT_ROOTS=""
+    declare -a WT_ROOT_ARR=()
+    IFS=':' read -r -a WT_PREFIXES <<<"$MEMCONTINUUM_STRIP_PREFIX"
+    for wt_prefix in "${WT_PREFIXES[@]}"; do
+        [ -z "$wt_prefix" ] && continue
+        wt_root="${wt_prefix%/}"
+        [ -z "$wt_root" ] && continue
+        WT_ROOT_ARR+=("$wt_root")
+        WT_ROOTS="${WT_ROOTS:+$WT_ROOTS
+}$wt_root"
+    done
+
+    if [ -n "$WT_ROOTS" ]; then
+        # shellcheck source=mc-path-lib.sh
+        source "$SCRIPT_DIR/mc-path-lib.sh"
+        # WT_IN_ROOT: the matching root's own string when FILE_PATH is
+        # physically under one of WT_ROOT_ARR, else empty. Kept (not just
+        # a 0/1 flag) because a nonzero mc_remap_worktree_path rc for an
+        # IN-ROOT path must fall through to today's plain outcome rather
+        # than `finish` a worktree-* outcome (see the case below) -- an
+        # in-root path with no nested worktree, or with a nested gitfile
+        # that mc_remap_worktree_path could not resolve, is not a
+        # worktree-gap situation the caller should report as one; it is
+        # exactly the pre-fix "in root, no decision bound to it" miss.
+        WT_IN_ROOT=""
+        for wt_root in "${WT_ROOT_ARR[@]}"; do
+            mc_path_under_root "$FILE_PATH" "$wt_root"
+            if [ $? -eq 0 ]; then
+                WT_IN_ROOT="$wt_root"
+                break
+            fi
+        done
+
+        WT_TRY_REMAP=1
+        if [ -n "$WT_IN_ROOT" ]; then
+            mc_nested_worktree_gitfile "$FILE_PATH" "$WT_IN_ROOT"
+            [ $? -eq 0 ] || WT_TRY_REMAP=0
+        fi
+
+        if [ "$WT_TRY_REMAP" -eq 1 ]; then
+            WT_REMAPPED="$(mc_remap_worktree_path "$FILE_PATH" "$WT_ROOTS")"
+            WT_REMAP_RC=$?
+            case $WT_REMAP_RC in
+                0)
+                    # Feed the remapped (main-checkout) path through the
+                    # EXISTING candidate machinery -- the bare relative
+                    # form (what code_refs are actually written in) plus
+                    # every STRIP_PREFIX form, same as a raw FILE_PATH
+                    # would get above -- and reuse try_candidate rather
+                    # than a second query implementation.
+                    if ! try_candidate "$WT_REMAPPED"; then
+                        for wt_root in "${WT_ROOT_ARR[@]}"; do
+                            wt_rel="${WT_REMAPPED#"$wt_root"/}"
+                            if [ "$wt_rel" != "$WT_REMAPPED" ]; then
+                                try_candidate "$wt_rel" && break
+                            fi
+                        done
+                    fi
+                    ;;
+                1)
+                    # worktree-unwired only when FILE_PATH itself was NOT
+                    # already under a configured root -- an in-root path
+                    # whose nested gitfile still resolved to "unwired"
+                    # (some OTHER, unwired repo's worktree parked inside
+                    # this root) falls through unchanged, same as an
+                    # in-root path with no nested worktree at all.
+                    [ -z "$WT_IN_ROOT" ] && finish "worktree-unwired"
+                    ;;
+                2)
+                    [ -z "$WT_IN_ROOT" ] && finish "worktree-unresolved"
+                    ;;
+                *) ;; # 3: not applicable (not a worktree, or no .git at all)
+            esac
+        fi
+    fi
+fi
 
 if [ -z "$MATCHED_CANDIDATE" ]; then
     if [ "$ANY_QUERY_SUCCEEDED" -eq 0 ]; then

@@ -1633,6 +1633,23 @@ language's `skip_dirs`. An unsupported extension has no language and so no
 `skip_dirs` of its own; it is always counted outside the global noise dirs,
 never hidden behind another language's skip set.
 
+Worktree gap: every one of these walkers (`iter_code_files`,
+`iter_code_source_files`, and the census walk) also prunes any directory
+that is itself a linked worktree's own toplevel — a `.git` FILE (never a
+directory) sitting directly inside it, e.g. `<root>/.worktrees/feat/`
+(`memidx.py`'s shared `_prune_dirnames_for_code_walk`). A linked worktree
+checked out inside a configured code root now gets retrieval and ledger
+coverage (the write-side fix above); without this exclusion the SAME
+`os.walk` that indexes the root's own tracked tree would also descend into
+the worktree and index its (possibly different-branch, possibly
+uncommitted) content as if it belonged to the root. Accepted side effect,
+named rather than hidden: a git SUBMODULE checkout also has a `.git` FILE
+at its own top (pointing at `<superproject>/.git/modules/<name>`), so this
+same predicate also excludes a submodule's content from the code index —
+no fixture or real project this repo's own tests cover currently wires a
+submodule under a code root; closing that gap too, if it is ever needed,
+is a separate follow-up.
+
 ### Unindexed-file tally
 
 `iter_code_source_files` mutates a caller-supplied `Counter` in place: every
@@ -2127,6 +2144,69 @@ state also returns the text `additionalContext` is built from; there is no
 second `for-path` call fetching that text separately, so one hook run walks
 the store at most once per candidate, and makes exactly one `for-path`
 invocation for whichever candidate matches.
+
+**A `git worktree` of a wired code root is remapped, not indexed.**
+`MEMCONTINUUM_CODE_ROOTS`/`MEMCONTINUUM_STRIP_PREFIX` name absolute paths fixed
+at repo-init time, so a `git worktree add` checkout is a different absolute
+directory nothing wired — every candidate above (raw path, cwd-relative,
+STRIP_PREFIX forms) comes up empty for a file edited there, the same way a
+genuinely unbound file does. `mc_remap_worktree_path` (`hooks/mc-path-lib.sh`)
+is tried once every other candidate has already failed: if the edited file's
+`git rev-parse --git-common-dir` matches a configured code root's OWN
+common-dir (asked of git directly — `git -C "$root" rev-parse
+--git-common-dir` — rather than assumed from `"$root/.git"` being a
+directory, so this also matches when the configured root is ITSELF a linked
+worktree or a `--separate-git-dir` checkout), the file is treated as though
+it were the same path in the main checkout (fed back through the same
+candidate list above) — the worktree's own content is never read into the
+index; only the path is remapped. Both git calls run with
+GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR explicitly unset for that one
+invocation, so an ambient value from the hook's own environment can never
+redirect the identity check onto an unrelated repo. A worktree of some
+OTHER, unwired repo is never remapped onto this project's records (`git
+rev-parse` still confirms a worktree, but no configured root's common-dir
+matches) — logged as `worktree-unwired`; when git itself cannot settle the
+question, `worktree-unresolved`.
+
+The same remap fires in `hooks/ledger-post-edit.sh`'s own root-containment
+check — not only once that loop has found nothing (a SIBLING worktree, or a
+path outside every git checkout entirely), but ALSO when the loop already
+matched a root, if a cheap bash-only ancestor walk (`mc_nested_worktree_gitfile`)
+finds a `.git` FILE strictly between the edited path and that root: a linked
+worktree checked out INSIDE the root (e.g. `<root>/.worktrees/feat/`) is
+physically "under" the root by plain containment, but is a different git
+checkout from the root's own, so the pre-remap path/root annotation would
+otherwise silently name the worktree instead of the main checkout. On a
+successful remap the ledger row is recorded under the main-checkout
+path/root (so `memidx.py unmapped --code-root` sees it), with
+`content_sha256` still read from the file that was actually edited and the
+real path kept visible on the row as `worktree_path`. `pre-edit-chain.sh`
+gates the same in-root case the same way before trying the remap.
+
+Cost: an ORDINARY file — already under a configured root, with no nested
+worktree on its ancestor chain, or not in any git checkout whatsoever — still
+never spawns git (the bash-only `.git`-entry / `mc_nested_worktree_gitfile`
+gates rule it out first). A worktree edit that DOES need remapping pays one
+`git rev-parse` to resolve the edited file's own identity, plus one more per
+configured root while searching for the match (bounded by the number of
+configured roots, typically one or a few) — no longer "a single `git
+rev-parse`" as this section previously (incorrectly) claimed for every case.
+
+This closes the gap in each hook's own logic; it does not change which paths
+the harness LAUNCHES either hook for at all. `pre-edit-chain.sh`'s
+settings-level `"if"` filter is still a literal, per-code-root path glob
+(`templates/code-root-filter-pair.json.tmpl`): a worktree checked out as a
+SIBLING of the wired root never reaches the script at all under the current
+settings rendering, so it gets **ledger coverage only** (`ledger-post-edit.sh`
+has no such filter — design R6, "fires for EVERY tool" — and covers it).
+A worktree checked out **INSIDE** the wired root (e.g. `<root>/.worktrees/x`)
+DOES reach `pre-edit-chain.sh` and gets full **retrieval and ledger**
+coverage — this is the layout this fix actually closes end-to-end. A project
+that wants retrieval for its own worktrees should therefore keep them inside
+the code root (e.g. `<root>/.worktrees/`, gitignored by that project) rather
+than as siblings; widening the settings-level glob to also launch
+`pre-edit-chain.sh` for a sibling worktree is a separate, not-yet-done
+follow-up.
 
 **A positive match off a non-`current` index stays usable; a negative claim
 does not.** `upgrade-required`, `stale`, and `quarantined` all warn and

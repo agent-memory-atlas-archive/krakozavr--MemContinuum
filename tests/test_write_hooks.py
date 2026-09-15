@@ -17,6 +17,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -1137,6 +1138,319 @@ class TestLedgerPostEdit(HookTestBase):
 # ---------------------------------------------------------------------------
 # 2b. Mutation-surface honesty (design R6, audit MC-P1-04, TOP-0123 L6)
 # ---------------------------------------------------------------------------
+
+
+class TestLedgerPostEditWorktreeGap(HookTestBase):
+    """Worktree gap fix (docs/internal/SESSION-HANDOFF-releases-0.3-to-0.6.md
+    SS"0.2.0 final" item 1): mc_remap_worktree_path (hooks/mc-path-lib.sh),
+    tried only once the existing root-containment loop has already found
+    nothing for FILE_PATH itself. self.code_root is the wired root
+    (HookTestBase.setUp); repo_b below is a second, real, never-wired repo."""
+
+    def setUp(self):
+        super().setUp()
+        self.code_root_wt = Path(self.td) / "code-worktree"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "wt-a", str(self.code_root_wt)],
+            cwd=self.code_root, check=True,
+        )
+        self.repo_b = Path(self.td) / "repo-b"
+        _write(self.repo_b / "src" / "other.py", "# b\n")
+        git_init(self.repo_b)
+        self.repo_b_wt = Path(self.td) / "repo-b-wt"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "wt-b", str(self.repo_b_wt)],
+            cwd=self.repo_b, check=True,
+        )
+
+    def _env(self, **overrides):
+        # Resolved, same convention test_bash_edit_under_a_worktree_code_
+        # root_is_still_diffed already uses (and real repo-init.sh wiring
+        # always does, via os.path.realpath at render time): on macOS CI,
+        # tempfile's own tmpdir sits behind a /var -> /private/var symlink,
+        # so an UNRESOLVED MEMCONTINUUM_CODE_ROOT here would silently diverge
+        # from mc_remap_worktree_path's own `cd && pwd -P` resolution the
+        # instant it's compared -- resolving up front keeps this test class
+        # platform-independent rather than accidentally Linux-only.
+        return self.base_env(
+            MEMCONTINUUM_CODE_ROOT=str(self.code_root.resolve()),
+            MEMCONTINUUM_CODE_ROOTS=json.dumps([str(self.code_root.resolve())]),
+            **overrides,
+        )
+
+    def _last_outcome_line(self, log_text):
+        matching = [l for l in log_text.splitlines() if "ledger outcome=" in l]
+        self.assertTrue(matching, log_text)
+        return matching[-1]
+
+    def test_worktree_of_wired_repo_gets_same_root_as_main(self):
+        session_id = "s-ledger-wt-wired"
+        wt_file = str(self.code_root_wt / "src" / "mapped.py")
+        payload = self.post_tool_use_payload(session_id, wt_file)
+        proc, _ = run_script(LEDGER_HOOK, payload, self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        main_path = str((self.code_root / "src" / "mapped.py").resolve())
+        state = self.load_state(session_id)
+        entry = [e for e in state["ledger"] if e["path"] == main_path]
+        self.assertEqual(len(entry), 1, state.get("ledger"))
+        entry = entry[0]
+        self.assertEqual(entry["kind"], "code")
+        self.assertEqual(entry["root"], str(self.code_root.resolve()))
+        self.assertEqual(entry["worktree_path"], wt_file)
+        self.assertTrue(entry.get("content_sha256"))
+
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=appended kind=code remap=1", self._last_outcome_line(log_text))
+
+    def test_content_hash_reads_the_real_worktree_file_not_the_main_copy(self):
+        """The main checkout's own src/mapped.py must never be read for a
+        worktree edit's content hash -- the worktree can (and typically
+        does) hold different, uncommitted content at the same relative
+        path."""
+        session_id = "s-ledger-wt-content"
+        wt_target = self.code_root_wt / "src" / "mapped.py"
+        wt_target.write_text("# mapped, changed ONLY in the worktree\n")
+        payload = self.post_tool_use_payload(session_id, str(wt_target))
+        proc, _ = run_script(LEDGER_HOOK, payload, self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = self.load_state(session_id)
+        main_path = str((self.code_root / "src" / "mapped.py").resolve())
+        entry = [e for e in state["ledger"] if e["path"] == main_path][0]
+        expected_sha = hashlib.sha256(wt_target.read_bytes()).hexdigest()
+        self.assertEqual(entry["content_sha256"], expected_sha)
+
+    def test_worktree_path_cleared_on_a_later_main_checkout_edit(self):
+        session_id = "s-ledger-wt-clear"
+        wt_file = str(self.code_root_wt / "src" / "mapped.py")
+        run_script(LEDGER_HOOK, self.post_tool_use_payload(session_id, wt_file), self._env())
+        main_path = str((self.code_root / "src" / "mapped.py").resolve())
+        state = self.load_state(session_id)
+        self.assertIn("worktree_path", [e for e in state["ledger"] if e["path"] == main_path][0])
+
+        run_script(LEDGER_HOOK, self.post_tool_use_payload(session_id, main_path), self._env())
+        state2 = self.load_state(session_id)
+        entry2 = [e for e in state2["ledger"] if e["path"] == main_path][0]
+        self.assertNotIn("worktree_path", entry2)
+
+    def test_worktree_of_unwired_repo_distinct_outcome_no_ledger_entry(self):
+        session_id = "s-ledger-wt-unwired"
+        wt_file = str(self.repo_b_wt / "src" / "other.py")
+        payload = self.post_tool_use_payload(session_id, wt_file)
+        proc, _ = run_script(LEDGER_HOOK, payload, self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        state = self.load_state(session_id)
+        paths = [e["path"] for e in state.get("ledger", [])]
+        self.assertNotIn(wt_file, paths)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=worktree-unwired", self._last_outcome_line(log_text))
+
+    def test_main_checkout_edit_pays_no_git_call(self):
+        fake_git_dir = Path(self.td) / "fake-git-bin-noop"
+        fake_git_dir.mkdir()
+        marker = Path(self.td) / "git-was-called"
+        fake_git = fake_git_dir / "git"
+        fake_git.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n")
+        fake_git.chmod(0o755)
+
+        session_id = "s-ledger-wt-nogit"
+        fpath = str(self.code_root / "src" / "mapped.py")
+        payload = self.post_tool_use_payload(session_id, fpath)
+        env = self._env(PATH=f"{fake_git_dir}:{os.environ.get('PATH', '')}")
+        proc, _ = run_script(LEDGER_HOOK, payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(marker.exists(), "git must not be invoked for a path already under a configured root")
+        state = self.load_state(session_id)
+        # No remap fires here (already under the configured root) -- the
+        # ledger row's path is FILE_PATH exactly as passed in, same as
+        # every pre-existing (non-worktree) ledger test already asserts.
+        self.assertIn(fpath, [e["path"] for e in state.get("ledger", [])])
+
+    def test_outside_scope_edit_pays_no_git_call(self):
+        """A path outside every root and not in any git repo at all (the
+        vast majority of real out-of-scope edits) must also cost nothing:
+        the bash-only `.git`-entry gate inside mc_remap_worktree_path
+        rules it out before ever spawning git."""
+        fake_git_dir = Path(self.td) / "fake-git-bin-noop2"
+        fake_git_dir.mkdir()
+        marker = Path(self.td) / "git-was-called-2"
+        fake_git = fake_git_dir / "git"
+        fake_git.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n")
+        fake_git.chmod(0o755)
+
+        session_id = "s-ledger-wt-nogit-outside"
+        fpath = "/tmp/somewhere/else/not-in-any-repo.py"
+        payload = self.post_tool_use_payload(session_id, fpath)
+        env = self._env(PATH=f"{fake_git_dir}:{os.environ.get('PATH', '')}")
+        proc, _ = run_script(LEDGER_HOOK, payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(marker.exists())
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=out-of-scope", self._last_outcome_line(log_text))
+
+    def test_git_failure_on_worktree_gives_unresolved_not_crash(self):
+        fake_git_dir = Path(self.td) / "fake-git-bin-fail"
+        fake_git_dir.mkdir()
+        fake_git = fake_git_dir / "git"
+        fake_git.write_text("#!/bin/sh\nexit 128\n")
+        fake_git.chmod(0o755)
+
+        session_id = "s-ledger-wt-gitfail"
+        wt_file = str(self.code_root_wt / "src" / "mapped.py")
+        payload = self.post_tool_use_payload(session_id, wt_file)
+        env = self._env(PATH=f"{fake_git_dir}:{os.environ.get('PATH', '')}")
+        proc, _ = run_script(LEDGER_HOOK, payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        state = self.load_state(session_id)
+        self.assertEqual(state.get("ledger", []), [])
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=worktree-unresolved", self._last_outcome_line(log_text))
+
+    def test_in_root_worktree_ledger_remapped(self):
+        """Round 2 BLOCKER (Grok): a worktree checked out INSIDE the wired
+        code root (e.g. `<root>/.worktrees/feat/`) used to be skipped by
+        the remap outright -- FILE_PATH is physically under the root by
+        plain containment (the pre-fix gate treated "already under a
+        configured root" as "nothing left to check"), so the ledger row
+        used to be recorded under the WORKTREE's own path/root annotation
+        instead of the main-checkout-equivalent one."""
+        in_root_wt = self.code_root / ".worktrees" / "feat"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "wt-in-root", str(in_root_wt)],
+            cwd=self.code_root, check=True,
+        )
+        session_id = "s-ledger-wt-inroot"
+        wt_file = str(in_root_wt / "src" / "mapped.py")
+        payload = self.post_tool_use_payload(session_id, wt_file)
+        proc, _ = run_script(LEDGER_HOOK, payload, self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        main_path = str((self.code_root / "src" / "mapped.py").resolve())
+        state = self.load_state(session_id)
+        entry = [e for e in state["ledger"] if e["path"] == main_path]
+        self.assertEqual(len(entry), 1, state.get("ledger"))
+        entry = entry[0]
+        self.assertEqual(entry["kind"], "code")
+        self.assertEqual(entry["root"], str(self.code_root.resolve()))
+        self.assertEqual(entry["worktree_path"], wt_file)
+        self.assertTrue(entry.get("content_sha256"))
+
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=appended kind=code remap=1", self._last_outcome_line(log_text))
+
+    def test_configured_root_that_is_itself_a_linked_worktree(self):
+        """Grok's second MAJOR / Codex's MAJOR: the configured code root
+        can itself be a linked worktree -- its own `.git` is a FILE, not a
+        directory, so the old `cd "$root/.git"` identity check silently
+        skipped this root for every worktree of the same repo.
+        self.code_root_wt (already a sibling worktree of self.code_root,
+        HookTestBase.setUp) is wired as the root here; a SECOND sibling
+        worktree of the same repo is edited."""
+        second_wt = Path(self.td) / "code-second-wt"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "wt-second", str(second_wt)],
+            cwd=self.code_root, check=True,
+        )
+        env = self.base_env(
+            MEMCONTINUUM_CODE_ROOT=str(self.code_root_wt.resolve()),
+            MEMCONTINUUM_CODE_ROOTS=json.dumps([str(self.code_root_wt.resolve())]),
+        )
+        session_id = "s-ledger-wt-root-is-wt"
+        wt_file = str(second_wt / "src" / "mapped.py")
+        payload = self.post_tool_use_payload(session_id, wt_file)
+        proc, _ = run_script(LEDGER_HOOK, payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        main_path = str((self.code_root_wt / "src" / "mapped.py").resolve())
+        state = self.load_state(session_id)
+        entry = [e for e in state["ledger"] if e["path"] == main_path]
+        self.assertEqual(len(entry), 1, state.get("ledger"))
+        self.assertEqual(entry[0]["root"], str(self.code_root_wt.resolve()))
+
+    def test_separate_git_dir_root_remaps_worktree(self):
+        """A configured root created via `git init --separate-git-dir`
+        also has a `.git` FILE at its own top -- the same layout defect
+        as a root that is itself a linked worktree, covered by the same
+        fix."""
+        sep_root = Path(self.td) / "code-sep"
+        sep_gitdir = Path(self.td) / "code-sep-gitdir"
+        sep_root.mkdir()
+        subprocess.run(["git", "init", "-q", f"--separate-git-dir={sep_gitdir}"], cwd=sep_root, check=True)
+        subprocess.run(["git", "config", "user.email", "test@test.local"], cwd=sep_root, check=True)
+        subprocess.run(["git", "config", "user.name", "test"], cwd=sep_root, check=True)
+        _write(sep_root / "src" / "mapped.py", "# mapped\n")
+        subprocess.run(["git", "add", "-A"], cwd=sep_root, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=sep_root, check=True)
+        sep_wt = Path(self.td) / "code-sep-wt"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "wt-sep", str(sep_wt)], cwd=sep_root, check=True,
+        )
+
+        env = self.base_env(
+            MEMCONTINUUM_CODE_ROOT=str(sep_root.resolve()),
+            MEMCONTINUUM_CODE_ROOTS=json.dumps([str(sep_root.resolve())]),
+        )
+        session_id = "s-ledger-wt-sep"
+        wt_file = str(sep_wt / "src" / "mapped.py")
+        payload = self.post_tool_use_payload(session_id, wt_file)
+        proc, _ = run_script(LEDGER_HOOK, payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        main_path = str((sep_root / "src" / "mapped.py").resolve())
+        state = self.load_state(session_id)
+        entry = [e for e in state["ledger"] if e["path"] == main_path]
+        self.assertEqual(len(entry), 1, state.get("ledger"))
+
+    def test_git_dir_env_poisoning_unwired_worktree_not_remapped(self):
+        """Grok's first MAJOR: mc_remap_worktree_path's own `git` calls
+        must ignore an ambient GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR --
+        here GIT_DIR points at the WIRED code root while the edited file
+        is a worktree of the UNWIRED repo_b; a leaked GIT_DIR must never
+        turn that into a false match onto the wired root's records."""
+        env = self._env(GIT_DIR=str(self.code_root.resolve() / ".git"))
+        session_id = "s-ledger-wt-gitdir-poison"
+        wt_file = str(self.repo_b_wt / "src" / "other.py")
+        payload = self.post_tool_use_payload(session_id, wt_file)
+        proc, _ = run_script(LEDGER_HOOK, payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        state = self.load_state(session_id)
+        self.assertNotIn(wt_file, [e["path"] for e in state.get("ledger", [])])
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=worktree-unwired", self._last_outcome_line(log_text))
+
+    def test_junk_gitfile_below_unwired_dir_gives_unresolved(self):
+        junk_dir = Path(self.td) / "junk-unwired"
+        (junk_dir / "sub").mkdir(parents=True)
+        (junk_dir / ".git").write_text("not a real gitfile\n")
+        target = junk_dir / "sub" / "file.py"
+        target.write_text("# x\n")
+        session_id = "s-ledger-wt-junkgit"
+        payload = self.post_tool_use_payload(session_id, str(target))
+        proc, _ = run_script(LEDGER_HOOK, payload, self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        state = self.load_state(session_id)
+        self.assertEqual(state.get("ledger", []), [])
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=worktree-unresolved", self._last_outcome_line(log_text))
+
+    def test_ordinary_checkout_of_unwired_repo_outcome_unchanged(self):
+        """Requirement 5: a plain (non-worktree) checkout of a repo that
+        was never wired must keep today's plain `out-of-scope` outcome,
+        never a new worktree-* one -- this is repo_b's OWN main checkout,
+        not repo_b_wt."""
+        session_id = "s-ledger-wt-ordinary-unwired"
+        main_path = str(self.repo_b / "src" / "other.py")
+        payload = self.post_tool_use_payload(session_id, main_path)
+        proc, _ = run_script(LEDGER_HOOK, payload, self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = self.load_state(session_id)
+        self.assertNotIn(main_path, [e["path"] for e in state.get("ledger", [])])
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=out-of-scope", self._last_outcome_line(log_text))
 
 
 class TestMutationSurface(HookTestBase):

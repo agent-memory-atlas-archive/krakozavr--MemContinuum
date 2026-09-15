@@ -1466,6 +1466,100 @@ class TestPerLanguageSkipDirs(unittest.TestCase):
             self.assertIn("ts", err_buf.getvalue())
 
 
+class TestNestedWorktreeExcludedFromCodeWalk(unittest.TestCase):
+    """Worktree-gap round 2 (Codex's "code index check" instruction, fix
+    round 2 report): a `git worktree add` checkout made INSIDE a
+    configured code root (e.g. `<root>/.worktrees/feat/`) is now the
+    layout hooks/mc-path-lib.sh's mc_remap_worktree_path gives retrieval
+    and ledger coverage to -- but its own tracked-file content is a
+    DIFFERENT git checkout than `root`'s own, and must never be silently
+    indexed as if it belonged to `root`. `iter_code_files`,
+    `iter_code_source_files` (what `code-reindex` actually walks), and
+    `code_census` all share `_prune_dirnames_for_code_walk`, which prunes
+    any directory whose own top holds a `.git` FILE (never a directory --
+    an ordinary checkout's `.git` stays walked as before)."""
+
+    @staticmethod
+    def _make_nested_worktree(root):
+        wt = root / ".worktrees" / "feat"
+        (wt / "src").mkdir(parents=True)
+        (wt / "src" / "other.py").write_text("def other():\n    return 2\n")
+        # A real `git worktree add` leaves a `.git` FILE (not directory)
+        # at the worktree's own top, containing a `gitdir: ...` pointer.
+        # The exclusion is keyed on that FILE, never on the "worktrees"
+        # directory name itself, so a plain text file reproduces it
+        # without needing a real git repo for this unit-level test.
+        (wt / ".git").write_text("gitdir: /nonexistent/main/.git/worktrees/feat\n")
+        return wt
+
+    def test_iter_code_files_excludes_nested_worktree_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(PY_FIXTURES / "basic_functions.py", root / "basic_functions.py")
+            self._make_nested_worktree(root)
+
+            paths = {p.relative_to(root) for p in memidx.iter_code_files(root)}
+            self.assertIn(Path("basic_functions.py"), paths)
+            self.assertFalse(
+                any(".worktrees" in p.parts for p in paths),
+                f"nested worktree content must be excluded, got: {paths}",
+            )
+
+    def test_code_reindex_excludes_nested_worktree_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(PY_FIXTURES / "basic_functions.py", root / "basic_functions.py")
+            self._make_nested_worktree(root)
+            db = Path(td) / "idx-code.sqlite"
+
+            rc = code_reindex(root, db, no_embed=True, lang="python")
+            self.assertEqual(rc, 0)
+
+            conn = memidx.open_code_db(db)
+            paths = {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
+            conn.close()
+            self.assertIn("basic_functions.py", paths)
+            self.assertFalse(
+                any(".worktrees" in Path(p).parts for p in paths),
+                f"nested worktree content must not be chunked/indexed, got: {paths}",
+            )
+
+    def test_code_census_excludes_nested_worktree_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(PY_FIXTURES / "basic_functions.py", root / "basic_functions.py")
+            self._make_nested_worktree(root)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = memidx.main(["code-census", "--root", str(root), "--json"])
+            self.assertEqual(rc, 0)
+            data = json.loads(buf.getvalue())
+            # basic_functions.py counted; the nested worktree's other.py
+            # must not inflate the same python count.
+            self.assertEqual(data["python"], {"files": 1, "status": "supported"})
+
+    def test_ordinary_dot_git_directory_still_pruned_as_before(self):
+        """The exclusion is `.git`-FILE-specific; an ordinary checkout's
+        own `.git` DIRECTORY (the pre-existing, unrelated
+        chunkers.UNIVERSAL_SKIP_DIRS rule) must keep being pruned too --
+        this is a regression guard, not new behavior."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"
+            root.mkdir()
+            shutil.copy(PY_FIXTURES / "basic_functions.py", root / "basic_functions.py")
+            git_dir = root / ".git" / "objects"
+            git_dir.mkdir(parents=True)
+            (root / ".git" / "stray.py").write_text("def stray():\n    return 1\n")
+
+            paths = {p.relative_to(root) for p in memidx.iter_code_files(root)}
+            self.assertIn(Path("basic_functions.py"), paths)
+            self.assertFalse(any(".git" in p.parts for p in paths))
+
+
 class TestSkipDirOwnLanguageRule(unittest.TestCase):
     """C1 (final fix wave, supersedes Task 7's Step 1(b) union rule, which
     the Codex gate flagged as silent data loss): a language's skip_dirs

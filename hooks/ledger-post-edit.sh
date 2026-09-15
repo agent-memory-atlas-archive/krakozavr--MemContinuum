@@ -3,6 +3,50 @@
 # design R6, audit MC-P1-04, TOP-0123 L6): silently appends every edited
 # file_path under any configured code root or the store root to this
 # session's ledger ($MEMCONTINUUM_HOME/sessions/<project>/<session_id>.json).
+#
+# The worktree gap (docs/internal/SESSION-HANDOFF-releases-0.3-to-0.6.md
+# SS"0.2.0 final" item 1): a `git worktree add` checkout of a wired code
+# root is a different absolute directory nothing wired, so the containment
+# loop below used to find nothing and log a plain `out-of-scope` for every
+# SIBLING worktree edit, indistinguishable from a genuine out-of-scope path
+# (this was the counted write-side loss the handoff item measures). Fixed
+# via mc_remap_worktree_path (hooks/mc-path-lib.sh): it maps the edited
+# path back to its main-checkout equivalent when (and only when) the
+# worktree's own main repo IS one of the configured code roots -- never
+# onto an unwired repo's records, and never by indexing the worktree's own
+# (possibly different-branch, possibly uncommitted) content.
+#
+# Round 2 fix (Grok BLOCKER, same defect as pre-edit-chain.sh's own):
+# trying the remap ONLY once the containment loop has failed for BOTH the
+# code roots and the store root was itself the bug for a worktree checked
+# out INSIDE a configured root (e.g. `<root>/.worktrees/feat/`) --
+# FILE_PATH is physically under the root by plain containment (the loop
+# succeeds, UNDER_CODE=1), so the remap used to never even get attempted,
+# and the ledger row was recorded under the WORKTREE's own path/root
+# annotation instead of the main-checkout-equivalent one (breaking
+# `memidx.py unmapped --code-root`'s root-relative accounting for exactly
+# this row). Now also tried when the containment loop already succeeded,
+# gated on mc_nested_worktree_gitfile's bash-only check so the ordinary
+# in-root case (no nested worktree at all) still pays no extra `git` call.
+#
+# On a successful remap the ledger row is recorded under the SAME
+# `path`/`root` a main-checkout edit of that file would get (so downstream
+# root-relative coverage tracking, e.g. hooks/userprompt-remind.sh's
+# `memidx.py unmapped --code-root`, works unchanged); `content_sha256` is
+# always read from the file that was ACTUALLY edited (never from the
+# remapped path, whose main-checkout content can differ or not exist at
+# all), and that real path is kept visible on the row as `worktree_path`.
+# Two new outcomes name the two ways this can still fail rather than
+# silently collapsing back into `out-of-scope`: `worktree-unwired`
+# (confirmed to be a linked worktree, but its main repo is not a
+# configured code root) and `worktree-unresolved` (git itself could not
+# settle the question) -- both apply only to a FILE_PATH that was NOT
+# already under some configured root (an in-root path with an unresolved
+# nested worktree falls through to the row it would have gotten before
+# this fix, not a new outcome -- see the call site's own comment). A
+# worktree of the STORE repo is out of scope for this fix -- the code
+# index/coverage is what the gap is about; store-root worktrees are a
+# separate, unrequested problem.
 # Never prints anything (PostToolUse additionalContext exists but this hook
 # never uses it -- it is pure evidence-gathering, not a reminder point --
 # docs/DESIGN.md ruling A/E). Runs identically inside a subagent
@@ -554,6 +598,8 @@ fi
 UNDER_CODE=0
 UNDER_STORE=0
 MC_MATCHED_ROOT=""
+MC_DID_REMAP=0
+CODE_ROOTS_TEXT="$(mc_code_roots)"
 while IFS= read -r ROOT_CANDIDATE; do
     [ -n "$ROOT_CANDIDATE" ] || continue
     mc_path_under_root "$FILE_PATH" "$ROOT_CANDIDATE"
@@ -563,10 +609,93 @@ while IFS= read -r ROOT_CANDIDATE; do
             MC_MATCHED_ROOT="$ROOT_CANDIDATE"
         fi
     fi
-done < <(mc_code_roots)
+done <<EOF
+$CODE_ROOTS_TEXT
+EOF
 if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
     mc_path_under_root "$FILE_PATH" "$MEMCONTINUUM_ROOT"
     [ $? -eq 0 ] && UNDER_STORE=1
+fi
+
+# Worktree gap (docs/internal/SESSION-HANDOFF-releases-0.3-to-0.6.md
+# SS"0.2.0 final" item 1): mc_remap_worktree_path (hooks/mc-path-lib.sh)
+# fires whenever it might change today's answer -- FILE_PATH matched no
+# configured code root and isn't under the store root either (a SIBLING
+# worktree of a configured root; or a genuinely out-of-scope path, which
+# pays nothing beyond this loop's cost since mc_remap_worktree_path's own
+# bash-only `.git`-entry gate rules it out before spawning git), OR
+# FILE_PATH already matched a code root but that match hides a NESTED
+# linked worktree checked out INSIDE it (e.g. `<root>/.worktrees/feat/`) --
+# round 2 fix (Grok BLOCKER): this second case used to be skipped outright
+# ("already under a root" was wrongly treated as "nothing left to check"),
+# recording the ledger row under the worktree's own path/root instead of
+# the main-checkout-equivalent one. mc_nested_worktree_gitfile's bash-only
+# ancestor walk (hooks/mc-path-lib.sh) gates that second case so the
+# ordinary in-root main-checkout edit (no nested worktree at all -- the
+# overwhelming majority of in-root edits) still pays zero extra `git`
+# calls. code_roots is scoped to CODE roots only here (never the store
+# root) -- deliberately: this remap exists to recover CODE coverage, and a
+# worktree of the store repo is a different, unrequested problem this task
+# does not touch.
+MC_REAL_FILE_PATH="$FILE_PATH"
+MC_TRY_REMAP=0
+MC_WAS_UNDER_ROOT=0
+if [ "$UNDER_STORE" -eq 0 ] && [ -n "$CODE_ROOTS_TEXT" ]; then
+    if [ "$UNDER_CODE" -eq 0 ]; then
+        MC_TRY_REMAP=1
+    else
+        MC_WAS_UNDER_ROOT=1
+        mc_nested_worktree_gitfile "$FILE_PATH" "$MC_MATCHED_ROOT"
+        [ $? -eq 0 ] && MC_TRY_REMAP=1
+    fi
+fi
+if [ "$MC_TRY_REMAP" -eq 1 ]; then
+    MC_REMAPPED_PATH="$(mc_remap_worktree_path "$FILE_PATH" "$CODE_ROOTS_TEXT")"
+    MC_REMAP_RC=$?
+    case $MC_REMAP_RC in
+        0)
+            # Re-run the SAME symlink-safe containment loop, against the
+            # remapped (main-checkout) path this time, so root selection
+            # (longest match) stays exactly the rule the loop above
+            # already uses -- mc_remap_worktree_path only ever returns a
+            # path that sits under some configured root's OWN toplevel, so
+            # this is guaranteed to match at least that root. Reset first
+            # (rather than only ever setting) so the in-root case's
+            # PRE-remap match (against the raw, worktree-relative
+            # FILE_PATH) is fully replaced by the post-remap one, never
+            # merely added to.
+            UNDER_CODE=0
+            MC_MATCHED_ROOT=""
+            while IFS= read -r ROOT_CANDIDATE; do
+                [ -n "$ROOT_CANDIDATE" ] || continue
+                mc_path_under_root "$MC_REMAPPED_PATH" "$ROOT_CANDIDATE"
+                if [ $? -eq 0 ]; then
+                    UNDER_CODE=1
+                    if [ -z "$MC_MATCHED_ROOT" ] || [ "${#ROOT_CANDIDATE}" -gt "${#MC_MATCHED_ROOT}" ]; then
+                        MC_MATCHED_ROOT="$ROOT_CANDIDATE"
+                    fi
+                fi
+            done <<EOF
+$CODE_ROOTS_TEXT
+EOF
+            if [ "$UNDER_CODE" -eq 1 ]; then
+                MC_DID_REMAP=1
+            fi
+            ;;
+        1)
+            # worktree-unwired only when FILE_PATH was NOT already under a
+            # configured root -- an in-root path whose nested gitfile
+            # resolves to "some OTHER, unwired repo's worktree parked
+            # inside this root" falls through to the row it would have
+            # gotten before this fix (UNDER_CODE/MC_MATCHED_ROOT from the
+            # raw FILE_PATH, untouched above), not a new outcome.
+            [ "$MC_WAS_UNDER_ROOT" -eq 0 ] && finish "worktree-unwired"
+            ;;
+        2)
+            [ "$MC_WAS_UNDER_ROOT" -eq 0 ] && finish "worktree-unresolved"
+            ;;
+        *) ;; # 3: not applicable (not a worktree, or no `.git` at all) -- fall through unchanged
+    esac
 fi
 
 if [ "$UNDER_CODE" -eq 0 ] && [ "$UNDER_STORE" -eq 0 ]; then
@@ -578,7 +707,17 @@ KIND="code"
 
 STATE_FILE="$(mc_state_file_for "$MC_PROJECT" "$SESSION_ID")"
 
-export MC_FILE_PATH="$FILE_PATH"
+# On a successful remap, MC_FILE_PATH is the main-checkout EQUIVALENT path
+# (what "path"/"root" get recorded under -- same annotation a main-checkout
+# edit of this file would get, so downstream root-relative coverage
+# tracking, e.g. hooks/userprompt-remind.sh's own `memidx.py unmapped
+# --code-root`, works unchanged). MC_REAL_FILE_PATH is always the file that
+# was ACTUALLY edited -- content is read from there, never from the
+# remapped path (a worktree's own branch/uncommitted content is real; the
+# main checkout's copy at that same relative path can be entirely
+# different, or not exist at all).
+export MC_FILE_PATH="${MC_REMAPPED_PATH:-$FILE_PATH}"
+export MC_REAL_FILE_PATH="$MC_REAL_FILE_PATH"
 export MC_KIND="$KIND"
 export MC_ROOT="$MC_MATCHED_ROOT"
 export MC_SESSION_ID="$SESSION_ID"
@@ -589,6 +728,7 @@ import hashlib, os, time
 '"$MC_STATE_BOOTSTRAP_PY"'
 
 path = os.environ.get("MC_FILE_PATH", "")
+real_path = os.environ.get("MC_REAL_FILE_PATH", "") or path
 kind = os.environ.get("MC_KIND", "code")
 # Design R5 (audit MC-P1-05, TOP-0123 L5): the physical root this path
 # matched, "" for a store row (MC_ROOT is only ever set when the code-root
@@ -597,10 +737,18 @@ kind = os.environ.get("MC_KIND", "code")
 root = os.environ.get("MC_ROOT", "") if kind == "code" else ""
 if path:
     try:
-        with open(path, "rb") as f:
+        with open(real_path, "rb") as f:
             content_sha = hashlib.sha256(f.read()).hexdigest()
     except OSError:
         content_sha = ""
+
+    # Worktree gap: worktree_path is the REAL edited path, recorded
+    # alongside the main-checkout "path" so the real provenance stays
+    # visible -- set only when it actually differs (a plain, non-remapped
+    # edit never carries this key at all), and explicitly REMOVED on the
+    # update branch so a later main-checkout edit of the same "path"
+    # does not inherit a stale worktree_path from an earlier worktree edit.
+    worktree_path = real_path if real_path != path else None
 
     ledger = state.setdefault("ledger", [])
     found = False
@@ -614,16 +762,23 @@ if path:
             entry["seen_at"] = now
             entry["root"] = root
             entry["source"] = "tool"
+            if worktree_path:
+                entry["worktree_path"] = worktree_path
+            else:
+                entry.pop("worktree_path", None)
             break
     if not found:
-        ledger.append({
+        new_entry = {
             "path": path,
             "kind": kind,
             "content_sha256": content_sha,
             "seen_at": now,
             "root": root,
             "source": "tool",
-        })
+        }
+        if worktree_path:
+            new_entry["worktree_path"] = worktree_path
+        ledger.append(new_entry)
 
     is_new_pair = (not found) or (previous_sha != content_sha)
     if is_new_pair:
@@ -638,8 +793,10 @@ print(json.dumps(state))
 '
 RC=$?
 
+MC_APPEND_EXTRA=""
+[ "$MC_DID_REMAP" -eq 1 ] && MC_APPEND_EXTRA=" remap=1"
 if [ $RC -eq 0 ]; then
-    finish "appended kind=$KIND"
+    finish "appended kind=$KIND$MC_APPEND_EXTRA"
 else
     finish "update-failed rc=$RC"
 fi
