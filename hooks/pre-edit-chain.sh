@@ -32,24 +32,33 @@
 # The worktree gap (docs/internal/SESSION-HANDOFF-releases-0.3-to-0.6.md
 # SS"0.2.0 final" item 1): once every candidate below (raw path, cwd-
 # relative, STRIP_PREFIX forms) has failed for FILE_PATH itself,
-# mc_remap_worktree_path (hooks/mc-path-lib.sh) is tried exactly once: if
-# FILE_PATH sits inside a `git worktree` whose MAIN checkout is one of the
-# roots MEMCONTINUUM_STRIP_PREFIX names, it is remapped to its main-checkout-
+# mc_remap_worktree_path (hooks/mc-path-lib.sh) is tried: if FILE_PATH
+# sits inside a `git worktree` whose MAIN checkout is one of the roots
+# MEMCONTINUUM_STRIP_PREFIX names, it is remapped to its main-checkout-
 # equivalent path and fed back through the SAME candidate machinery -- never
 # onto an unwired repo's records, and never by indexing the worktree's own
 # content. Two outcomes name the ways this can still fail visibly instead of
 # collapsing into a plain `no-match`: `worktree-unwired` (confirmed to be a
 # worktree, but its main repo isn't a configured root) and
-# `worktree-unresolved` (git itself could not settle the question). This
-# closes the gap in THIS SCRIPT's own logic; it cannot make the harness
+# `worktree-unresolved` (git itself could not settle the question).
+#
+# This closes the gap in THIS SCRIPT's own logic; it cannot make the harness
 # LAUNCH the script for a file outside every "if" glob repo-init.sh renders
 # (templates/code-root-filter-pair.json.tmpl scopes each invocation's "if"
 # to one literal code-root path) -- a worktree checked out as a SIBLING of
-# the wired root never reaches this script at all under current wiring; one
-# checked out INSIDE the wired root (e.g. `<root>/.worktrees/x`) does, and
-# is what this fix closes end-to-end. See this task's own report for the
-# settings-rendering follow-up that would be needed to close the sibling
-# case too.
+# the wired root never reaches this script at all under current wiring, so
+# it gets NO retrieval here (ledger-post-edit.sh, which has no such filter,
+# still ledgers it -- see that hook's own header). One checked out INSIDE
+# the wired root (e.g. `<root>/.worktrees/x`) DOES reach this script, and
+# gets full retrieval -- round 1 of this fix claimed this case was "closed
+# end-to-end" while its own callers still silently skipped the remap for
+# ANY FILE_PATH already physically under a configured root (Grok's round-2
+# BLOCKER finding): the in-root worktree case is what that round-2 fix
+# actually closes; round 1 only wired the machinery for it. A project that
+# wants retrieval for its own worktrees should therefore keep them INSIDE
+# the code root (e.g. `<root>/.worktrees/`, gitignored by that project) --
+# a sibling worktree stays ledger-only until the settings-rendering
+# follow-up (see this task's own report) widens the "if" glob itself.
 #
 # Env:
 #   MEMCONTINUUM_ROOT     store markdown root; used to derive a default
@@ -521,17 +530,22 @@ done
 # of "the configured roots this invocation knows about", not a
 # looser/lossier stand-in for mc_code_roots. A hand-wired STRIP_PREFIX that
 # is not really a repo root can never produce a false remap either way --
-# mc_remap_worktree_path's own match test is exact `.git`-directory
-# identity, never a prefix/substring test (see its header in
-# hooks/mc-path-lib.sh) -- it would just make the remap silently not fire.
+# mc_remap_worktree_path's own match test is exact common-dir identity,
+# never a prefix/substring test (see its header in hooks/mc-path-lib.sh)
+# -- it would just make the remap silently not fire.
 #
-# Zero extra `git` calls for the common case: skipped entirely (no
-# sourcing, no root loop, no remap attempt) whenever a query never even
-# ran (index-missing/index-error/query-failed already `finish`ed above) OR
-# FILE_PATH is already physically under one of these roots -- that miss was
-# ALREADY fully evaluated by the candidate loop above (STRIP_PREFIX's own
-# candidate is exactly the in-root relative form) and must cost nothing
-# extra, per INV-0001's own majority case (absences inside the wired repo).
+# Round 2 fix (Grok BLOCKER): a FILE_PATH already physically under one of
+# these roots used to skip this whole block outright -- wrong for a
+# worktree checked out INSIDE the root (e.g. `<root>/.worktrees/feat/`),
+# the ONLY worktree location the settings-level "if" glob
+# (templates/code-root-filter-pair.json.tmpl) ever lets THIS SCRIPT be
+# invoked for at all (a sibling worktree's Edit never matches that glob,
+# so it never reaches this script -- see this file's own header). Fixed:
+# still zero extra `git` calls for the ordinary in-root case (no nested
+# worktree at all -- by far the common shape of an in-root miss), via
+# mc_nested_worktree_gitfile's bash-only ancestor walk; the one `git`
+# call inside mc_remap_worktree_path is paid only when that walk actually
+# finds a nested `.git` FILE between FILE_PATH and the matching root.
 if [ -z "$MATCHED_CANDIDATE" ] && [ "$ANY_QUERY_SUCCEEDED" -eq 1 ] && [ -n "${MEMCONTINUUM_STRIP_PREFIX:-}" ]; then
     WT_ROOTS=""
     declare -a WT_ROOT_ARR=()
@@ -548,16 +562,31 @@ if [ -z "$MATCHED_CANDIDATE" ] && [ "$ANY_QUERY_SUCCEEDED" -eq 1 ] && [ -n "${ME
     if [ -n "$WT_ROOTS" ]; then
         # shellcheck source=mc-path-lib.sh
         source "$SCRIPT_DIR/mc-path-lib.sh"
-        WT_ALREADY_UNDER_ROOT=0
+        # WT_IN_ROOT: the matching root's own string when FILE_PATH is
+        # physically under one of WT_ROOT_ARR, else empty. Kept (not just
+        # a 0/1 flag) because a nonzero mc_remap_worktree_path rc for an
+        # IN-ROOT path must fall through to today's plain outcome rather
+        # than `finish` a worktree-* outcome (see the case below) -- an
+        # in-root path with no nested worktree, or with a nested gitfile
+        # that mc_remap_worktree_path could not resolve, is not a
+        # worktree-gap situation the caller should report as one; it is
+        # exactly the pre-fix "in root, no decision bound to it" miss.
+        WT_IN_ROOT=""
         for wt_root in "${WT_ROOT_ARR[@]}"; do
             mc_path_under_root "$FILE_PATH" "$wt_root"
             if [ $? -eq 0 ]; then
-                WT_ALREADY_UNDER_ROOT=1
+                WT_IN_ROOT="$wt_root"
                 break
             fi
         done
 
-        if [ "$WT_ALREADY_UNDER_ROOT" -eq 0 ]; then
+        WT_TRY_REMAP=1
+        if [ -n "$WT_IN_ROOT" ]; then
+            mc_nested_worktree_gitfile "$FILE_PATH" "$WT_IN_ROOT"
+            [ $? -eq 0 ] || WT_TRY_REMAP=0
+        fi
+
+        if [ "$WT_TRY_REMAP" -eq 1 ]; then
             WT_REMAPPED="$(mc_remap_worktree_path "$FILE_PATH" "$WT_ROOTS")"
             WT_REMAP_RC=$?
             case $WT_REMAP_RC in
@@ -577,8 +606,18 @@ if [ -z "$MATCHED_CANDIDATE" ] && [ "$ANY_QUERY_SUCCEEDED" -eq 1 ] && [ -n "${ME
                         done
                     fi
                     ;;
-                1) finish "worktree-unwired" ;;
-                2) finish "worktree-unresolved" ;;
+                1)
+                    # worktree-unwired only when FILE_PATH itself was NOT
+                    # already under a configured root -- an in-root path
+                    # whose nested gitfile still resolved to "unwired"
+                    # (some OTHER, unwired repo's worktree parked inside
+                    # this root) falls through unchanged, same as an
+                    # in-root path with no nested worktree at all.
+                    [ -z "$WT_IN_ROOT" ] && finish "worktree-unwired"
+                    ;;
+                2)
+                    [ -z "$WT_IN_ROOT" ] && finish "worktree-unresolved"
+                    ;;
                 *) ;; # 3: not applicable (not a worktree, or no .git at all)
             esac
         fi

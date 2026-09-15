@@ -8,26 +8,42 @@
 # SS"0.2.0 final" item 1): a `git worktree add` checkout of a wired code
 # root is a different absolute directory nothing wired, so the containment
 # loop below used to find nothing and log a plain `out-of-scope` for every
-# worktree edit, indistinguishable from a genuine out-of-scope path (this
-# was the counted write-side loss the handoff item measures). Fixed via
-# mc_remap_worktree_path (hooks/mc-path-lib.sh), tried ONLY once the
-# containment loop has already failed for BOTH the code roots and the
-# store root: it maps the edited path back to its main-checkout equivalent
-# when (and only when) the worktree's own main repo IS one of the
-# configured code roots -- never onto an unwired repo's records, and never
-# by indexing the worktree's own (possibly different-branch, possibly
-# uncommitted) content. On a successful remap the ledger row is recorded
-# under the SAME `path`/`root` a main-checkout edit of that file would get
-# (so downstream root-relative coverage tracking, e.g.
-# hooks/userprompt-remind.sh's `memidx.py unmapped --code-root`, works
-# unchanged); `content_sha256` is always read from the file that was
-# ACTUALLY edited (never from the remapped path, whose main-checkout
-# content can differ or not exist at all), and that real path is kept
-# visible on the row as `worktree_path`. Two new outcomes name the two
-# ways this can still fail rather than silently collapsing back into
-# `out-of-scope`: `worktree-unwired` (confirmed to be a linked worktree,
-# but its main repo is not a configured code root) and
-# `worktree-unresolved` (git itself could not settle the question). A
+# SIBLING worktree edit, indistinguishable from a genuine out-of-scope path
+# (this was the counted write-side loss the handoff item measures). Fixed
+# via mc_remap_worktree_path (hooks/mc-path-lib.sh): it maps the edited
+# path back to its main-checkout equivalent when (and only when) the
+# worktree's own main repo IS one of the configured code roots -- never
+# onto an unwired repo's records, and never by indexing the worktree's own
+# (possibly different-branch, possibly uncommitted) content.
+#
+# Round 2 fix (Grok BLOCKER, same defect as pre-edit-chain.sh's own):
+# trying the remap ONLY once the containment loop has failed for BOTH the
+# code roots and the store root was itself the bug for a worktree checked
+# out INSIDE a configured root (e.g. `<root>/.worktrees/feat/`) --
+# FILE_PATH is physically under the root by plain containment (the loop
+# succeeds, UNDER_CODE=1), so the remap used to never even get attempted,
+# and the ledger row was recorded under the WORKTREE's own path/root
+# annotation instead of the main-checkout-equivalent one (breaking
+# `memidx.py unmapped --code-root`'s root-relative accounting for exactly
+# this row). Now also tried when the containment loop already succeeded,
+# gated on mc_nested_worktree_gitfile's bash-only check so the ordinary
+# in-root case (no nested worktree at all) still pays no extra `git` call.
+#
+# On a successful remap the ledger row is recorded under the SAME
+# `path`/`root` a main-checkout edit of that file would get (so downstream
+# root-relative coverage tracking, e.g. hooks/userprompt-remind.sh's
+# `memidx.py unmapped --code-root`, works unchanged); `content_sha256` is
+# always read from the file that was ACTUALLY edited (never from the
+# remapped path, whose main-checkout content can differ or not exist at
+# all), and that real path is kept visible on the row as `worktree_path`.
+# Two new outcomes name the two ways this can still fail rather than
+# silently collapsing back into `out-of-scope`: `worktree-unwired`
+# (confirmed to be a linked worktree, but its main repo is not a
+# configured code root) and `worktree-unresolved` (git itself could not
+# settle the question) -- both apply only to a FILE_PATH that was NOT
+# already under some configured root (an in-root path with an unresolved
+# nested worktree falls through to the row it would have gotten before
+# this fix, not a new outcome -- see the call site's own comment). A
 # worktree of the STORE repo is out of scope for this fix -- the code
 # index/coverage is what the gap is about; store-root worktrees are a
 # separate, unrequested problem.
@@ -602,18 +618,38 @@ if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
 fi
 
 # Worktree gap (docs/internal/SESSION-HANDOFF-releases-0.3-to-0.6.md
-# SS"0.2.0 final" item 1): reached ONLY on the branch that already gives up
-# today -- FILE_PATH matched no configured code root and isn't under the
-# store root either. mc_remap_worktree_path (hooks/mc-path-lib.sh) is a
-# single `git` call at most, and only fires when a `.git` entry exists
-# somewhere on FILE_PATH's ancestor chain, so an ordinary out-of-scope path
-# (not in any git repo at all) pays nothing beyond what this loop already
-# cost. code_roots is scoped to CODE roots only here (never the store
+# SS"0.2.0 final" item 1): mc_remap_worktree_path (hooks/mc-path-lib.sh)
+# fires whenever it might change today's answer -- FILE_PATH matched no
+# configured code root and isn't under the store root either (a SIBLING
+# worktree of a configured root; or a genuinely out-of-scope path, which
+# pays nothing beyond this loop's cost since mc_remap_worktree_path's own
+# bash-only `.git`-entry gate rules it out before spawning git), OR
+# FILE_PATH already matched a code root but that match hides a NESTED
+# linked worktree checked out INSIDE it (e.g. `<root>/.worktrees/feat/`) --
+# round 2 fix (Grok BLOCKER): this second case used to be skipped outright
+# ("already under a root" was wrongly treated as "nothing left to check"),
+# recording the ledger row under the worktree's own path/root instead of
+# the main-checkout-equivalent one. mc_nested_worktree_gitfile's bash-only
+# ancestor walk (hooks/mc-path-lib.sh) gates that second case so the
+# ordinary in-root main-checkout edit (no nested worktree at all -- the
+# overwhelming majority of in-root edits) still pays zero extra `git`
+# calls. code_roots is scoped to CODE roots only here (never the store
 # root) -- deliberately: this remap exists to recover CODE coverage, and a
 # worktree of the store repo is a different, unrequested problem this task
 # does not touch.
 MC_REAL_FILE_PATH="$FILE_PATH"
-if [ "$UNDER_CODE" -eq 0 ] && [ "$UNDER_STORE" -eq 0 ] && [ -n "$CODE_ROOTS_TEXT" ]; then
+MC_TRY_REMAP=0
+MC_WAS_UNDER_ROOT=0
+if [ "$UNDER_STORE" -eq 0 ] && [ -n "$CODE_ROOTS_TEXT" ]; then
+    if [ "$UNDER_CODE" -eq 0 ]; then
+        MC_TRY_REMAP=1
+    else
+        MC_WAS_UNDER_ROOT=1
+        mc_nested_worktree_gitfile "$FILE_PATH" "$MC_MATCHED_ROOT"
+        [ $? -eq 0 ] && MC_TRY_REMAP=1
+    fi
+fi
+if [ "$MC_TRY_REMAP" -eq 1 ]; then
     MC_REMAPPED_PATH="$(mc_remap_worktree_path "$FILE_PATH" "$CODE_ROOTS_TEXT")"
     MC_REMAP_RC=$?
     case $MC_REMAP_RC in
@@ -623,7 +659,13 @@ if [ "$UNDER_CODE" -eq 0 ] && [ "$UNDER_STORE" -eq 0 ] && [ -n "$CODE_ROOTS_TEXT
             # (longest match) stays exactly the rule the loop above
             # already uses -- mc_remap_worktree_path only ever returns a
             # path that sits under some configured root's OWN toplevel, so
-            # this is guaranteed to match at least that root.
+            # this is guaranteed to match at least that root. Reset first
+            # (rather than only ever setting) so the in-root case's
+            # PRE-remap match (against the raw, worktree-relative
+            # FILE_PATH) is fully replaced by the post-remap one, never
+            # merely added to.
+            UNDER_CODE=0
+            MC_MATCHED_ROOT=""
             while IFS= read -r ROOT_CANDIDATE; do
                 [ -n "$ROOT_CANDIDATE" ] || continue
                 mc_path_under_root "$MC_REMAPPED_PATH" "$ROOT_CANDIDATE"
@@ -640,8 +682,18 @@ EOF
                 MC_DID_REMAP=1
             fi
             ;;
-        1) finish "worktree-unwired" ;;
-        2) finish "worktree-unresolved" ;;
+        1)
+            # worktree-unwired only when FILE_PATH was NOT already under a
+            # configured root -- an in-root path whose nested gitfile
+            # resolves to "some OTHER, unwired repo's worktree parked
+            # inside this root" falls through to the row it would have
+            # gotten before this fix (UNDER_CODE/MC_MATCHED_ROOT from the
+            # raw FILE_PATH, untouched above), not a new outcome.
+            [ "$MC_WAS_UNDER_ROOT" -eq 0 ] && finish "worktree-unwired"
+            ;;
+        2)
+            [ "$MC_WAS_UNDER_ROOT" -eq 0 ] && finish "worktree-unresolved"
+            ;;
         *) ;; # 3: not applicable (not a worktree, or no `.git` at all) -- fall through unchanged
     esac
 fi
