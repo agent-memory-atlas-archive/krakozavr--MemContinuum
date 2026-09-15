@@ -4,10 +4,11 @@
 
 ### Tests
 - The suite no longer builds a virtual environment in its own checkout: a
-  bare `--apply` in one release-hygiene test reached the real installer
-  script once the machine layer became default-on, silently leaving a
-  `.venv` behind next to the code. Six tests that depend on no engine
-  `.venv` being present now skip with a stated reason when one exists,
+  bare `--apply` in an updater test (the one proving the apply-row walk
+  fails on every unfinished row) reached the real installer script once
+  the machine layer became default-on, silently leaving a `.venv` behind
+  next to the code. Six tests that depend on no engine `.venv` being
+  present now skip with a stated reason when one exists,
   instead of failing on a precondition they do not control, and a loud
   precondition check names the requirement directly.
 
@@ -16,8 +17,9 @@
   actually happens: the governing decision chain reaches the model
   together with that edit's own tool result, in the same turn, and shapes
   what the agent does next -- not the content of the edit that triggered
-  the lookup. The hook still runs before the edit lands on disk, where it
-  can still deny or rewrite the call, and retrieval is still automatic.
+  the lookup. The hook still runs before the edit lands on disk, though it
+  fails open -- it never blocks or alters the edit -- and retrieval is
+  still automatic.
 
 ### Repository hygiene
 - `.claude/` is per-machine rendered wiring and is now ignored
@@ -60,9 +62,9 @@
   can change, what an invalid rewrite produces, whether a denial's reason
   text changes what the model writes on retry, and whether a hook that
   always denies can hang a session. Each harness builds and tears down its
-  own disposable fixture, with a per-run unguessable marker reachable to
-  the model only through the mechanism under test, and a contamination
-  check confirming it reached nowhere else.
+  own disposable fixture, with a per-run unguessable marker and a
+  contamination check confirming it appears in neither the prompt nor the
+  project tree.
 
 ## [0.2.0rc5] — 2026-09-10
 

@@ -49,9 +49,9 @@ No `--max-turns` CLI flag exists in this build (checked via `claude
 plus this harness's own subprocess timeout, exactly like the ordering
 probe's existing safety net.
 
-D3 and D4 extend the same D1/D1B family to answer the two follow-up
-questions raised in memory/investigations/what-a-pre-tool-hook-can-actually-
-enforce.md, once denial itself and dictated-nonce refusal were established:
+D3 and D4 extend the same D1/D1B family to answer two follow-up questions
+about what a pre-edit hook can actually enforce, once denial itself and
+dictated-nonce refusal were established:
   - D3: does a denial naming an ORDINARY, PLAUSIBLE, non-nonce value --
     grounded in a real sibling file the model can Read and verify -- get
     treated differently on retry than D1/D1B's nonce-shaped dictated

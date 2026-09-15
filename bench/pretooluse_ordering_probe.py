@@ -4,18 +4,14 @@ sees hooks/pre-edit-chain.sh's PreToolUse `additionalContext`: before the
 model has already emitted its Edit/Write tool_use block, or only in the
 follow-up turn, alongside the tool result.
 
-Companion measurement to a Codex-side finding of the same shape ("PreToolUse
-additionalContext is post-execution model context in Codex 0.154.0"),
-measured by a Codex-side harness kept outside this repository.
-Same essential design: a per-run unguessable nonce lives ONLY inside a
-disposable store's ruling text (`_runtime_topic`), reachable to the model
-only through the real hook's additionalContext by way of `code_refs`
-binding the file the model is asked to edit. The nonce is never placed in
-the prompt, in any file under the code root, or anywhere else the model
-could read or search it into view on its own.
+A per-run unguessable nonce lives ONLY inside a disposable store's ruling
+text (`_runtime_topic`), reachable to the model only through the real
+hook's additionalContext by way of `code_refs` binding the file the model
+is asked to edit. The nonce is never placed in the prompt, in any file
+under the code root, or anywhere else the model could read or search it
+into view on its own.
 
-Unlike the Codex probe, this one does not need a wire-level transport
-proxy: Claude Code's own `--output-format stream-json --include-hook-events`
+Claude Code's own `--output-format stream-json --include-hook-events`
 interleaves `system`/`hook_started`/`hook_response` events with the
 `assistant`/`user` (tool_use/tool_result) messages in one ordered stream,
 so the transcript alone establishes ordering -- no separate wire probe is
@@ -65,9 +61,8 @@ GOVERNED_RELPATH = "src/governed.py"
 
 
 def generate_nonce() -> str:
-    """Per-run unguessable token -- a separate, patchable seam (same
-    reasoning as the Codex probe's `_generate_nonce`), never an inline
-    call, so a test can substitute a known value."""
+    """Per-run unguessable token -- a separate, patchable seam, never an
+    inline call, so a test can substitute a known value."""
     return f"MC-NONCE-{secrets.token_hex(16)}"
 
 
@@ -369,10 +364,10 @@ def parse_transcript(stdout: str) -> list[dict[str, Any]]:
 def analyze_nonce_ordering(events: list[dict[str, Any]], nonce: str) -> dict[str, Any]:
     """Measure transcript EMISSION ORDER (message index in the
     `--output-format stream-json --include-hook-events` stream), not
-    request order as such -- but here, unlike the Codex JSONL shape,
-    `hook_started`/`hook_response` are the CLI's own record of when the
-    hook actually ran relative to the surrounding assistant/tool_use
-    messages, not something this harness has to infer indirectly. The
+    request order as such: `hook_started`/`hook_response` are the CLI's
+    own record of when the hook actually ran relative to the surrounding
+    assistant/tool_use messages, not something this harness has to infer
+    indirectly. The
     decisive comparison is `hook_started_index` (when the hook that gates
     the edit actually started) against
     `first_edit_write_tool_use_index` (when the model's OWN Edit/Write
