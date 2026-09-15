@@ -136,8 +136,10 @@ mc_path_under_root() {
 # raw/cwd-relative/STRIP_PREFIX candidates every caller already tries for
 # FILE_PATH itself are the wrong relative form and a real decision binds
 # to nothing. This function is the caller-side gate that decides whether
-# that expensive check (one `git` call, inside mc_remap_worktree_path) is
-# worth paying for an in-root FILE_PATH: bash-only, no git, no python --
+# that expensive check (one identity `git` call for FILE_PATH itself, plus
+# one more per configured root while mc_remap_worktree_path searches for a
+# match) is worth paying for an in-root FILE_PATH: bash-only, no git, no
+# python --
 # does a `.git` FILE (a linked worktree's own marker -- an ordinary
 # checkout's `.git` is a DIRECTORY) sit somewhere on FILE_PATH's ancestor
 # chain STRICTLY BELOW ROOT's own real location?
