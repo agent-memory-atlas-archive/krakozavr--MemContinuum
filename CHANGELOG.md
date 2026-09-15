@@ -1,5 +1,67 @@
 # Changelog
 
+## [0.2.0] — 2026-09-15
+
+### Tests
+- The suite no longer builds a virtual environment in its own checkout: a
+  bare `--apply` in one release-hygiene test reached the real installer
+  script once the machine layer became default-on, silently leaving a
+  `.venv` behind next to the code. Six tests that depend on no engine
+  `.venv` being present now skip with a stated reason when one exists,
+  instead of failing on a precondition they do not control, and a loud
+  precondition check names the requirement directly.
+
+### Documentation
+- The README and the pre-edit hook's own header comment now say what
+  actually happens: the governing decision chain reaches the model
+  together with that edit's own tool result, in the same turn, and shapes
+  what the agent does next -- not the content of the edit that triggered
+  the lookup. The hook still runs before the edit lands on disk, where it
+  can still deny or rewrite the call, and retrieval is still automatic.
+
+### Repository hygiene
+- `.claude/` is per-machine rendered wiring and is now ignored
+  root-anchored, rather than only its `skills/` subdirectory -- the rest of
+  the directory sat untracked and un-ignored, one `git add -A` away from a
+  public repository. The machine-identifying-content guard's failure
+  message now names what a flagged file risks and the two legitimate
+  fixes, instead of reporting only that something was found.
+
+### Hooks
+- An edit inside a worktree of a wired repository is no longer invisible
+  to the hooks: a worktree checked out inside the code root gets the same
+  retrieval and the same ledger entry a main-checkout edit gets. A
+  worktree checked out as a sibling of the root gets the ledger entry
+  only, because the hook that matches on the edited path never fires
+  there under current settings. Two new hook.log outcomes name a
+  worktree the underlying git question cannot resolve cleanly, instead of
+  falling back to an ordinary no-match or out-of-scope line that looks the
+  same as a genuine one. A project that wants retrieval inside its own
+  worktrees should keep them under the code root (`<root>/.worktrees/`,
+  ignored by the project), rather than as siblings of it.
+
+### Code index
+- The code-tree walk that feeds `code-reindex` no longer descends into a
+  nested linked worktree checked out inside a code root and indexes its
+  content as the root's own: any directory whose own top holds a `.git`
+  file, rather than a directory, is pruned from the walk, which also
+  excludes an ordinary git submodule's content under the same rule.
+
+### Benchmark
+- Three measurement harnesses now live under `bench/`, run against real
+  Claude Code sessions rather than derived from documentation. One
+  establishes when a PreToolUse hook's context actually reaches the model
+  relative to the tool call it gates, reading the answer off the CLI's
+  own ordered event stream instead of the model's self-report. A small
+  scenario-driven stand-in hook and a second harness together establish
+  what a hook's rewrite and denial mechanisms actually do: what a rewrite
+  can change, what an invalid rewrite produces, whether a denial's reason
+  text changes what the model writes on retry, and whether a hook that
+  always denies can hang a session. Each harness builds and tears down its
+  own disposable fixture, with a per-run unguessable marker reachable to
+  the model only through the mechanism under test, and a contamination
+  check confirming it reached nowhere else.
+
 ## [0.2.0rc5] — 2026-09-10
 
 ### Decision index
