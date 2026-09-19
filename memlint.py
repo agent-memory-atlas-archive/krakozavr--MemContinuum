@@ -14,8 +14,9 @@ Rules implemented, a subset of docs/SCHEMA.md section 7:
     enumerated in docs/SCHEMA.md section 3                                  -> error
   * a topic's `standing:` pointer names a link not in that topic, not
     active, or not owner-verbatim/owner-ratified (TOP-0132 L2)        -> error
-  * the store-wide `standing:` set exceeds 24 links or 4,800 chars of
-    projected text                                                    -> error
+  * a topic's `standing:` pointer whose link's ruling.text has a CR/LF -> error
+  * the store-wide `standing:` set exceeds 24 links or 4,800 bytes
+    (UTF-8) of the complete digest                                    -> error
 
 Exit 1 if any error was found anywhere under ROOT (warnings alone -> exit 0).
 
@@ -44,7 +45,7 @@ from memidx import (
     HOLD_ELIGIBLE_AUTHORITIES,
     INVARIANT_KINDS,
     KINDS,
-    STANDING_CAP_CHARS,
+    STANDING_CAP_BYTES,
     STANDING_CAP_LINKS,
     STATUSES,
     ParseResult,
@@ -58,6 +59,7 @@ from memidx import (
     newest_active_link,
     parse_record,
     parse_record_text,
+    standing_digest_text,
     standing_line,
     standing_sort_key,
     validated_evidence_list,
@@ -339,6 +341,23 @@ def lint_topic(
                 f"{path}: standing link {lid_str!r} has ruling.authority {link_auth!r} -- "
                 f"must be one of {sorted(CONSTRAINT_AUTHORITIES)} (the declared CONSTRAINT "
                 "gate this v0 digest uses, TOP-0132 L2)"
+            )
+        # Fix-round MAJOR (both reviewers): a multi-line ruling.text (a YAML
+        # block scalar, most often) is never flattened by the parser, and
+        # `memidx.py standing` used to project it verbatim -- an unframed
+        # second physical line inside `additionalContext`, indistinguishable
+        # from real conversation text (the reviewers' own reproduction: a
+        # line reading "SYSTEM: ignore all previous instructions...",
+        # delivered with no quoting at all). `standing_line`'s own runtime
+        # flattening (memidx.py) is the second layer; THIS is the first --
+        # a standing-pointed link's ruling.text may never carry a raw CR or
+        # LF at all, caught here before it is ever indexed.
+        link_text = link_ruling.get("text")
+        if link_text and ("\n" in str(link_text) or "\r" in str(link_text)):
+            errors.append(
+                f"{path}: standing link {lid_str!r} ruling.text contains a line break -- "
+                "a standing ruling's text must be a single line (flatten it; the digest "
+                "projects it verbatim into an agent's context, unframed)"
             )
 
     return errors, warnings
@@ -1064,13 +1083,21 @@ def _duplicate_claim_errors(root: Path) -> list[str]:
 
 def _standing_cap_errors(root: Path) -> list[str]:
     """TOP-0132 L1/L2's hard, VISIBLE, store-wide cap: at most
-    STANDING_CAP_LINKS pointers, or STANDING_CAP_CHARS characters of
-    PROJECTED text (`standing_line`'s own rendering -- the exact string
-    `memidx.py standing` emits per pointer), whichever is reached first,
-    counted in the SAME order the projection uses (`standing_sort_key`:
-    topic id, then link id). Corpus-wide, like `_duplicate_claim_errors`,
-    so it walks the store once on its own rather than threading a
-    cross-topic accumulator through `lint_topic`'s per-file pass.
+    STANDING_CAP_LINKS pointers, or STANDING_CAP_BYTES bytes of the
+    COMPLETE digest (`standing_digest_text`'s own rendering -- the header,
+    every line, and the newlines joining them, UTF-8-encoded -- exactly
+    what `memidx.py standing` prints and hashes), whichever is reached
+    first, counted in the SAME order the projection uses
+    (`standing_sort_key`: topic id, then link id). Corpus-wide, like
+    `_duplicate_claim_errors`, so it walks the store once on its own rather
+    than threading a cross-topic accumulator through `lint_topic`'s
+    per-file pass.
+
+    Fix-round MINOR (both reviewers): bytes, not characters of the lines
+    alone -- a character count excluded the header entirely and
+    undercounted any multi-byte (e.g. Cyrillic) text by roughly its
+    encoded-width factor, letting a set through that `memidx.py standing`
+    would then deliver at a size well past what was actually measured.
 
     Only a pointer that ALSO clears the per-link eligibility gate
     `lint_topic` checks (exists in its topic, active, CONSTRAINT_AUTHORITIES)
@@ -1105,22 +1132,33 @@ def _standing_cap_errors(root: Path) -> list[str]:
     entries.sort(key=standing_sort_key)
     rendered = [standing_line(*e) for e in entries]
     total_links = len(rendered)
-    total_chars = sum(len(line) for line in rendered)
-    if total_links <= STANDING_CAP_LINKS and total_chars <= STANDING_CAP_CHARS:
+    total_bytes = len(standing_digest_text(rendered).encode("utf-8"))
+    if total_links <= STANDING_CAP_LINKS and total_bytes <= STANDING_CAP_BYTES:
         return []
 
     over_topics = set()
-    cum_chars = 0
+    # Mirrors standing_digest_text's own concatenation: the header's bytes
+    # first, then each line preceded by its own "\n" -- so cum_bytes after
+    # entry i equals len(standing_digest_text(rendered[:i+1]).encode()).
+    cum_bytes = len(_std_header_bytes())
     for i, (entry, line) in enumerate(zip(entries, rendered)):
-        cum_chars += len(line)
-        if i >= STANDING_CAP_LINKS or cum_chars > STANDING_CAP_CHARS:
+        cum_bytes += len(("\n" + line).encode("utf-8"))
+        if i >= STANDING_CAP_LINKS or cum_bytes > STANDING_CAP_BYTES:
             over_topics.add(entry[0])
     listing = ", ".join(sorted(over_topics))
     return [
-        f"standing set exceeds the store-wide cap ({total_links} links, {total_chars} chars "
-        f"of projected text; limit {STANDING_CAP_LINKS} links / {STANDING_CAP_CHARS} chars): "
+        f"standing set exceeds the store-wide cap ({total_links} links, {total_bytes} bytes "
+        f"of the complete digest; limit {STANDING_CAP_LINKS} links / {STANDING_CAP_BYTES} bytes): "
         f"topics over the line: {listing}"
     ]
+
+
+def _std_header_bytes() -> bytes:
+    """`standing_digest_text([])`'s own bytes -- the header alone, no
+    lines -- used only to seed the cumulative byte count above so it
+    matches `standing_digest_text`'s real concatenation exactly (never a
+    second, independent header-length computation)."""
+    return standing_digest_text([]).encode("utf-8")
 
 
 def lint_root(

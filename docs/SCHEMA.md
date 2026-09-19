@@ -184,9 +184,12 @@ copied inline.
 - a `standing:` entry whose link is not `status: active` → error, even when the link was superseded
   by a valid successor — the supersession and the pointer update (or removal) must land together
 - a `standing:` entry whose link's `ruling.authority` is not `owner-verbatim`/`owner-ratified` → error
+- a `standing:` entry whose link's `ruling.text` contains a line break → error; a multi-line ruling
+  is projected verbatim into an agent's context, unframed — flatten it to one line
 - the store-wide `standing:` set — every topic's pointers, together — exceeding 24 links or 4,800
-  characters of the exact text `memidx.py standing` would project, whichever line is crossed first →
-  error, naming every topic whose pointer sits past that line
+  bytes (UTF-8) of the complete digest `memidx.py standing` would emit (header, every line, and the
+  newlines joining them), whichever line is crossed first → error, naming every topic whose pointer
+  sits past that line
 - frontmatter that does not parse (unreadable, not UTF-8, unterminated, malformed YAML on a
   canonical record), or a typed field in the wrong shape (`links` not a list of mappings, a link
   missing its `link` id, `ruling`/`rationale`/`invariant` not a mapping, a list field carrying a

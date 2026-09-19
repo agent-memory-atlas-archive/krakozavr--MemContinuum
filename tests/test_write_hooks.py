@@ -2696,6 +2696,68 @@ Body.
         self.assertEqual(git_head(self.store_root), head_before)
         self.assertEqual(hashlib.sha256(db.read_bytes()).hexdigest(), sha_before)
 
+    def test_compact_no_state_then_resume_dedupes(self):
+        """Fix-round MINOR (Codex): a `compact` with no prior state file
+        used to inject the digest but never store its hash, so the very
+        next `resume` in the same session had nothing to dedupe against
+        and re-injected the identical digest a second time."""
+        self._add_standing_topic()
+        session_id = "s-standing-compact-then-resume"
+        self.assertFalse(self.state_file(session_id).exists())
+
+        proc1, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "compact"), self.base_env()
+        )
+        self.assertTrue(proc1.stdout.strip())
+        self.assertTrue(
+            self.state_file(session_id).exists(),
+            "compact must persist the standing hash even with no prior state file",
+        )
+
+        proc2, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "resume"), self.base_env()
+        )
+        self.assertEqual(
+            proc2.stdout.strip(), "",
+            "a following resume must dedupe against the hash compact just persisted",
+        )
+
+    def test_upgrade_required_shows_hint_once_per_session(self):
+        """Fix-round MAJOR (both reviewers): a generation bump is not
+        self-healing -- a project with no store commit after it would sit
+        at `standing=skipped-upgrade-required` forever, silently, with
+        nothing telling a human to reindex. The hint fires once per
+        session, never on every SessionStart."""
+        self._add_standing_topic()
+        db = self.home / f"{self.project}.sqlite"
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '5')"
+        )
+        conn.commit()
+        conn.close()
+
+        session_id = "s-standing-upgrade-hint"
+        proc1, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "startup"), self.base_env()
+        )
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        out1 = json.loads(proc1.stdout)
+        ctx1 = out1["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Standing decisions unavailable", ctx1)
+        self.assertIn("memcontinuum-update.sh --apply", ctx1)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("standing=skipped-upgrade-required hint=shown", self._standing_line(log_text))
+
+        proc2, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "resume"), self.base_env()
+        )
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertEqual(
+            proc2.stdout.strip(), "",
+            "the hint shows once per session, not on every SessionStart",
+        )
+
 
 class TestSessionStartHookLogRotation(HookTestBase):
     """eval-topic-logging section 5 (owner-approved add-on): rotation runs

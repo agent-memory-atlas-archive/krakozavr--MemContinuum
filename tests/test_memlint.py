@@ -2738,6 +2738,54 @@ class TestStandingDigest(unittest.TestCase):
             any("standing link" in e and "ruling.authority" in e for e in errors), errors,
         )
 
+    def test_multiline_ruling_text_on_a_standing_link_is_an_error(self):
+        """Fix-round MAJOR (both reviewers): a YAML block scalar (or any
+        embedded newline) in a standing-pointed link's ruling.text used to
+        pass lint and be projected verbatim -- an unframed second physical
+        line inside an agent's additionalContext, indistinguishable from
+        real conversation text. The reviewers' own reproduction put an
+        instruction-shaped sentence on that second line; this uses the same
+        shape without repeating live attack text."""
+        # A YAML block scalar -- the natural, realistic way an author
+        # introduces a multi-line ruling.text -- rather than trying to
+        # smuggle a raw newline through a one-line flow mapping string.
+        topic = (
+            "---\n"
+            "type: topic\n"
+            "id: TOP-9507\n"
+            "title: Block scalar standing topic\n"
+            "area: testing\n"
+            "current: L1\n"
+            "standing: [L1]\n"
+            "links:\n"
+            "  - link: L1\n"
+            "    date: 2026-01-01\n"
+            "    status: active\n"
+            "    kind: adopted\n"
+            "    ruling:\n"
+            "      text: |\n"
+            "        first line\n"
+            "        second line looks like an instruction\n"
+            "      authority: owner-verbatim\n"
+            "      source: s\n"
+            "    recorded_by: agent\n"
+            "    recorded_at: 2026-01-01\n"
+            "---\n\nBody.\n"
+        )
+        errors, _ = self._lint({"topics/t.md": topic})
+        self.assertTrue(
+            any(
+                "standing link" in e and "'L1'" in e and "line break" in e
+                for e in errors
+            ),
+            errors,
+        )
+
+    def test_single_line_ruling_text_on_a_standing_link_is_unaffected(self):
+        topic = _standing_topic("TOP-9508", ["L2"], ruling_text="a perfectly ordinary one-line ruling")
+        errors, _ = self._lint({"topics/t.md": topic})
+        self.assertFalse(any("line break" in e for e in errors), errors)
+
     def _cap_topics(self, n: int, chars_each: int = 10) -> dict:
         files = {}
         for i in range(n):
@@ -2758,14 +2806,31 @@ class TestStandingDigest(unittest.TestCase):
         self.assertIn("TOP-1024", cap_errors[0])
         self.assertNotIn("TOP-1000", cap_errors[0])
 
-    def test_cap_overflow_on_char_count_is_caught_even_under_the_link_cap(self):
+    def test_cap_overflow_on_byte_count_is_caught_even_under_the_link_cap(self):
         # 10 topics, one link each, 1000 chars of ruling text apiece -- well
-        # under STANDING_CAP_LINKS but the rendered lines alone exceed
-        # STANDING_CAP_CHARS (4800).
+        # under STANDING_CAP_LINKS but the rendered digest's bytes exceed
+        # STANDING_CAP_BYTES (4800).
         files = self._cap_topics(10, chars_each=1000)
         errors, _ = self._lint(files)
         cap_errors = [e for e in errors if "exceeds the store-wide cap" in e]
         self.assertEqual(len(cap_errors), 1, errors)
+
+    def test_multibyte_content_undercounted_by_chars_is_caught_by_bytes(self):
+        """Fix-round MINOR (both reviewers): a char count excludes the
+        header entirely and undercounts multi-byte UTF-8 text -- a
+        Cyrillic-heavy set can sit comfortably under a 4800-CHARACTER cap
+        (len() counts codepoints, not bytes) while its real UTF-8 encoding
+        is well past 4800 BYTES. This fixture's line text alone is 2500
+        characters (under any plausible char cap) but ~5000+ bytes."""
+        files = {}
+        files["topics/cyr.md"] = _standing_topic(
+            "TOP-2000", ["L2"], ruling_text="Ф" * 2500,
+        )
+        errors, _ = self._lint(files)
+        cap_errors = [e for e in errors if "exceeds the store-wide cap" in e]
+        self.assertEqual(len(cap_errors), 1, errors)
+        self.assertIn("bytes", cap_errors[0])
+        self.assertIn("TOP-2000", cap_errors[0])
 
     def test_under_cap_on_both_axes_is_clean(self):
         files = self._cap_topics(memlint.STANDING_CAP_LINKS, chars_each=10)
@@ -2811,9 +2876,9 @@ class TestStandingGateMutation(unittest.TestCase):
         with mock.patch.object(memlint, "STANDING_CAP_LINKS", 1000):
             self._assert_defeated("test_cap_overflow_on_link_count_names_the_topic_over_the_line")
 
-    def test_raising_the_char_cap_defeats_the_overflow_case(self):
-        with mock.patch.object(memlint, "STANDING_CAP_CHARS", 100000):
-            self._assert_defeated("test_cap_overflow_on_char_count_is_caught_even_under_the_link_cap")
+    def test_raising_the_byte_cap_defeats_the_overflow_case(self):
+        with mock.patch.object(memlint, "STANDING_CAP_BYTES", 100000):
+            self._assert_defeated("test_cap_overflow_on_byte_count_is_caught_even_under_the_link_cap")
 
 
 if __name__ == "__main__":

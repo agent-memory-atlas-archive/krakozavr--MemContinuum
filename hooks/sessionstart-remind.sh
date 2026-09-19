@@ -159,25 +159,33 @@ eval "$(mc_extract_fields "$PAYLOAD" session_id source)" 2>/dev/null
 STATE_FILE="$(mc_state_file_for "$MC_PROJECT" "$SESSION_ID")"
 
 # mc_compute_standing -- TOP-0132 L1/L2. Runs `memidx.py standing --json`
-# (never touches session state itself; callers below decide dedupe/
-# persistence) and sets these globals:
+# EXACTLY ONCE (never touches session state itself; callers below decide
+# dedupe/persistence) and sets these globals:
 #   STANDING_STATUS  "ready" | "empty" | "skipped-<state>"
 #   STANDING_TEXT    the exact plain-text digest to inject (only set when
-#                     STANDING_STATUS=ready -- header + one line per
-#                     pointer, byte-identical to what --json's own hash/
-#                     bytes describe, since both come from the SAME
-#                     `memidx.py standing` query against an unchanged,
-#                     current index)
+#                     STANDING_STATUS=ready), reconstructed from --json's
+#                     own "lines" as HEADER + "\n" + "\n".join(lines)
 #   STANDING_HASH / STANDING_LINKS / STANDING_BYTES  from --json, verbatim
 #                     -- never recomputed here, so this hook can never
 #                     disagree with `memidx.py standing --json` about what
 #                     the digest's own hash or size is.
-# Two `memidx.py standing` calls when there IS something to inject (one
-# --json, for the structured hash/links/bytes memidx.py itself computes;
-# one plain, for the exact text to inject) -- never more, and never a
-# second call at all when the index refuses or the set is empty. Bash 3.2:
-# no associative arrays, no `local -n`; globals by convention (this file is
-# a leaf script, never sourced elsewhere).
+# Fix-round MAJOR (both reviewers, Opus measured 0.95-1.18s on drvfs with
+# two links against the 2s watchdog): a prior version called `memidx.py
+# standing` TWICE -- once --json for the structured fields, once plain for
+# the exact text -- each a full module import (yaml, chunkers). Two calls
+# cost roughly double, AND a store commit landing between them could make
+# the logged hash disagree with the injected text (the very thing the
+# dedupe/log line exists to describe accurately). ONE call now: the same
+# python step that already parses the JSON for kind/links/hash/bytes also
+# reconstructs the plain text from "lines" and writes it to a second
+# tmpfile -- HEADER below is a literal copy of memidx.py's own
+# STANDING_HEADER constant, not re-derived (there is no cheap way to ask a
+# python module for one constant without importing the whole module,
+# which is the exact cost this fix removes); the two ship in the same
+# commit/repo, so they can never drift version-to-version by accident --
+# grep STANDING_HEADER in memidx.py before ever changing either.
+# Bash 3.2: no associative arrays, no `local -n`; globals by convention
+# (this file is a leaf script, never sourced elsewhere).
 STANDING_STATUS=""
 STANDING_TEXT=""
 STANDING_HASH=""
@@ -198,20 +206,34 @@ mc_compute_standing() {
     local json_out
     json_out="$(env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" "${args[@]}" --json 2>>"$MC_LOG")"
 
-    local meta_tmp
+    local meta_tmp text_tmp
     meta_tmp="$(mktemp 2>/dev/null)" || return
+    text_tmp="$(mktemp 2>/dev/null)" || { rm -f "$meta_tmp"; return; }
     env PYTHONPATH= "$MC_PY" -c '
 import json, sys
+
+# Literal copy of memidx.STANDING_HEADER -- see the comment above
+# mc_compute_standing in hooks/sessionstart-remind.sh before changing
+# either one; they must always match.
+HEADER = "Standing decisions -- citations only; the store is the source of truth."
 
 try:
     obj = json.loads(sys.argv[1] or "{}")
 except Exception:
     obj = {}
+
 if "hash" in obj:
+    lines = obj.get("lines") or []
+    text = HEADER + ("\n" + "\n".join(lines) if lines else "")
+    try:
+        with open(sys.argv[2], "w") as f:
+            f.write(text)
+    except OSError:
+        pass
     print("ok - %d %s %d" % (obj.get("links", 0), obj.get("hash", "-"), obj.get("bytes", 0)))
 else:
     print("refused %s 0 - 0" % obj.get("state", "unknown"))
-' "$json_out" >"$meta_tmp" 2>>"$MC_LOG"
+' "$json_out" "$text_tmp" >"$meta_tmp" 2>>"$MC_LOG"
 
     local kind rstate links hash nbytes
     read -r kind rstate links hash nbytes <"$meta_tmp" 2>/dev/null
@@ -219,14 +241,17 @@ else:
 
     if [ "${kind:-}" != "ok" ]; then
         STANDING_STATUS="skipped-${rstate:-unknown}"
+        rm -f "$text_tmp" 2>/dev/null
         return
     fi
     if [ "${links:-0}" = "0" ]; then
         STANDING_STATUS="empty"
+        rm -f "$text_tmp" 2>/dev/null
         return
     fi
 
-    STANDING_TEXT="$(env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" "${args[@]}" 2>>"$MC_LOG")"
+    STANDING_TEXT="$(cat "$text_tmp" 2>/dev/null)"
+    rm -f "$text_tmp" 2>/dev/null
     STANDING_HASH="$hash"
     STANDING_LINKS="$links"
     STANDING_BYTES="$nbytes"
@@ -243,6 +268,50 @@ mc_wrap_context() {
 import json, sys
 print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": sys.argv[1]}}))
 ' "$1" 2>>"$MC_LOG"
+}
+
+# Fix-round MAJOR (both reviewers): a generation bump is not self-healing
+# (see docs/INTERNALS.md's "Upgrading" -- neither unmapped's self-heal,
+# memcontinuum-update.sh check mode, nor a template change reindexes on
+# its own; only a store commit or a manual `reindex` does). A project
+# with no store commit after the bump would sit at
+# `standing=skipped-upgrade-required` forever with nothing visible to a
+# human. mc_maybe_upgrade_hint sets STANDING_HINT_CTX to this one-line
+# nudge exactly ONCE per session (a state flag, compare-and-set inside
+# ONE locked transform, same race-safety shape as the hash write) --
+# never a repeat nag on every subsequent SessionStart in the same run.
+STANDING_UPGRADE_HINT_TEXT="Standing decisions unavailable: the decision index needs a reindex -- run memcontinuum-update.sh --apply"
+STANDING_HINT_CTX=""
+
+mc_maybe_upgrade_hint() {
+    STANDING_HINT_CTX=""
+    [ "$STANDING_STATUS" = "skipped-upgrade-required" ] || return
+    local hint_tmp
+    hint_tmp="$(mktemp 2>/dev/null)" || return
+    export MC_HINT_VERDICT_OUT="$hint_tmp"
+    mc_update_state_json "$STATE_FILE" '
+import os
+
+_verdict = "shown" if state.get("standing_upgrade_hint_shown") else "new"
+state["standing_upgrade_hint_shown"] = True
+_out = os.environ.get("MC_HINT_VERDICT_OUT")
+if _out:
+    try:
+        with open(_out, "w") as _f:
+            _f.write(_verdict)
+    except OSError:
+        pass
+
+print(json.dumps(state))
+' >>"$MC_LOG" 2>&1
+    local verdict="shown"
+    if [ -s "$hint_tmp" ]; then
+        verdict="$(cat "$hint_tmp")"
+    fi
+    rm -f "$hint_tmp" 2>/dev/null
+    if [ "$verdict" = "new" ]; then
+        STANDING_HINT_CTX="$STANDING_UPGRADE_HINT_TEXT"
+    fi
 }
 
 case "${SOURCE:-}" in
@@ -385,6 +454,12 @@ print(json.dumps(state))
             else
                 STANDING_LOG_TOKEN="dedup"
             fi
+        elif [ "$STANDING_STATUS" = "skipped-upgrade-required" ]; then
+            mc_maybe_upgrade_hint
+            if [ -n "$STANDING_HINT_CTX" ]; then
+                STANDING_CTX="$STANDING_HINT_CTX"
+                STANDING_LOG_TOKEN="skipped-upgrade-required hint=shown"
+            fi
         fi
 
         if [ -n "$STANDING_CTX" ]; then
@@ -404,20 +479,39 @@ print(json.dumps(state))
         mc_compute_standing
         STANDING_CTX=""
         STANDING_LOG_TOKEN="$STANDING_STATUS"
+        # Captured BEFORE the standing hash write below, which -- fix-
+        # round MINOR (Codex) -- now runs even with no prior state file
+        # (mc_update_state_json tolerates a missing file, treating it as
+        # {} and creating it): a fresh `-f` test after that write would
+        # always see the file it just created and never take the
+        # "compact-no-state" branch below again, even on a genuinely
+        # bare first compact.
+        HAD_STATE_FILE=0
+        [ -f "$STATE_FILE" ] && HAD_STATE_FILE=1
         if [ "$STANDING_STATUS" = "ready" ]; then
             STANDING_CTX="$STANDING_TEXT"
             STANDING_LOG_TOKEN="injected links=$STANDING_LINKS bytes=$STANDING_BYTES hash=$STANDING_HASH"
-            if [ -f "$STATE_FILE" ]; then
-                export MC_STANDING_HASH="$STANDING_HASH"
-                mc_update_state_json "$STATE_FILE" '
+            # Persist unconditionally, even when no state file exists yet
+            # -- the OLD `[ -f "$STATE_FILE" ]` guard here meant a compact
+            # with no prior state injected but could never STORE the
+            # hash, so the very next resume in that same session had
+            # nothing to dedupe against and re-injected the identical
+            # digest a second time.
+            export MC_STANDING_HASH="$STANDING_HASH"
+            mc_update_state_json "$STATE_FILE" '
 import os
 state["standing_hash"] = os.environ.get("MC_STANDING_HASH", "")
 print(json.dumps(state))
 ' >>"$MC_LOG" 2>&1
+        elif [ "$STANDING_STATUS" = "skipped-upgrade-required" ]; then
+            mc_maybe_upgrade_hint
+            if [ -n "$STANDING_HINT_CTX" ]; then
+                STANDING_CTX="$STANDING_HINT_CTX"
+                STANDING_LOG_TOKEN="skipped-upgrade-required hint=shown"
             fi
         fi
 
-        if [ ! -f "$STATE_FILE" ]; then
+        if [ "$HAD_STATE_FILE" -eq 0 ]; then
             if [ -n "$STANDING_CTX" ]; then
                 PY_OUT="$(mc_wrap_context "$STANDING_CTX")"
                 [ -n "$PY_OUT" ] && printf '%s\n' "$PY_OUT"

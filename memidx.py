@@ -1362,6 +1362,25 @@ def _classify_index_state(
         return "upgrade-required"
     if generation < CURRENT_INDEX_GENERATION:
         return "upgrade-required"
+    # Fix-round (both reviewers), the old-engine ping-pong guard: a
+    # generation AHEAD of this engine's own CURRENT_INDEX_GENERATION used
+    # to fall straight through every check below and read as fully
+    # "current" -- an older engine (this one, relative to whatever wrote
+    # that stamp) has no idea what the newer generation's own columns mean,
+    # and a `reindex` run under it would re-stamp the OLDER generation
+    # number and rewrite every row through its OWN (older) build_record/
+    # insert_record_rows, silently dropping any column only the newer
+    # generation populates (TOP-0132 L2's own `standing`, at generation 6,
+    # is exactly such a column). `upgrade-required` is reused rather than a
+    # new state -- every existing caller already refuses/warns on it
+    # uniformly -- but it now covers BOTH directions: behind, or ahead.
+    # This protects THIS engine build going forward against an even newer
+    # one's stamp; it cannot retroactively patch an already-deployed OLDER
+    # engine that predates this check, which is why two engine versions
+    # must never be pointed at the same MEMCONTINUUM_HOME (see the
+    # standing-decisions section of docs/INTERNALS.md).
+    if generation > CURRENT_INDEX_GENERATION:
+        return "upgrade-required"
     if root is not None and _index_has_drift(conn, root, project, verify_content=verify_content):
         return "stale"
     has_errors = conn.execute("SELECT 1 FROM index_errors WHERE project=? LIMIT 1", (project,)).fetchone()
@@ -4541,14 +4560,25 @@ HOLD_ELIGIBLE_AUTHORITIES = {"reviewer-finding", "code-derived", "agent-inferenc
 # frontmatter list names which of ITS links are true of the whole project,
 # always -- eligible only at CONSTRAINT_AUTHORITIES (the declared label,
 # same gate `standing` re-checks below; v0 explicitly does not wait for a
-# derived-authority scheme). These three names are shared by `memlint.py`'s
+# derived-authority scheme). These names are shared by `memlint.py`'s
 # lint-time cap/gate check and `cmd_standing`'s own projection below, so the
 # two can never independently drift on what "the projected text" means --
-# memlint imports them rather than keeping its own copy (the store-wide cap
-# is enforced at lint time; `cmd_standing` itself never refuses on the cap,
-# only lint owns that).
+# memlint imports them rather than keeping its own copy.
+#
+# Fix-round (both reviewers): the cap is enforced in BYTES of the complete
+# digest -- header, every line, and the newlines joining them, UTF-8
+# encoded -- not characters of the lines alone. A char count silently let a
+# Cyrillic (or any multi-byte) standing set through at roughly 1.6x its
+# apparent size, and excluded the 71-byte header entirely; the STORE side
+# (memlint, at lint time) and the RUNTIME side (`cmd_standing`, on every
+# call) now enforce the identical ceiling via the identical rendering
+# (`standing_digest_text` below), so neither can drift from what the other
+# actually measures, and `cmd_standing` itself refuses over the cap rather
+# than trusting a lint run already happened (a `--no-verify` commit, or a
+# store never linted with `--code-root`, must not silently inject an
+# oversized digest).
 STANDING_CAP_LINKS = 24
-STANDING_CAP_CHARS = 4800
+STANDING_CAP_BYTES = 4800
 STANDING_HEADER = "Standing decisions -- citations only; the store is the source of truth."
 
 _STANDING_LINK_SUFFIX_RE = re.compile(r"^(.*?)(\d+)$")
@@ -4579,10 +4609,33 @@ def standing_line(topic_id: str, link_id: str, authority: str, text: str) -> str
     """The one rendering of a standing pointer: `TOP-0112 L15
     (owner-ratified): <ruling.text>` -- the ruling sentence only, never
     rationale, never chain_lines. Shared by `cmd_standing`'s projection and
-    memlint's cap-overflow error so the character count memlint enforces is
-    the exact string the projection would actually emit for that pointer,
-    not an approximation of it."""
-    return f"{topic_id} {link_id} ({authority}): {text}"
+    memlint's cap-overflow error so the byte count memlint enforces is the
+    exact string the projection would actually emit for that pointer, not
+    an approximation of it.
+
+    Fix-round (both reviewers): `text` is flattened defensively here --
+    every run of whitespace (a literal newline included) collapsed to one
+    space -- even though memlint's own lint-time check (see lint_topic)
+    already rejects a CR/LF inside a standing-pointed link's ruling.text
+    before this ever runs on a lint-clean store. This is the second layer,
+    not the only one: an index built before that lint rule existed, or a
+    `--no-verify` commit, must never let a raw newline reach `standing`'s
+    output and split what `--json`'s `lines` count promises is one line
+    per pointer into more physical lines than that -- the exact failure a
+    block-scalar `ruling.text` produced (a second physical line reading as
+    plain, unframed text inside the delivered additionalContext)."""
+    flat_text = " ".join(str(text).split())
+    return f"{topic_id} {link_id} ({authority}): {flat_text}"
+
+
+def standing_digest_text(lines: list) -> str:
+    """The complete digest -- `STANDING_HEADER`, then one line per pointer,
+    each preceded by its own newline -- exactly as `cmd_standing` both
+    prints (non-JSON) and hashes (`--json`'s `hash`), and exactly what
+    memlint's cap check counts in bytes. The ONE place this concatenation
+    happens, so `cmd_standing`'s hash/bytes/plain-text and memlint's cap
+    total can never independently reconstruct it differently."""
+    return STANDING_HEADER + ("\n" + "\n".join(lines) if lines else "")
 
 
 def validated_evidence_list(raw) -> list[str]:
@@ -5358,24 +5411,35 @@ def cmd_standing(args) -> int:
     session start rather than waiting for an edit to a file it happens to
     be bound to.
 
+    Fix-round BLOCKER (both reviewers, Opus measured): this reader is
+    ALWAYS read-only -- `decision_index_state_readonly`/`open_db_readonly`
+    (mode=ro), never `decision_index_state`/`open_db_noncreating`. The rw
+    opener's own `_run_decision_migration_guards` ALTERs a generation-5
+    index (this engine's `ensure_records_standing_column`, among others)
+    BEFORE the generation check below can return `upgrade-required` --
+    every project a prior engine reindexed is in exactly that state at its
+    first `standing` call after this engine is installed, so "no write
+    path" would be false at the one moment it matters most. A read-only
+    open can never write a byte, so this refusal is not merely a courtesy:
+    it is the only way this command keeps that guarantee.
+
     Unlike every other reader here (search/chain/for-path/why/drift), which
     proceed with a stderr warning on `upgrade-required`/`stale`/
     `quarantined` (ruling 68: "a positive match off a degraded index is
     still real evidence"), `standing` refuses on EVERY state but `current`
-    -- `missing`, `uninitialized`, `upgrade-required`, `stale`, and
-    `quarantined` alike. A stale STANDING digest risks delivering a
-    superseded constraint as though it still held; TOP-0132 L1 rejected a
-    rendered rules file for exactly this failure mode ("a stale rendered
-    file serves a superseded constraint as if current, worse than
+    -- `missing`, `uninitialized`, `upgrade-required` (behind OR ahead of
+    this engine's own generation -- see `_classify_index_state`'s ping-pong
+    guard), `stale`, and `quarantined` alike. A stale STANDING digest risks
+    delivering a superseded constraint as though it still held; TOP-0132 L1
+    rejected a rendered rules file for exactly this failure mode ("a stale
+    rendered file serves a superseded constraint as if current, worse than
     absence"), and a live projection off a degraded index has the same
     problem by a different route -- this is the one reader where "keep
     serving, just warn" is the wrong default. `--root`, when given, is what
     lets `upgrade-required`/`stale` be told apart from `current` at all
-    (decision_index_state's on-disk drift check needs a root to walk);
-    omitted, this reader can still see `missing`/`uninitialized`/
-    `upgrade-required`/`quarantined`, just never `stale` -- exactly the
-    optional-root tradeoff `add_common_args` already documents for search/
-    chain/for-path/why/drift.
+    (the on-disk drift check needs a root to walk); omitted, this reader
+    can still see `missing`/`uninitialized`/`upgrade-required`/
+    `quarantined`, just never `stale`.
 
     The eligibility gate (declared, not derived -- TOP-0132 L2 over L1's
     original derived-authority plan): a pointed link counts only when it
@@ -5384,26 +5448,34 @@ def cmd_standing(args) -> int:
     a store-wide cap on top of it) at lint time, importing these same
     names -- but this reader re-applies the gate itself rather than merely
     trusting a prior lint run happened: an ineligible pointer is simply
-    never projected, never a warning (unlike ruling 68's degraded-index
-    warnings above, this is a hard exclusion, not a caveat)."""
+    never projected, never a warning.
+
+    Fix-round MAJOR (both reviewers): the byte cap (`STANDING_CAP_LINKS`/
+    `STANDING_CAP_BYTES`, the SAME ceiling memlint enforces at lint time,
+    via the SAME `standing_digest_text` rendering) is enforced again HERE,
+    at runtime, on every call -- a store committed with `--no-verify`, or
+    one never linted with `--code-root` at all, must never have this
+    command silently inject (or silently truncate) an oversized digest.
+    Over the cap refuses outright (`reason=over-cap`), the same shape as
+    every other refusal below -- never a partial digest."""
     db_path = resolve_db_path(args)
     root = Path(args.root).resolve() if getattr(args, "root", None) else None
-    state = decision_index_state(db_path, args.project, root=root)
+    state = decision_index_state_readonly(db_path, args.project, root=root)
     if state != "current":
         print(
             f"standing: the decision index is {state} for project {args.project!r} -- "
             "run `reindex --root <path>` first (the standing digest never serves off "
-            "a non-current index)",
+            "a non-current index, and never opens the index for anything but reading)",
             file=sys.stderr,
         )
         if args.json:
             print(json.dumps({"state": state, "links": 0, "lines": []}, indent=2))
         return 1
 
-    conn = open_db_noncreating(db_path, args.project)
+    conn = open_db_readonly(db_path)
     if conn is None:
-        # TOCTOU: the file vanished between decision_index_state's own
-        # open/close above and this one.
+        # TOCTOU: the file vanished between decision_index_state_readonly's
+        # own open/close above and this one.
         print(
             f"standing: the decision index is missing for project {args.project!r} -- "
             "run `reindex --root <path>` first",
@@ -5446,14 +5518,29 @@ def cmd_standing(args) -> int:
 
     entries.sort(key=standing_sort_key)
     lines = [standing_line(tid, lid, auth, text) for tid, lid, auth, text in entries]
-    digest_text = STANDING_HEADER + ("\n" + "\n".join(lines) if lines else "")
+    digest_text = standing_digest_text(lines)
+    digest_bytes = len(digest_text.encode("utf-8"))
+
+    if len(lines) > STANDING_CAP_LINKS or digest_bytes > STANDING_CAP_BYTES:
+        print(
+            f"standing: {len(lines)} link(s)/{digest_bytes} byte(s) exceeds the store-wide "
+            f"cap ({STANDING_CAP_LINKS} links / {STANDING_CAP_BYTES} bytes) -- refusing rather "
+            "than truncate; memlint should have caught this at lint time",
+            file=sys.stderr,
+        )
+        if args.json:
+            print(json.dumps(
+                {"reason": "over-cap", "links": len(lines), "bytes": digest_bytes, "lines": []},
+                indent=2,
+            ))
+        return 1
 
     if args.json:
         h = hashlib.sha256(digest_text.encode("utf-8")).hexdigest()[:16]
         payload = {
             "hash": h,
             "links": len(lines),
-            "bytes": len(digest_text.encode("utf-8")),
+            "bytes": digest_bytes,
             "lines": lines,
         }
         print(json.dumps(payload, indent=2))

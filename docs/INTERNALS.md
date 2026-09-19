@@ -2071,7 +2071,8 @@ Topic-chain rules:
 | a `standing:` entry names a link id not in that topic | error |
 | a `standing:` entry's link is not `status: active` | error — even a valid successor does not clear it; the supersession and the pointer's own update/removal must land in the same commit |
 | a `standing:` entry's link's `ruling.authority` is not `owner-verbatim`/`owner-ratified` | error |
-| the store-wide `standing:` set (every topic's pointers together, in the projection's own order) exceeds 24 links or 4,800 characters of projected text | error (corpus-wide; names every topic whose pointer sits past whichever line is crossed first) |
+| a `standing:` entry's link's `ruling.text` contains a CR or LF (a YAML block scalar, most often) | error — projected verbatim into an agent's context, unframed; flatten it to one line |
+| the store-wide `standing:` set (every topic's pointers together, in the projection's own order) exceeds 24 links or 4,800 bytes (UTF-8) of the complete digest (header, every line, and the newlines joining them) | error (corpus-wide; names every topic whose pointer sits past whichever line is crossed first) |
 
 Concept-record rules (`type: concept` files). `--code-root` is repeatable —
 one project can have several code roots, and every root given is checked:
@@ -2771,14 +2772,69 @@ area, its authority, or the presence or absence of `code_refs` (a topic with
 no `code_refs` is not thereby standing, and one with `code_refs` is not
 thereby excluded; membership is exactly the list, nothing else). `memlint.py`
 enforces the eligibility gate at lint time (the memlint tables above): a
-pointed link must exist in that topic, be `status: active`, and carry
+pointed link must exist in that topic, be `status: active`, carry
 `ruling.authority` `owner-verbatim` or `owner-ratified` — the declared label,
 the same one the pre-edit chain already cites verbatim; this digest does not
-wait for a derived-authority scheme. A store-wide cap (24 links, or 4,800
-characters of the projected text below, whichever is reached first, counted
-in the projection's own order) keeps the set from growing into a second store
+wait for a derived-authority scheme — and carry a single-line `ruling.text`
+(a CR/LF is a lint error, not flattened for you at lint time; `standing_line`
+flattens defensively at read time regardless, so a store that predates this
+rule, or a `--no-verify` commit, still projects one physical line per
+pointer). A store-wide cap (24 links, or 4,800 bytes, UTF-8, of the COMPLETE
+digest below — header, every line, and the newlines joining them, never
+characters of the lines alone — whichever is reached first, counted in the
+projection's own order) keeps the set from growing into a second store
 nobody can hold in their head; memlint's error names every topic whose
-pointer sits past the line that was crossed.
+pointer sits past the line that was crossed. `cmd_standing` enforces the
+identical ceiling again at runtime (`reason: over-cap`, refuses rather than
+truncates) — a store committed with `--no-verify`, or never linted with
+`--code-root` at all, must never have this reached a session unmeasured.
+
+**Accepted v0 risk.** The eligibility gate is the DECLARED authority label,
+not a derived one: a link mis-labelled `owner-verbatim` whose `source:` is
+empty, or does not actually quote the owner, is delivered as standing exactly
+like a genuine one, until a derived-authority scheme lands.
+
+**Read-only, always.** `cmd_standing` opens the index through
+`open_db_readonly`/`decision_index_state_readonly` (mode=`ro`) — NEVER
+`open_db_noncreating`/`decision_index_state` (mode=`rw`), which runs every
+migration guard on open (see "decision index provenance" above). A generation
+gap is exactly the case this matters for: an rw open would ALTER the new
+columns into existence before its own generation check could return
+`upgrade-required`, so "no write path" would be false at the one moment a
+version bump makes it most necessary — every project a newer engine has not
+yet reindexed is in precisely that state. A `standing` refusal is therefore
+never a courtesy; a read-only connection cannot write a byte regardless.
+
+**Old-engine ping-pong guard.** `_classify_index_state` (the body every
+reader's `decision_index_state`/`_readonly` shares) refuses `upgrade-required`
+on a generation AHEAD of `CURRENT_INDEX_GENERATION` exactly as it already did
+on one behind — a generation ahead used to read as plain `current` and would
+let an older engine's own `reindex` re-stamp the OLDER number and silently
+drop whatever column only the newer generation populates. This protects a
+given engine build going forward against an even-newer stamp; it cannot
+retroactively patch an already-deployed OLDER build that predates the check.
+**Two engine versions must never be pointed at the same `MEMCONTINUUM_HOME`**
+— on this project's own machine every wired hook calls one checkout by
+absolute path, so this is a standing guard, not a live bug, but a second
+checkout (a stale worktree, a pinned older clone) sharing the same
+`MEMCONTINUUM_HOME` would trigger exactly the ping-pong this guard exists to
+stop.
+
+**Upgrading.** A `CURRENT_INDEX_GENERATION` bump (adding `standing` itself
+bumped it) is not self-healing: `unmapped`'s self-heal fires only on
+`stale`, `memcontinuum-update.sh` never reindexed on its own before this, a
+hook or template change stales no render fingerprint, and the only things
+that actually reindex a store are a store commit (`post-commit-reindex.sh`,
+content-only) or a manual `reindex --full`. A project with no store commit
+after the bump would otherwise sit at `standing=skipped-upgrade-required`
+forever, silently. Three things now close that gap: `memcontinuum-update.sh`
+(check mode) reports `index: upgrade-required (generation G < C)` for every
+wired project whose stamp is behind, and `--apply` reindexes it
+(`memidx.py reindex --root STORE --project P`); `sessionstart-remind.sh`
+injects one short line into context, once per session, the first time a
+session hits `skipped-upgrade-required` (a state flag, not a repeat nag); and
+a generation bump's own release notes must say a wired project needs one
+reindex to pick it up.
 
 **Projection.** `memidx.py standing [--root DIR] [--json]` reads the index —
 never the markdown directly; `standing` is indexed at reindex exactly like
@@ -2788,23 +2844,34 @@ lint run: this reader has no dependency on one having just happened. One
 line per eligible pointer, ordered by topic id then link id (numeric-aware,
 so a topic's tenth link sorts after its second, not before it):
 `<topic id> <link id> (<authority>): <the ruling sentence>` — the sentence
-alone, never the rationale, never the chain lines a human-facing `chain`
-render would add. A fixed header states the store is the source of truth and
-this is a citation of it. `--json` adds a hash of the text (for the dedupe
-rule below), the link count, the byte count, and the plain array of lines.
-Deterministic: two runs against an unchanged index are byte-identical.
-Refuses — exits non-zero, names the state — on every index state but
-`current`; see the deviation note above.
+alone, flattened to one physical line, never the rationale, never the chain
+lines a human-facing `chain` render would add. A fixed header states the
+store is the source of truth and this is a citation of it. `--json`'s `lines`
+count always equals the number of physical lines the plain rendering would
+print — never more, regardless of what a ruling's raw text once contained.
+`--json` also adds a hash of the complete digest text (for the dedupe rule
+below) and the byte count. Deterministic: two runs against an unchanged index
+are byte-identical. Refuses — exits non-zero, names the state or
+`reason: over-cap` — on every index state but `current`, and over the byte
+cap; see the deviation note above.
 
-**Delivery.** `sessionstart-remind.sh` attempts the digest on every
+**Delivery, one call.** `sessionstart-remind.sh` attempts the digest on every
 `SessionStart`, computed strictly AFTER whatever state work that source
 already does (session init on `startup`/`resume`/`clear`; pending
 consumption on `compact`) — a kill mid-digest then loses only the digest,
-never that already-committed bookkeeping. A refusal or an empty set injects
-nothing (logged `standing=skipped-<state>` / `standing=empty`); otherwise the
-text becomes — or, on `compact`, is appended after — the SessionStart
-`additionalContext` that source already builds, coverage's own text staying
-first when it has one.
+never that already-committed bookkeeping. It calls `memidx.py standing --json`
+exactly ONCE (a prior draft called it twice — once `--json`, once plain, to
+get both the structured fields and the exact text — but a store commit
+landing between the two calls could make the logged hash disagree with the
+injected text; `--json`'s own `lines` already carry everything needed to
+reconstruct the identical text: `HEADER + "\n" + "\n".join(lines)`, HEADER
+being the same fixed, versioned literal `memidx.py` itself renders, so hash
+and text now always come from the same snapshot, and the round trip costs one
+process, not two). A refusal or an empty set injects nothing (logged
+`standing=skipped-<state>` / `standing=empty`); otherwise the text becomes —
+or, on `compact`, is appended after — the SessionStart `additionalContext`
+that source already builds, coverage's own text staying first when it has
+one.
 
 **Dedupe.** `startup`/`resume` compare the digest's hash against
 `state["standing_hash"]` inside the SAME locked state-update transform that
@@ -2814,13 +2881,26 @@ old hash and both decide to inject), logging `standing=dedup` on a match and
 `standing=injected links=N bytes=B hash=H` otherwise. `clear` and `compact`
 never dedupe — the context is gone either way, so both always inject when
 there is something to inject, refreshing the stored hash so a LATER `resume`
-in the same session dedupes against what was actually last shown.
+in the same session dedupes against what was actually last shown. `compact`
+persists that hash even when no session state file existed yet (it creates
+one with just the hash) — otherwise a `compact` with no prior state could
+never dedupe a following `resume`, and would re-inject the same digest twice
+in a row for no reason.
 
 **No write path.** The digest reads the index and, on an inject or a dedup
 decision, writes exactly one field (`standing_hash`) into the session's own
 state file — never the store, never a rendered file. A hook run that
 computes and injects a digest leaves the store's git status clean and its
-index untouched.
+index untouched — including against a generation-behind index, which the
+read-only opener above makes structural, not merely tested-for.
+
+**Subagents.** Whether Claude Code fires `SessionStart` for a subagent
+session at all is not established one way or the other by anything in this
+engine; this hook makes no claim either way and adds no `fork`-specific
+handling. What is deliberate: a dispatch brief template is the channel that
+carries the digest to a subagent ("subagents do not inherit a session's
+context; the digest goes into every dispatch brief template so they do") —
+not this hook.
 
 Loaded is not applied — this raises the odds a standing ruling is honored, it
 is not a guarantee.
