@@ -2432,6 +2432,53 @@ class TestPreCommitAppendOnlyHook(unittest.TestCase):
         self.assertIn("pre-commit-append-only: schema-rc=1", log_text)
         self.assertIn("project=unfenced-proj", log_text)
 
+    def test_broken_python_crash_is_fail_open_not_a_schema_block(self):
+        """Re-gate MAJOR: `$MEMCONTINUUM_PYTHON` pointing at an executable
+        that CAN be launched but crashes before printing memlint's own
+        summary line (the reviewer's own repro -- a venv missing PyYAML,
+        reproduced here as a fake python that always prints a traceback-
+        shaped stderr and exits 1, the finding's own offered alternative
+        to building a real broken venv) must never read as a schema ERROR.
+        Store is schema-clean with one legitimate NEW link staged (the
+        reviewer's exact fixture) -- before this fix, rc=1 with `schema-
+        rc=1` in hook.log, indistinguishable from a real fence violation;
+        after it, both memlint invocations fail the same way (schema AND
+        append-only alike -- the crash has nothing to do with argv), each
+        recognized as an engine failure by its own missing summary-line
+        marker, and the commit is let through."""
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-crash-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        store = _init_topic_store(Path(tmp) / "store")
+        text = _prepend_new_link((store / "topics" / "foo.md").read_text())
+        (store / "topics" / "foo.md").write_text(text)
+        _git(["add", "-A"], cwd=store)
+        fake_py = Path(tmp) / "fake-python-crashes-on-import"
+        fake_py.write_text(
+            "#!/usr/bin/env bash\n"
+            'echo "Traceback (most recent call last):" >&2\n'
+            'echo \'  File "memlint.py", line 33, in <module>\' >&2\n'
+            'echo "    from memidx import (" >&2\n'
+            'echo "ModuleNotFoundError: No module named '"'"'yaml'"'"'" >&2\n'
+            "exit 1\n"
+        )
+        fake_py.chmod(0o755)
+        env = clean_env(
+            HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_ROOT=str(store),
+            MEMCONTINUUM_PROJECT="crash-proj", MEMCONTINUUM_PYTHON=str(fake_py),
+        )
+        # cwd=store: see test_unborn_head_skips's comment above.
+        proc = subprocess.run(
+            [MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=15, cwd=store,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("schema=skipped-engine-failure", log_text)
+        self.assertIn("skipped=engine-failure", log_text)
+        self.assertIn("project=crash-proj", log_text)
+        self.assertNotIn("schema-rc=1", log_text)
+
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestPreCommitAppendOnlyRealCommit(unittest.TestCase):

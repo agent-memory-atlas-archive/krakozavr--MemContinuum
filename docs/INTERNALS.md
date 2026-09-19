@@ -2047,6 +2047,23 @@ structurally-found items does not match the parsed `links` list (a `REF`-
 side duplicate id `_recovered_old_links` already resolved to one entry is
 the one case seen in practice).
 
+A comment line's own position still matters, even though its indent never
+does: one added directly under `links:`, before the first item, belongs to
+no span at all and is free (attributed to nothing, the same as any other
+text outside every item's own range). One added AFTER the last recorded
+item, by contrast, becomes part of THAT item's span — a genuinely new
+trailing byte inside the last link's own range — and correctly flags that
+link as reformatted; the message is literally accurate, not a false
+positive, because the file at that link's position really did change. And
+because the newest-first order check (above) matches a new link to a `REF`-
+side one by id rather than by position, it refuses an in-place repair that
+merely ADDS a missing `link:` key to a `REF`-side entry that never had one
+(a shape error distinct from a duplicate id): the repaired entry now
+carries an id `REF` never associated with that position, which the check
+reads as a new link landing below an existing one. The only way through is
+`--no-verify` — narrow, and the honest cost of matching by id rather than
+by position.
+
 `--staged` compares `REF` to the INDEX (`git show :path`, what `git commit`
 would actually commit); the default compares `REF` to the working tree
 (`git diff REF` — the standard "everything you'd get if you staged

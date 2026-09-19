@@ -2242,7 +2242,22 @@ def main(argv=None) -> int:
         if resolved not in seen:
             seen.add(resolved)
             code_roots.append(resolved)
-    errors, warnings = lint_root(root, code_roots)
+    try:
+        errors, warnings = lint_root(root, code_roots)
+    except Exception as exc:  # never a bare traceback -- same contract
+        # _run_append_only already holds (spec test (j)): a real ERROR is
+        # a printed diagnostic and exit 1, never an uncaught exception.
+        # Re-gate finding (MAJOR): this does not by itself close the
+        # `--against-ref` mode's own hole (a broken `memlint import` --
+        # PyYAML missing from the venv -- fails before `main` is ever
+        # reached, so no try/except inside it can catch that), but it
+        # keeps THIS mode's own rc contract honest for every failure that
+        # happens once execution is inside `main` -- and it is exactly
+        # this exit-2 shape that hooks/pre-commit-append-only.sh's
+        # summary-line marker check (rather than trusting RC alone) is
+        # built to tell apart from a real finding either way.
+        print(f"memlint: unexpected failure during schema lint: {exc}", file=sys.stderr)
+        return 2
     for w in warnings:
         print(f"WARNING: {w}")
     for e in errors:

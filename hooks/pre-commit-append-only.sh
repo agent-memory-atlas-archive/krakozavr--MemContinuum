@@ -62,12 +62,16 @@
 # ABOUT RUNNING THE CHECK failed (skipped=<reason>: MEMCONTINUUM_ROOT
 # unset, the invoking repo is not-the-store (Codex 1 -- this wrapper fired
 # for a commit outside MEMCONTINUUM_ROOT, e.g. a shared core.hooksPath),
-# an unborn HEAD, no python, or memlint itself erroring out with no
-# recognizable summary line) -- fail-open for infrastructure, fail-closed
-# only for a genuine history edit. `git commit --no-verify` bypasses this
-# hook entirely, same as any git hook; the real guarantee against a
-# rewritten history for a store other machines/CI also touch is a
-# protected branch plus this same check run in CI, not this hook alone.
+# an unborn HEAD, no python, or EITHER memlint invocation erroring out
+# with no recognizable summary line -- an uncaught exception (a broken
+# $MEMCONTINUUM_PYTHON, e.g. a venv missing a dependency memlint imports)
+# exits 1 exactly like a real finding, so both checks below are trusted
+# only together with their own summary-line marker, never RC alone) --
+# fail-open for infrastructure, fail-closed only for a genuine finding.
+# `git commit --no-verify` bypasses this hook entirely, same as any git
+# hook; the real guarantee against a rewritten or unfenced history for a
+# store other machines/CI also touch is a protected branch plus this same
+# check run in CI, not this hook alone.
 
 set -u
 export PYTHONPATH=
@@ -142,24 +146,39 @@ if [ ! -x "$PY" ]; then
 fi
 
 # INC-0127: the schema check, first -- a plain `memlint.py ROOT` run (no
-# --against-ref, no --code-root). Its own exit code is unambiguous (1 iff
-# at least one ERROR was printed, 0 otherwise -- including "clean" and
-# "clean (N warning(s))"), so unlike the append-only summary line below
-# there is no separate marker to look for: RC alone decides. A crash would
-# also be a non-{0,1} exit in principle, but memlint's schema mode has no
-# documented exit other than 0/1 -- treated as fail-open all the same,
-# consistent with this hook's stance everywhere else (an infrastructure
-# problem must never read as "your commit is bad").
+# --against-ref, no --code-root). Re-gate finding (MAJOR): Python exits 1
+# on ANY uncaught exception, not only "at least one ERROR was printed" --
+# a $PY that CAN be executed but fails to even IMPORT memlint (a venv
+# missing PyYAML, reproduced with `python3 -m venv --without-pip` and no
+# `pip install pyyaml`) prints a traceback and exits 1, indistinguishable
+# from a real schema ERROR by RC alone. Schema mode always prints one of
+# two summary lines on its LAST line of real output -- `memlint: N
+# error(s), M warning(s)` or `memlint: clean (M warning(s))` -- so, exactly
+# like the append-only branch below trusting `changed=` over RC alone,
+# SCHEMA_RC=1 blocks the commit only when that marker is actually present;
+# a 1 with no marker (a crash) is logged and falls through fail-open, the
+# same as any other infrastructure problem this hook already tolerates.
 SCHEMA_OUT="$(PYTHONPATH= "$PY" "$MEMLINT" "$MEMCONTINUUM_ROOT" 2>&1)"
 SCHEMA_RC=$?
+SCHEMA_NOTE="schema=ok"
 if [ "$SCHEMA_RC" -eq 1 ]; then
-    echo "$SCHEMA_OUT" >&2
-    log_line "schema-rc=1 project=$PROJECT"
-    exit 1
+    case "$SCHEMA_OUT" in
+        *"memlint: "*" error(s)"*)
+            echo "$SCHEMA_OUT" >&2
+            log_line "schema-rc=1 project=$PROJECT"
+            exit 1
+            ;;
+    esac
+    SCHEMA_NOTE="schema=skipped-engine-failure"
+elif [ "$SCHEMA_RC" -ne 0 ]; then
+    SCHEMA_NOTE="schema=skipped-engine-failure"
 fi
-if [ "$SCHEMA_RC" -ne 0 ]; then
-    log_line "skipped=schema-engine-failure schema-rc=$SCHEMA_RC project=$PROJECT"
-fi
+# NIT (re-gate): the schema outcome above, when it does NOT block, folds
+# into the ONE log line this invocation ends with below (the append-only
+# verdict, or the engine-failure fallback) rather than writing its own
+# separate line and then continuing anyway -- a line that says "skipped"
+# while the hook keeps working, followed by a second line, previously
+# disagreed with what actually happened.
 
 OUT="$(PYTHONPATH= "$PY" "$MEMLINT" --against-ref HEAD --staged "$MEMCONTINUUM_ROOT" 2>&1)"
 RC=$?
@@ -203,16 +222,16 @@ case "$NOTES" in
 esac
 
 if [ "$RC" -eq 0 ] && [ -n "$CHANGED" ]; then
-    log_line "rc=0 changed=$CHANGED notes=$NOTES project=$PROJECT"
+    log_line "rc=0 changed=$CHANGED notes=$NOTES $SCHEMA_NOTE project=$PROJECT"
     exit 0
 fi
 if [ "$RC" -eq 1 ] && [ -n "$CHANGED" ]; then
     echo "$OUT" >&2
-    log_line "rc=1 changed=$CHANGED notes=$NOTES project=$PROJECT"
+    log_line "rc=1 changed=$CHANGED notes=$NOTES $SCHEMA_NOTE project=$PROJECT"
     exit 1
 fi
 
 # Anything else (RC=2, a crash, no recognizable summary line at all) is an
 # ENGINE failure, not a history edit -- fail open.
-log_line "skipped=engine-failure rc=$RC project=$PROJECT"
+log_line "skipped=engine-failure rc=$RC $SCHEMA_NOTE project=$PROJECT"
 exit 0
