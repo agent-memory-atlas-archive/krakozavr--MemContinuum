@@ -1988,7 +1988,7 @@ severity below rather than adding a new rule:
 |---|---|
 | a recognized commit citation does not resolve under any code root that is a git repository | warning by default (`unverifiable, not necessarily wrong`); error under `--strict-citations` |
 | a recognized `path:line` citation's file is not found under any code root | warning by default (`unverifiable, not necessarily wrong`); error under `--strict-citations` |
-| a commit citation resolves, but a same-line quoted subject after it does not match `git log -1 --format=%s` (whitespace-normalized) | error, unconditionally — a substantiated mismatch, not affected by `--strict-citations` |
+| a `commit `/`merge `-triggered citation resolves, but a same-line quoted subject after it does not match `git log -1 --format=%s` (whitespace-normalized) | error, unconditionally — a substantiated mismatch, not affected by `--strict-citations`. `at `/`as `-triggered and backtick-wrapped citations are never subject-eligible at all — a quote following one of those is never read as a claimed subject, checked or not |
 | a `path:line` citation's file exists but has fewer lines than cited | error, unconditionally — substantiated, not affected by `--strict-citations` |
 | a `path:line` citation's path is absolute | error, unconditionally — a shape violation, not a repository question |
 | `--strict-citations` given with no `--code-root` | no effect (the whole citation check is already skipped) |

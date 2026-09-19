@@ -1,4 +1,4 @@
-"""Cited-commit / file:line verification (docs/SCHEMA.md sec3/sec9 addendum;
+"""Cited-commit / file:line verification (docs/SCHEMA.md sec7/sec9 addendum;
 INC-0124's "cited commits" pull-forward, TOP-0129 L1's mutation-testing
 doctrine). Mirrors tests/test_memlint.py's own style: a throwaway
 tempdir store per test, memlint.lint_root/lint_topic/lint_record called
@@ -151,8 +151,19 @@ class TestCommitCitationRecognizer(unittest.TestCase):
     def test_quote_on_a_later_line_is_not_a_subject_claim(self):
         """A commit/merge-triggered hash whose "nearest" quote sits on a
         LATER line (a YAML `|` block scalar preserves real newlines) must
-        never bind to it -- same-line only."""
-        text = 'commit abc1234 landed here.\nA later paragraph says "unrelated quote".'
+        never bind to it -- same-line only.
+
+        Fix round (second pass, MINOR): the original fixture had prose
+        ("landed here.") between the hash and the newline, so the optional
+        subject group never matched at all EITHER before or after the
+        same-line fix -- it pinned nothing (verified: it passed against
+        the pre-fix `\\s*"[^"\\n]*"` shape too). This fixture instead puts
+        the quote directly on the line right after the hash, with nothing
+        else between -- verified to actually flip: the pre-fix shape
+        (`\\s*`, matching the newline) captures "quoted on next line" as
+        the subject; the current same-line-only shape (`[ \\t]*`, no
+        newline) correctly does not."""
+        text = 'commit abc1234\n"quoted on next line"'
         cites = memlint._extract_commit_citations(text)
         self.assertEqual(cites, [{"hash": "abc1234", "subject": None}])
 
@@ -197,6 +208,25 @@ class TestFileLineCitationRecognizer(unittest.TestCase):
         at all."""
         self.assertEqual(
             memlint._extract_file_line_citations("see hooks\\missing.py:3 for detail"), []
+        )
+
+    def test_tilde_path_is_not_a_citation(self):
+        """Fix round (second pass, NIT): "~/dev/three.py:4" used to match
+        starting right after the `~`, capturing "/dev/three.py:4" -- which
+        then read as an ABSOLUTE path and produced an "is absolute" ERROR
+        naming a path (`/dev/three.py`) nobody actually wrote. `~` is now
+        excluded from the lookbehind, same as `\\`."""
+        self.assertEqual(
+            memlint._extract_file_line_citations("see ~/dev/three.py:4 for detail"), []
+        )
+
+    def test_windows_drive_path_is_not_a_citation(self):
+        """Documented known miss (fix round, second pass, NIT), not new
+        behavior: "C:/x/three.py:1" is silently not a citation at all --
+        the bare colon right after the drive letter is already excluded
+        the same way this store's own "field: value" YAML lines are."""
+        self.assertEqual(
+            memlint._extract_file_line_citations("see C:/x/three.py:1 for detail"), []
         )
 
 
@@ -336,7 +366,7 @@ class TestCitationsAgainstFixtureRepo(unittest.TestCase):
         identical to the real one, so it never exercised whitespace
         normalization at all -- an exact-byte compare would have passed it
         too. A citation that preserves the real subject's WORDS but not its
-        exact internal spacing must still be clean (docs/SCHEMA.md sec3:
+        exact internal spacing must still be clean (docs/SCHEMA.md sec7:
         "compared after whitespace normalization")."""
         with tempfile.TemporaryDirectory() as td_str:
             td = Path(td_str)
@@ -351,6 +381,38 @@ class TestCitationsAgainstFixtureRepo(unittest.TestCase):
                 topic_md("TOP-CITE-DBLSPACE", source=f'commit {first} "{doubled_space_subject}"')
             )
             errors, warnings = memlint.lint_root(store, code_roots=[code_root])
+            self.assertFalse([e for e in errors if "cites commit" in e], errors)
+            self.assertFalse([w for w in warnings if "cites commit" in w], warnings)
+
+    def test_real_commit_subject_containing_a_quote_is_clean(self):
+        """Fix round (second pass, MINOR): a NON-greedy subject capture
+        (`[^"\\n]*`) stopped at the FIRST inner quote, so a real commit
+        subject that itself contains a quote produced an unconditional
+        false ERROR -- the exact false-accusation class this whole feature
+        exists to avoid. Not hypothetical: this repo's own history has
+        several (`git log --format=%s | grep -c '"'` is 8 as of the fix).
+        Uses a REAL commit (f1b5c14) against this checkout's own repo
+        (TOOLS_DIR -- portable across machines and CI, which checks out
+        with fetch-depth: 0, full history) as --code-root, read-only --
+        its subject contains two separate quoted substrings, "whatever
+        you answer ... is recorded" and "Not now", so this also exercises
+        that the greedy-to-last-quote fix correctly spans both when they
+        are part of ONE real subject."""
+        real_repo = TOOLS_DIR
+        if not (real_repo / ".git").exists():
+            self.skipTest("not running inside a git checkout")
+        real_hash = "f1b5c14"
+        if not memlint._commit_resolves(real_repo, real_hash):
+            self.skipTest(f"{real_hash} does not resolve in the real repo on this machine")
+        real_subject = memlint._commit_subject(real_repo, real_hash)
+        self.assertIn('"', real_subject)  # the fixture's whole point
+        with tempfile.TemporaryDirectory() as td_str:
+            store = Path(td_str) / "store"
+            (store / "topics" / "memory").mkdir(parents=True)
+            (store / "topics" / "memory" / "t.md").write_text(
+                topic_md("TOP-CITE-QUOTEDSUBJ", source=f'commit {real_hash} "{real_subject}"')
+            )
+            errors, warnings = memlint.lint_root(store, code_roots=[real_repo])
             self.assertFalse([e for e in errors if "cites commit" in e], errors)
             self.assertFalse([w for w in warnings if "cites commit" in w], warnings)
 

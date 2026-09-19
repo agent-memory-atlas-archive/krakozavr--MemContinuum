@@ -468,7 +468,7 @@ def lint_concept(
 
 
 # ---------------------------------------------------------------------------
-# Cited commit / file:line verification (docs/SCHEMA.md sec3/sec9 addendum;
+# Cited commit / file:line verification (docs/SCHEMA.md sec7/sec9 addendum;
 # INC-0124 -- "invented commit subjects" is the one class of fabrication that
 # is mechanically checkable: a source:/evidence: entry naming a commit can be
 # verified against the wired code repository's history, the same way
@@ -530,8 +530,25 @@ def lint_concept(
 # implicitly via `[^"]` (also matches newline), so a YAML `|` block scalar
 # -- which preserves real newlines -- let "commit X" bind to a completely
 # unrelated quoted sentence many PARAGRAPHS later, as long as no other `"`
-# appeared first. `[ \t]*"[^"\n]*"` makes both directions of that
+# appeared first. `[ \t]*"[^\n]*"` makes both directions of that
 # impossible: a hash and its subject must share one physical line.
+#
+# THE QUOTE CAPTURE IS GREEDY TO THE LAST `"` ON THE LINE (fix round,
+# second pass, MINOR): a real commit subject can itself contain a quote
+# (this repo's own history has several -- `git log --format=%s | grep -c
+# '"'` is 8 as of this writing), and a NON-greedy `[^"\n]*` stopped at the
+# FIRST inner quote, so `commit abc1234 "Fix the "foo" parser"` captured
+# only `Fix the ` -- an unconditional ERROR against the real subject,
+# exactly the false-accusation class this whole feature exists to avoid.
+# `[^\n]*"` (greedy, backtracking only as needed) matches to the LAST `"`
+# on the line instead, so an inner quote survives intact. Residual known
+# miss: two SEPARATE quoted strings after one hash on one line
+# (`commit abc1234 "real subject" and also "an unrelated quote"`) still
+# over-captures everything between the first and the last quote as one
+# claimed subject -- not solvable without knowing which quote is the
+# subject and which is unrelated prose, the same fundamental ambiguity
+# that motivated restricting subject-eligibility to commit/merge triggers
+# in the first place. Not observed in this store's real citations today.
 #
 # KNOWN MISSES, by design, not oversight:
 #   - a bare hash with NO context word and no backticks ("...fixed by
@@ -590,7 +607,7 @@ _COMMIT_CITE_RE = re.compile(
     r"""
     (?:
         \b(?i:commit|merge)\b\s+(?P<hash_ctx_subj>[0-9a-f]{40}|[0-9a-f]{7})\b
-        (?:[ \t]*"(?P<subject>[^"\n]*)")?
+        (?:[ \t]*"(?P<subject>[^\n]*)")?
       |
         \b(?i:at|as)\b\s+(?P<hash_ctx_bare>[0-9a-f]{40}|[0-9a-f]{7})\b
       |
@@ -617,6 +634,12 @@ _COMMIT_CITE_RE = re.compile(
 # root, if one happened to exist there -- instead of correctly matching
 # nothing at all (this store's own paths are always forward-slashed, so a
 # backslash immediately before a candidate path is never legitimate).
+# The `~` exclusion (fix round, second pass, NIT) closes the same class of
+# hole as the backslash one: `~/dev/three.py:4` used to match starting
+# right after the `~`, capturing `/dev/three.py:4` -- which then read as
+# an ABSOLUTE path and produced an "is absolute" ERROR naming
+# `/dev/three.py`, a path nobody actually wrote. `~` immediately before a
+# candidate path is now excluded the same way `\` already is.
 # KNOWN MISS, not fixed here (no specific repair requested; the citation
 # format this schema documents assumes no spaces in a path): a path
 # containing a literal space ("my t.py:123") still matches only its
@@ -625,9 +648,18 @@ _COMMIT_CITE_RE = re.compile(
 # nothing marks where such a path starts. Only the FIRST line number of a
 # "path:123-456" or "path:123,456" citation is captured -- a range's or
 # list's remaining numbers, and an "L"-prefixed line number
-# ("file.py:L123"), are known misses (see module comment above).
+# ("file.py:L123"), are known misses (see module comment above). A
+# Windows drive-letter path ("C:/x/three.py:1") is SILENTLY not a
+# citation at all, the same class as the backslash miss: the colon right
+# after "C" is excluded from the lookbehind the same way any other bare
+# colon is (this store's own "field: value" YAML convention), so nothing
+# ever starts matching partway through it either. A "version 0.2.0:1" or
+# "v0.2.0:3"-shaped token (a version number, not a path, followed by a
+# colon and a small integer) reads as a file:line citation -- ".2.0"
+# satisfies the dotted-extension requirement -- and resolves to a WARNING
+# (not found), never an ERROR, unless --strict-citations is set.
 _FILE_LINE_CITE_RE = re.compile(
-    r"(?<![\w./:\\-])([A-Za-z0-9_.\-/]+\.[A-Za-z0-9]{1,8}):(\d+)(?:[-,]\d+)?"
+    r"(?<![\w./:\\~-])([A-Za-z0-9_.\-/]+\.[A-Za-z0-9]{1,8}):(\d+)(?:[-,]\d+)?"
 )
 
 
@@ -700,7 +732,7 @@ def _extract_file_line_citations(text: str) -> list[tuple[str, int]]:
 
 
 def _normalize_subject(s: str) -> str:
-    """Whitespace-normalized comparison, chosen (docs/SCHEMA.md sec3
+    """Whitespace-normalized comparison, chosen (docs/SCHEMA.md sec7
     addendum) as the safe default over an exact byte compare: a citation
     typed by hand into YAML is expected to preserve the commit subject's
     WORDS, not necessarily its exact run of internal whitespace, and a
@@ -842,7 +874,7 @@ def lint_record(
     strict_citations: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Enum-validate a standalone (non-topic) record's top-level status/authority,
-    plus (SCHEMA sec3/sec9 addendum, INC-0124) verify any commit/file:line
+    plus (SCHEMA sec7/sec9 addendum, INC-0124) verify any commit/file:line
     citations in its top-level source:/evidence: fields -- see
     _citation_errors."""
     errors: list[str] = []
