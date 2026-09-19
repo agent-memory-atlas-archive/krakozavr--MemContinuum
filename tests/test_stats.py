@@ -1170,13 +1170,15 @@ class TestStatsPreEditTopics(StatsTestBase):
 
 
 class TestStatsSpansRotatedHookLog(StatsTestBase):
-    """eval-topic-logging section 5 (owner-approved add-on): nothing used
-    to truncate or prune hook.log -- sessionstart-remind.sh now rotates it
-    into hook.log.1 (replacing any previous one) once it crosses
+    """eval-topic-logging section 5 (owner-approved add-on), extended by
+    hook.log: bounded retention of N rotated files -- nothing used to
+    truncate or prune hook.log -- sessionstart-remind.sh now rotates it
+    into hook.log.1 .. hook.log.$MEMCONTINUUM_LOG_KEEP once it crosses
     MEMCONTINUUM_LOG_MAX_BYTES. `stats` must read hook.log.1 (when
     present) alongside hook.log so a `--days N` window spanning a rotation
     still sees the rotated-out side exactly once -- not dropped, not
-    double-counted."""
+    double-counted. (TestStatsSpansMultipleRotatedHookLogs below covers
+    the multi-file KEEP>1 case this class predates.)"""
 
     def write_rotated_log(self, lines):
         (self.home / "hook.log.1").write_text("\n".join(lines) + "\n")
@@ -1226,6 +1228,147 @@ class TestStatsSpansRotatedHookLog(StatsTestBase):
         rc, out = run_stats_json(home=str(self.home))
         self.assertEqual(rc, 0)
         self.assertEqual(out["pre_edit"]["matched"], 1, "only hook.log's own line should be counted")
+
+
+class TestStatsSpansMultipleRotatedHookLogs(StatsTestBase):
+    """hook.log: bounded retention of N rotated files -- mc_rotate_hook_log
+    can now leave hook.log.1 .. hook.log.$MEMCONTINUUM_LOG_KEEP on disk
+    (default KEEP=12), not just a single hook.log.1. `stats` must read
+    every hook.log.<digits> file it finds, not just `.1`, so a --days
+    window spanning several rotations still sees everything retained."""
+
+    def write_numbered_rotated_log(self, n, lines):
+        (self.home / f"hook.log.{n}").write_text("\n".join(lines) + "\n")
+
+    def test_counts_rows_from_all_three_rotated_files_plus_current(self):
+        self.write_numbered_rotated_log(3, [
+            f"{ts(4)} outcome=matched elapsed=0s project=demo file=/oldest.py",
+        ])
+        self.write_numbered_rotated_log(2, [
+            f"{ts(3)} outcome=matched elapsed=0s project=demo file=/older.py",
+        ])
+        self.write_numbered_rotated_log(1, [
+            f"{ts(2)} outcome=matched elapsed=0s project=demo file=/old.py",
+        ])
+        self.write_log([
+            f"{ts(1)} outcome=matched elapsed=0s project=demo file=/new.py",
+        ])
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            out["pre_edit"]["matched"], 4,
+            "all three rotated files plus the current hook.log must be counted",
+        )
+
+    def test_a_days_window_spanning_all_rotations_excludes_only_out_of_window_rows(self):
+        self.write_numbered_rotated_log(3, [
+            # 10 days ago -- outside a 7-day window
+            f"{ts(24 * 10)} outcome=matched elapsed=0s project=demo file=/too-old.py",
+        ])
+        self.write_numbered_rotated_log(2, [
+            # 6 days ago -- inside a 7-day window, but two rotations back
+            f"{ts(24 * 6)} outcome=matched elapsed=0s project=demo file=/still-in-window.py",
+        ])
+        self.write_numbered_rotated_log(1, [
+            f"{ts(24 * 2)} outcome=matched elapsed=0s project=demo file=/recent.py",
+        ])
+        self.write_log([
+            f"{ts(1)} outcome=matched elapsed=0s project=demo file=/fresh.py",
+        ])
+        rc, out = run_stats_json(home=str(self.home), days=7)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["pre_edit"]["matched"], 3)
+
+    def test_a_leftover_rotating_temp_file_is_never_counted(self):
+        """mc_rotate_hook_log's own atomic-claim temp file
+        (hook.log.rotating.<pid>) must never be swept in as a data file --
+        only a pure-digit suffix counts as a rotated file."""
+        (self.home / "hook.log.rotating.12345").write_text(
+            f"{ts(2)} outcome=matched elapsed=0s project=demo file=/stray.py\n"
+        )
+        self.write_log([
+            f"{ts(1)} outcome=matched elapsed=0s project=demo file=/new.py",
+        ])
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["pre_edit"]["matched"], 1)
+
+    def test_two_digit_suffix_dot_10_is_counted_alongside_single_digit_dot_9(self):
+        """Round-2 review TESTS finding (Grok): every stats test up to now
+        only ever used single-digit suffixes, so a reader that (say) only
+        matched `.1`-`.9` would pass all of them while silently dropping
+        `.10`-`.12` under the documented default KEEP=12. Pins that both
+        get counted."""
+        self.write_numbered_rotated_log(9, [
+            f"{ts(5)} outcome=matched elapsed=0s project=demo file=/nine.py",
+        ])
+        self.write_numbered_rotated_log(10, [
+            f"{ts(6)} outcome=matched elapsed=0s project=demo file=/ten.py",
+        ])
+        self.write_log([
+            f"{ts(1)} outcome=matched elapsed=0s project=demo file=/new.py",
+        ])
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["pre_edit"]["matched"], 3)
+
+    def test_rotated_files_present_but_no_live_hook_log_still_counted(self):
+        """Round-2 review NIT: "no hook.log" must mean there is truly
+        nothing to report, not merely that the CURRENT hook.log happens to
+        be momentarily missing (the ordinary state right after a rotation,
+        before the next append recreates it) -- rows already sitting in a
+        rotated file must still be reported, not silently discarded."""
+        self.write_numbered_rotated_log(1, [
+            f"{ts(2)} outcome=matched elapsed=0s project=demo file=/old.py",
+        ])
+        self.assertFalse((self.home / "hook.log").exists())
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["pre_edit"]["matched"], 1)
+
+
+class TestRotatedHookLogPathsOrdering(unittest.TestCase):
+    """Round-2 review TESTS finding (Grok): a direct assertion that
+    _rotated_hook_log_paths orders suffixes NUMERICALLY, not lexically --
+    every stats-level test above only ever checks the aggregate count,
+    which a wrong ORDER could still pass by coincidence (the per-line
+    scan is order-independent per _scan_hook_log's own docstring); this
+    checks the ordering contract directly instead."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-rotpaths-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.home = Path(self.td)
+
+    def test_non_ascii_digit_suffix_is_ignored_not_swept_in(self):
+        """Round-2 review NIT (Opus): plain `str.isdigit()` also returns
+        True for non-ASCII digit characters (e.g. superscript '²') --
+        `int('²')` then raises ValueError, which this fail-open reader
+        must never let escape as `stats: internal error`. A suffix built
+        entirely of superscript-two characters must simply be ignored,
+        exactly like any other non-numbered stray suffix (e.g.
+        hook.log.rotating.<pid>), never counted and never crash the scan."""
+        log_path = self.home / "hook.log"
+        (self.home / "hook.log.²²").write_text("should never be read\n")
+        (self.home / "hook.log.3").write_text("n=3\n")
+        result = memidx._rotated_hook_log_paths(log_path)
+        self.assertEqual([p.name for p in result], ["hook.log.3"])
+
+    def test_two_digit_suffixes_sort_numerically_oldest_first_not_lexically(self):
+        log_path = self.home / "hook.log"
+        for n in (2, 9, 10, 11):
+            (self.home / f"hook.log.{n}").write_text(f"n={n}\n")
+        result = memidx._rotated_hook_log_paths(log_path)
+        self.assertEqual(
+            [p.name for p in result],
+            ["hook.log.11", "hook.log.10", "hook.log.9", "hook.log.2"],
+            "must be numeric descending (oldest/highest-N first, this "
+            "function's documented contract) -- a lexical STRING sort "
+            "would instead produce ['hook.log.9', 'hook.log.2', "
+            "'hook.log.11', 'hook.log.10'] descending (or "
+            "['hook.log.10', 'hook.log.11', 'hook.log.2', 'hook.log.9'] "
+            "ascending), both wrong",
+        )
 
 
 if __name__ == "__main__":

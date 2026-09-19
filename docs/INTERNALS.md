@@ -124,24 +124,39 @@ many distinct topic ids were ever injected in the window), and `top_topics`
 never counted as a topic.
 
 **hook.log rotation.** Nothing truncates or prunes hook.log on its own —
-`mc_prune_old_state` only ever clears session-state JSON — so it grows
-forever: measured on a real machine, ~177 KB/day, tens of MB per year per
-machine, with every `memidx.py stats` run reading the whole file cold.
-`sessionstart-remind.sh` now rotates it once per session, at the
+`mc_prune_old_state` only ever clears session-state JSON — so an
+unrotated hook.log grows without bound (~177 KB/day on a real machine),
+with every `memidx.py stats` run reading the whole file cold.
+`sessionstart-remind.sh` rotates it once per session, at the
 startup/resume/clear session-init boundary only — never from `mc_log`'s own
 append path, or from `pre-edit-chain.sh`'s independent logger, both of which
 are hot paths that must not gain a `stat()` call for this, and never
 re-checked on a mid-session `compact`. Once hook.log exceeds
-`MEMCONTINUUM_LOG_MAX_BYTES` (default 5242880 bytes, 5 MiB), its current
-content moves to `hook.log.1` — replacing whatever was there before — and a
-fresh, empty hook.log starts. At most two files exist, ever: no `.2`, no
-dated archive, no compression, and data older than the *previous* rotation
-is gone by design once a second one happens. `memidx.py stats` reads
-`hook.log.1` (when present) alongside hook.log, so a `--days N` window that
-spans a rotation still sees the rotated-out side. Fail-open like every other
-path here: a missing/unwritable `$MEMCONTINUUM_HOME`, an unreadable size, or
-a concurrent session racing the same rotation all leave the log alone and
-never block `SessionStart`.
+`MEMCONTINUUM_LOG_MAX_BYTES` (default 5242880 bytes, 5 MiB), it is rotated:
+the chain `hook.log.1` (newest) .. `hook.log.$MEMCONTINUUM_LOG_KEEP` (oldest)
+shifts up by one (`.N` → `.N+1`, the oldest file dropped), then hook.log's
+current content becomes the new `hook.log.1` and a fresh, empty hook.log
+starts. `MEMCONTINUUM_LOG_KEEP` (default 12) bounds how many rotated files
+are ever kept — no file beyond `.$MEMCONTINUUM_LOG_KEEP`, no dated archive,
+no compression, and data older than the oldest retained file is gone by
+design once retention fills up. Lowering `MEMCONTINUUM_LOG_KEEP` takes
+effect on the very next rotation: the contiguous run of files beyond the
+new, smaller bound is deleted outright, not merely left unreferenced. A
+rotation interrupted by `SessionStart`'s own 2s watchdog — after hook.log
+has been claimed but before it lands at `.1` — is recovered on the next
+rotation (oldest recovered claim first, then the newest), never left a
+permanent, invisible orphan. `MEMCONTINUUM_LOG_KEEP=1` keeps only
+`hook.log.1`, always replaced in place, never a `.2`.
+
+Sizing: a real store's hook.log grew ~5 MB in 21 days (~240 KB/day), so
+the default `12 × 5 MiB` bound gives roughly 8-9 months of retained
+history at that rate — a bounded, documented allowance, not unlimited
+archival. `memidx.py stats` reads every `hook.log.N` it finds (oldest
+first) alongside hook.log, so a `--days N` window spanning one or more
+rotations still sees everything still retained. Fail-open like every
+other path here: a missing/unwritable `$MEMCONTINUUM_HOME`, an unreadable
+size, or a concurrent session racing the same rotation all leave the log
+alone and never block `SessionStart`.
 
 `userprompt-remind.sh` has its own exception too (Codex 12, fix wave 1 G4): a
 turn whose HEAD-moved check (independent of coverage candidacy — see "The

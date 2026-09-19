@@ -144,16 +144,85 @@ mc_log() {
     printf '%s %s project=%s\n' "$(date -Iseconds 2>/dev/null || date)" "$1" "$MC_PROJECT" >>"$MC_LOG" 2>/dev/null || true
 }
 
+# mc_rotate_orphans_oldest_first -- lists every hook.log.rotating.* file
+# next to $MC_LOG, oldest mtime first. Portable across GNU and BSD/macOS
+# without arrays or a GNU-only/BSD-only reversal tool: `ls -t` sorts
+# newest-first on both, and the awk one-liner just reverses that list (no
+# `tac`, GNU-only; no `tail -r`, BSD-only). A missing directory or zero
+# matches prints nothing, never an error -- the glob simply fails to
+# expand and `ls`'s own stderr is discarded.
+mc_rotate_orphans_oldest_first() {
+    ls -1t "$MC_LOG".rotating.* 2>/dev/null | awk '{a[NR]=$0} END{for (i = NR; i >= 1; i--) print a[i]}'
+}
+
+# mc_rotate_shift_and_land SRC KEEP -- the rotation primitive shared by the
+# normal path (SRC=the content just claimed from hook.log) and interrupted-
+# shift recovery (SRC=a recovered dead-pid orphan, see mc_rotate_hook_log
+# below): shifts .1..KEEP-1 up to .2..KEEP (dropping whatever sat at .KEEP,
+# highest N first so a shift never overwrites a file before that file
+# itself has been shifted along), then lands SRC at the now-free .1. Every
+# shift step is independently fail-open (`|| true`) -- a single missing/
+# unmovable link in the middle of the chain must never abort the ones
+# after it; only the final `mv "$SRC" .1` result is ever surfaced to the
+# caller.
+#
+# The shift only ever runs when .1 currently exists (round-2 review
+# finding, MINOR -- Grok's worked example): if .1 is already missing, this
+# is either the ordinary first-ever-rotation case (every slot below KEEP is
+# empty too, so the shift would be an all-no-op regardless) OR a PRIOR call
+# already shifted this exact chain to completion and was interrupted before
+# landing its own SRC -- the shift loop's last step (n=1) is the one that
+# vacates .1, so .1 missing is precisely the signal that "nothing is left
+# to shift, only the land step remains". Running the shift AGAIN in that
+# second case would shift the ALREADY-shifted chain a second time and drop
+# one extra in-window file that should have survived (exactly the bug the
+# finding describes: KEEP=3, .1/.2/.3 = A/B/C, a claim's shift completes
+# in full -- B lands at .3 dropping C, A lands at .2, .1 now empty -- then
+# the process is killed before landing its own SRC at .1; if the next
+# rotation blindly re-shifted, it would move .2's A to .3, dropping B,
+# which had every right to survive). When .1 IS present, the shift below
+# is always safe to run unconditionally even over a PARTIALLY completed
+# prior shift, because every already-vacated slot's own `[ -f ... ]` check
+# makes that step a harmless no-op the second time through. KEEP=1 makes
+# the loop itself a no-op (n starts at 0) regardless of this guard, so the
+# final mv lands directly on .1 exactly as the original two-file-total code
+# always did.
+mc_rotate_shift_and_land() {
+    local src="$1" keep="$2" n
+    if [ -f "$MC_LOG.1" ]; then
+        n=$((keep - 1))
+        while [ "$n" -ge 1 ]; do
+            if [ -f "$MC_LOG.$n" ]; then
+                mv -f "$MC_LOG.$n" "$MC_LOG.$((n + 1))" 2>/dev/null || true
+            fi
+            n=$((n - 1))
+        done
+    fi
+    mv -f "$src" "$MC_LOG.1" 2>/dev/null
+}
+
 # mc_rotate_hook_log -- eval-topic-logging section 5 (owner-approved
-# add-on): nothing used to truncate or prune hook.log (mc_prune_old_state
-# only ever clears session-state JSON) -- measured on a real machine,
-# ~177 KB/day, tens of MB/year, unbounded, and every `memidx.py stats` run
-# reads the whole file cold. If $MC_LOG is larger than
-# MEMCONTINUUM_LOG_MAX_BYTES (default 5242880 = 5 MiB), its current
-# content is moved to $MC_LOG.1 (replacing whatever was there before) and
-# a fresh, empty $MC_LOG is created. At most two files, ever -- no `.2`,
-# no dated archive, no compression; data older than the PREVIOUS rotation
-# is gone by design (memidx.py stats only ever reads hook.log.1 + hook.log).
+# add-on): nothing truncates or prunes hook.log on its own
+# (mc_prune_old_state only ever clears session-state JSON) -- measured on a
+# real machine, ~177 KB/day, so it grows unbounded without this, and every
+# `memidx.py stats` run reads the whole file cold. If $MC_LOG is larger
+# than MEMCONTINUUM_LOG_MAX_BYTES (default 5242880 = 5 MiB), it is rotated:
+# the chain hook.log.1 (newest) .. hook.log.$MEMCONTINUUM_LOG_KEEP (oldest)
+# is shifted up by one (.N -> .N+1, oldest dropped), then $MC_LOG's current
+# content becomes the new hook.log.1 and a fresh, empty $MC_LOG is created.
+# MEMCONTINUUM_LOG_KEEP (default 12) bounds how many rotated files are ever
+# kept -- no file beyond .$MEMCONTINUUM_LOG_KEEP, no dated archive, no
+# compression; data older than the oldest retained file is gone by design
+# (memidx.py stats reads every hook.log.N it finds, N=1..KEEP, alongside
+# hook.log itself). Lowering MEMCONTINUUM_LOG_KEEP is honored on the very
+# next rotation: anything now beyond the new, smaller bound is pruned (see
+# below), not merely left unreferenced. MEMCONTINUUM_LOG_KEEP=1 reproduces
+# the pre-this-feature, hook.log.1-only policy exactly (hook.log.1 always
+# replaced, never a .2). Sizing rationale: a real store's live hook.log
+# measured ~5 MB of growth in 21 days (~240 KB/day), so the default
+# 12 x 5 MiB bound gives roughly 8-9 months of retained history at that
+# rate -- bounded and documented, not "archive forever" (an external
+# review ruled out unbounded retention; this is the sized alternative).
 #
 # Called ONLY from sessionstart-remind.sh's own startup/resume/clear
 # branch, once per session -- NEVER from mc_log above, or from
@@ -168,8 +237,8 @@ mc_log() {
 # step below (rather than a direct `mv "$MC_LOG" "$MC_LOG.1"`) means at
 # most ONE of two sessions racing this same rotation ever wins: the
 # loser's own `mv "$MC_LOG" ...` simply fails (the winner already moved
-# it) and returns cleanly, rather than both racing to write `.1` and one
-# silently clobbering the other's already-rotated content.
+# it) and returns cleanly -- only the winner ever reaches the shift logic
+# below, so there is no shift-vs-shift race to guard against either.
 mc_rotate_hook_log() {
     [ -f "$MC_LOG" ] || return 0
 
@@ -186,9 +255,110 @@ mc_rotate_hook_log() {
     esac
     [ "$size" -gt "$max_bytes" ] || return 0
 
+    # KEEP validation (round-2 review finding, MAJOR): reject not just
+    # empty/non-digit input but also a LEADING ZERO -- bash's own
+    # arithmetic expansion ($(( ))) in mc_rotate_shift_and_land treats a
+    # leading-zero operand as octal, so KEEP=08 aborts with an "invalid
+    # octal digit" arithmetic error and KEEP=012 silently means 10, not 12.
+    # By this point in the function $MC_LOG has NOT yet been claimed (the
+    # claim is below), but an arithmetic error inside the shift-and-land
+    # helper still must never happen: this repo's fail-open rule has no
+    # trap/set -e safety net around it, and a raised arithmetic error would
+    # abandon whatever `case`/`while` was running and skip every step after
+    # it, including `touch "$MC_LOG"`. Reject any value outside [1, 1000]
+    # too -- an unbounded KEEP (e.g. 999999999) would make the shift loop
+    # in mc_rotate_shift_and_land spin roughly that many `[ -f ... ]`
+    # iterations, an effectively infinite SessionStart hang under the
+    # caller's own watchdog; 1000 is far beyond this feature's sizing
+    # rationale (12) and still trivially cheap.
+    local keep="${MEMCONTINUUM_LOG_KEEP:-}"
+    case "$keep" in
+        ''|0*|*[!0-9]*) keep=12 ;;
+    esac
+    if ! [ "$keep" -ge 1 ] 2>/dev/null || ! [ "$keep" -le 1000 ] 2>/dev/null; then
+        keep=12
+    fi
+
     local tmp="$MC_LOG.rotating.$$"
     mv "$MC_LOG" "$tmp" 2>/dev/null || return 0
-    mv -f "$tmp" "$MC_LOG.1" 2>/dev/null || return 0
+
+    # Interrupted-shift recovery (round-2 review finding, MINOR):
+    # sessionstart-remind.sh's own 2s watchdog can kill this function mid-
+    # shift, after the claim just above has already renamed hook.log away
+    # but before mc_rotate_shift_and_land finished landing it at .1 -- the
+    # claimed content is then stranded forever as hook.log.rotating.<pid>,
+    # invisible to every hook.log reader (_rotated_hook_log_paths in
+    # memidx.py only ever looks at pure-digit suffixes) unless recovered
+    # here (see mc_rotate_shift_and_land's own comment for how a naive
+    # re-shift would additionally drop an in-window file that should have
+    # survived, and why checking .1 there is enough to avoid it).
+    #
+    # Fix: before doing the normal shift-and-land for $tmp, sweep every
+    # hook.log.rotating.<pid> belonging to a DEAD pid (`kill -0` failing --
+    # a LIVE pid means another session's claim is genuinely in flight right
+    # now this instant, never touch that one) and land each recovered
+    # window through the exact same mc_rotate_shift_and_land primitive,
+    # oldest mtime first. Ordering property this depends on, in the common
+    # case: every such orphan is newer than whatever already sits at .1
+    # (nothing ever lands at .1 except through this same claim-and-shift
+    # path, and a dead orphan's claim ordinarily predates the claim just
+    # made above) and older than $tmp (claimed an instant ago) -- so
+    # processing oldest-orphan .. newest-orphan .. $tmp, each through its
+    # own single shift-and-land call, reproduces exactly the chain an
+    # uninterrupted sequence of individual rotations would have produced.
+    # This is best-effort ordering, not a strict guarantee (round-2 review
+    # NIT): if an earlier sweep skipped an orphan because its pid had been
+    # recycled by an unrelated live process (a live-looking pid that isn't
+    # really the original claim's), that orphan is left for a LATER
+    # rotation to recover, and it can then land ahead of windows that were
+    # actually claimed after it -- eviction order at a full retention
+    # window can end up slightly off in that narrow case. Nothing is ever
+    # lost and no stats row is miscounted either way (each line still
+    # carries and is scanned by its own timestamp, independent of which
+    # numbered file it physically sits in) -- only which specific window
+    # gets evicted first at the KEEP boundary can be affected.
+    local orphan pid
+    # `while read` over a heredoc, never `for orphan in $(...)` (round-2
+    # review finding, MINOR): the bare `for ... in $(...)` form is subject
+    # to the shell's own word-splitting AND glob expansion of the command
+    # substitution's output -- the only such unquoted expansion anywhere
+    # in hooks/*.sh. A MEMCONTINUUM_HOME containing a space (reproduced:
+    # ".../c7 with space") splits one real orphan path into two bogus
+    # words, neither of which passes `[ -f "$orphan" ]`, so the orphan is
+    # silently skipped and recovery no-ops with rc=0 -- exactly the kind
+    # of silent failure this repo's fail-open rule is not supposed to
+    # excuse. `read -r` takes each line whole, no splitting, no globbing;
+    # the heredoc (not `<(...)` process substitution, not a pipe) keeps
+    # this loop running in the CURRENT shell rather than a subshell, and
+    # needs nothing beyond bash 3.2.
+    while IFS= read -r orphan; do
+        [ -f "$orphan" ] || continue
+        [ "$orphan" = "$tmp" ] && continue
+        pid="${orphan##*.rotating.}"
+        case "$pid" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        kill -0 "$pid" 2>/dev/null && continue
+        mc_rotate_shift_and_land "$orphan" "$keep"
+    done <<EOF
+$(mc_rotate_orphans_oldest_first)
+EOF
+
+    mc_rotate_shift_and_land "$tmp" "$keep" || return 0
+
+    # Prune (round-2 review finding, MINOR): lowering MEMCONTINUUM_LOG_KEEP
+    # after files beyond the new bound already exist must actually enforce
+    # the new, smaller bound going forward -- the shift-and-land calls
+    # above only ever touch .1..$keep (they have no reason to know about a
+    # stale .5 left over from when KEEP was higher), so without this, a
+    # lowered KEEP would silently leave the old, larger retention in place
+    # forever.
+    local n=$((keep + 1))
+    while [ -f "$MC_LOG.$n" ]; do
+        rm -f "$MC_LOG.$n" 2>/dev/null || true
+        n=$((n + 1))
+    done
+
     # `touch`, never `: >`/`>`: a concurrent writer (a second session's
     # mc_log/pre-edit-chain.sh append) can create a brand-new hook.log via
     # its own `>>` in the gap between the mv above and this line -- a bare

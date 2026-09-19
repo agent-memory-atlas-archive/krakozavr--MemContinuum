@@ -746,9 +746,10 @@ class TestInternalsDocumentsPreEditTopicsLogging(unittest.TestCase):
         section = text[rc5_idx:rc4_idx]
         self.assertIn("topics=", section)
 
-    def test_internals_documents_rotation_env_var_and_two_file_policy(self):
+    def test_internals_documents_rotation_env_vars_and_bounded_file_policy(self):
         text = INTERNALS.read_text()
         self.assertIn("MEMCONTINUUM_LOG_MAX_BYTES", text)
+        self.assertIn("MEMCONTINUUM_LOG_KEEP", text)
         self.assertIn("hook.log.1", text)
 
     def test_internals_rotation_paragraph_names_stats_and_data_loss_by_design(self):
