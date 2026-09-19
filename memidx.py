@@ -288,7 +288,17 @@ def _records_fresh_vector_counts(conn: "sqlite3.Connection", project: str) -> tu
 # without forcing a needless re-embed (a migration-only pass never queues
 # an unchanged vector; see the migration-probe comment just below and
 # cmd_reindex's own no_embed guard).
-CURRENT_INDEX_GENERATION = 5
+# Bumped to 6 (TOP-0132 L2): a topic's own `standing:` pointer list is new
+# this generation (records.standing, ensure_records_standing_column below).
+# An unchanged-sha topic reindexed at generation 5 or older would otherwise
+# keep records.standing NULL forever -- the migration guard only adds the
+# COLUMN, it cannot retroactively parse markdown that never gets re-read --
+# and `cmd_standing`'s projection would then silently miss that topic's
+# pointers even after its `standing:` field was added and committed. The
+# same migration probe forces one full content pass on any generation-5-
+# or-older db, exactly as generation 3/4/5's own bumps did for their own
+# new columns.
+CURRENT_INDEX_GENERATION = 6
 
 # MAJOR fix-round item c (TOP-0133 L1): `search --hydrate`'s per-hit byte
 # cap, read once at import time from MEMCONTINUUM_FALLBACK_MAX_BYTES (the
@@ -462,7 +472,7 @@ def validate_record_shape(fm: dict) -> list:
     build_record is ever called for that record."""
     diagnostics: list = []
 
-    for field in ("tags", "code_refs", "implemented_by", "tested_by", "governed_by", "involved_in"):
+    for field in ("tags", "code_refs", "standing", "implemented_by", "tested_by", "governed_by", "involved_in"):
         if not _shape_ok_list_of_scalars(fm.get(field)):
             diagnostics.append((field, f"{field} must be a list of scalars"))
 
@@ -789,6 +799,11 @@ def build_record(root: Path, path: Path, fm: dict, body: str) -> dict:
         "authority": authority,
         "tags": json.dumps(tags),
         "code_refs": json.dumps(code_refs),
+        # TOP-0132 L2: only a TOPIC's own `standing:` list means anything --
+        # stored for every record type regardless (json.dumps([]) for a
+        # non-topic) so insert_record_rows never needs a type branch to
+        # decide whether the column gets a value.
+        "standing": json.dumps(fm.get("standing") or [] if is_topic else []),
         "body": body,
         "ruling_text": ruling_text,
         "is_topic": is_topic,
@@ -1068,6 +1083,18 @@ def ensure_links_evidence_column(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE links ADD COLUMN evidence TEXT")
 
 
+def ensure_records_standing_column(conn: sqlite3.Connection) -> None:
+    """Migration guard shaped like ensure_links_invariant_column (TOP-0132
+    L2): a topic's own `records` row must carry its `standing:` pointer
+    list (JSON-encoded, same convention as `code_refs`/`tags`) or
+    `cmd_standing` has nothing to project -- see CURRENT_INDEX_GENERATION's
+    bump-to-6 comment for why an unchanged-sha topic still needs the
+    generation-driven full content pass on top of this column existing."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(records)").fetchall()}
+    if "standing" not in cols:
+        conn.execute("ALTER TABLE records ADD COLUMN standing TEXT")
+
+
 def ensure_records_link_columns(conn: sqlite3.Connection) -> bool:
     """Migration guard shaped like ensure_links_invariant_column. Returns
     True iff it just added the columns (a pre-F5 db reaching this schema),
@@ -1238,6 +1265,7 @@ def _run_decision_migration_guards(conn: sqlite3.Connection, db_path: Path, proj
     ensure_embeddings_embed_fp_column(conn)
     ensure_links_evidence_column(conn)
     ensure_records_link_columns(conn)
+    ensure_records_standing_column(conn)
     ensure_index_errors_table(conn)
     if project is not None:
         enforce_project_isolation(conn, db_path, project)
@@ -1509,13 +1537,13 @@ def insert_record_rows(conn: sqlite3.Connection, project: str, rec: dict, sha: s
     conn.execute(
         """INSERT INTO records
            (path, sha256, mtime, size, project, type, id, title, area, topic,
-            status, authority, tags, code_refs, body, ruling_text,
+            status, authority, tags, code_refs, body, ruling_text, standing,
             source_path, link_topic_path, link_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             rec["path"], sha, mtime, size, project, rec["type"], rec["id"], rec["title"],
             rec["area"], rec["topic"], rec["status"], rec["authority"], rec["tags"],
-            rec["code_refs"], rec["body"], rec["ruling_text"],
+            rec["code_refs"], rec["body"], rec["ruling_text"], rec["standing"],
             rec["path"], None, None,
         ),
     )
@@ -1579,12 +1607,12 @@ def insert_record_rows(conn: sqlite3.Connection, project: str, rec: dict, sha: s
             conn.execute(
                 """INSERT OR REPLACE INTO records
                    (path, sha256, mtime, size, project, type, id, title, area, topic,
-                    status, authority, tags, code_refs, body, ruling_text,
+                    status, authority, tags, code_refs, body, ruling_text, standing,
                     source_path, link_topic_path, link_id)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (link_path, sha, mtime, size, project, "link", rec["id"], rec["title"], rec["area"],
                  rec["topic"], link.get("status"), ruling.get("authority") or rationale.get("authority"),
-                 rec["tags"], "[]", "", link_ruling_text, rec["path"], rec["path"], link_id),
+                 rec["tags"], "[]", "", link_ruling_text, "[]", rec["path"], rec["path"], link_id),
             )
             conn.execute("INSERT INTO fts (path, project, title, body, ruling_text) VALUES (?,?,?,?,?)",
                          (link_path, project, rec["title"], "", link_ruling_text))
@@ -4509,6 +4537,54 @@ CONSTRAINT_AUTHORITIES = {"owner-verbatim", "owner-ratified"}
 HOLD_ELIGIBLE_AUTHORITIES = {"reviewer-finding", "code-derived", "agent-inference"}
 
 
+# TOP-0132 L1/L2: the standing-decisions digest. A topic's own `standing:`
+# frontmatter list names which of ITS links are true of the whole project,
+# always -- eligible only at CONSTRAINT_AUTHORITIES (the declared label,
+# same gate `standing` re-checks below; v0 explicitly does not wait for a
+# derived-authority scheme). These three names are shared by `memlint.py`'s
+# lint-time cap/gate check and `cmd_standing`'s own projection below, so the
+# two can never independently drift on what "the projected text" means --
+# memlint imports them rather than keeping its own copy (the store-wide cap
+# is enforced at lint time; `cmd_standing` itself never refuses on the cap,
+# only lint owns that).
+STANDING_CAP_LINKS = 24
+STANDING_CAP_CHARS = 4800
+STANDING_HEADER = "Standing decisions -- citations only; the store is the source of truth."
+
+_STANDING_LINK_SUFFIX_RE = re.compile(r"^(.*?)(\d+)$")
+
+
+def standing_link_sort_key(link_id: str):
+    """Numeric-aware sort key for a link id (`L2` before `L10`) -- unlike a
+    topic id (`TOP-####`, zero-padded, so a plain lexical sort already
+    orders it correctly), a link id is never zero-padded, so a bare string
+    sort would put `L10` ahead of `L2` within one topic's standing set."""
+    m = _STANDING_LINK_SUFFIX_RE.match(str(link_id))
+    if m:
+        return (m.group(1), int(m.group(2)))
+    return (str(link_id), -1)
+
+
+def standing_sort_key(entry: tuple) -> tuple:
+    """Orders a `(topic_id, link_id, ...)` standing entry by topic id (plain
+    string), then by link id (`standing_link_sort_key`) -- the one ordering
+    `memidx.py standing`'s projection and memlint's cap-overflow check both
+    use, so "the topics over the line" always names the same topics a real
+    projection run would actually overflow on."""
+    topic_id, link_id = entry[0], entry[1]
+    return (str(topic_id), standing_link_sort_key(link_id))
+
+
+def standing_line(topic_id: str, link_id: str, authority: str, text: str) -> str:
+    """The one rendering of a standing pointer: `TOP-0112 L15
+    (owner-ratified): <ruling.text>` -- the ruling sentence only, never
+    rationale, never chain_lines. Shared by `cmd_standing`'s projection and
+    memlint's cap-overflow error so the character count memlint enforces is
+    the exact string the projection would actually emit for that pointer,
+    not an approximation of it."""
+    return f"{topic_id} {link_id} ({authority}): {text}"
+
+
 def validated_evidence_list(raw) -> list[str]:
     """The parsed-evidence-shape core shared by drift's classifier
     (_validated_evidence below) and memlint's own check (memlint.py imports
@@ -5273,6 +5349,117 @@ def _decision_vector_index_state(conn: sqlite3.Connection, project: str) -> str:
     if fresh == total:
         return "full"
     return "partial"
+
+
+def cmd_standing(args) -> int:
+    """`memidx.py standing --project P [--root DIR] [--json]` -- TOP-0132
+    L1/L2's citation-only projection of every topic's own `standing:`
+    pointer list: what is true of the whole project, always, delivered at
+    session start rather than waiting for an edit to a file it happens to
+    be bound to.
+
+    Unlike every other reader here (search/chain/for-path/why/drift), which
+    proceed with a stderr warning on `upgrade-required`/`stale`/
+    `quarantined` (ruling 68: "a positive match off a degraded index is
+    still real evidence"), `standing` refuses on EVERY state but `current`
+    -- `missing`, `uninitialized`, `upgrade-required`, `stale`, and
+    `quarantined` alike. A stale STANDING digest risks delivering a
+    superseded constraint as though it still held; TOP-0132 L1 rejected a
+    rendered rules file for exactly this failure mode ("a stale rendered
+    file serves a superseded constraint as if current, worse than
+    absence"), and a live projection off a degraded index has the same
+    problem by a different route -- this is the one reader where "keep
+    serving, just warn" is the wrong default. `--root`, when given, is what
+    lets `upgrade-required`/`stale` be told apart from `current` at all
+    (decision_index_state's on-disk drift check needs a root to walk);
+    omitted, this reader can still see `missing`/`uninitialized`/
+    `upgrade-required`/`quarantined`, just never `stale` -- exactly the
+    optional-root tradeoff `add_common_args` already documents for search/
+    chain/for-path/why/drift.
+
+    The eligibility gate (declared, not derived -- TOP-0132 L2 over L1's
+    original derived-authority plan): a pointed link counts only when it
+    exists in its topic, is `status: active`, and its `ruling.authority`
+    is in CONSTRAINT_AUTHORITIES. `memlint.py` enforces this same gate (and
+    a store-wide cap on top of it) at lint time, importing these same
+    names -- but this reader re-applies the gate itself rather than merely
+    trusting a prior lint run happened: an ineligible pointer is simply
+    never projected, never a warning (unlike ruling 68's degraded-index
+    warnings above, this is a hard exclusion, not a caveat)."""
+    db_path = resolve_db_path(args)
+    root = Path(args.root).resolve() if getattr(args, "root", None) else None
+    state = decision_index_state(db_path, args.project, root=root)
+    if state != "current":
+        print(
+            f"standing: the decision index is {state} for project {args.project!r} -- "
+            "run `reindex --root <path>` first (the standing digest never serves off "
+            "a non-current index)",
+            file=sys.stderr,
+        )
+        if args.json:
+            print(json.dumps({"state": state, "links": 0, "lines": []}, indent=2))
+        return 1
+
+    conn = open_db_noncreating(db_path, args.project)
+    if conn is None:
+        # TOCTOU: the file vanished between decision_index_state's own
+        # open/close above and this one.
+        print(
+            f"standing: the decision index is missing for project {args.project!r} -- "
+            "run `reindex --root <path>` first",
+            file=sys.stderr,
+        )
+        if args.json:
+            print(json.dumps({"state": "missing", "links": 0, "lines": []}, indent=2))
+        return 1
+
+    entries = []
+    try:
+        topic_rows = conn.execute(
+            "SELECT path, id, standing FROM records WHERE project=? AND type='topic'",
+            (args.project,),
+        ).fetchall()
+        for row in topic_rows:
+            try:
+                standing_ids = json.loads(row["standing"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(standing_ids, list) or not standing_ids:
+                continue
+            topic_id = row["id"]
+            for lid in standing_ids:
+                lid = str(lid)
+                link_row = conn.execute(
+                    "SELECT status, ruling_authority, ruling_text FROM links "
+                    "WHERE project=? AND topic_path=? AND link=?",
+                    (args.project, row["path"], lid),
+                ).fetchone()
+                if link_row is None:
+                    continue
+                if link_row["status"] != "active":
+                    continue
+                if link_row["ruling_authority"] not in CONSTRAINT_AUTHORITIES:
+                    continue
+                entries.append((topic_id, lid, link_row["ruling_authority"], link_row["ruling_text"] or ""))
+    finally:
+        conn.close()
+
+    entries.sort(key=standing_sort_key)
+    lines = [standing_line(tid, lid, auth, text) for tid, lid, auth, text in entries]
+    digest_text = STANDING_HEADER + ("\n" + "\n".join(lines) if lines else "")
+
+    if args.json:
+        h = hashlib.sha256(digest_text.encode("utf-8")).hexdigest()[:16]
+        payload = {
+            "hash": h,
+            "links": len(lines),
+            "bytes": len(digest_text.encode("utf-8")),
+            "lines": lines,
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        print(digest_text)
+    return 0
 
 
 def cmd_check(args) -> int:
@@ -9037,6 +9224,16 @@ def main(argv=None) -> int:
     p_unmapped.add_argument("--code-root", dest="code_root", action="append", default=None)
     p_unmapped.add_argument("--json", action="store_true")
     p_unmapped.set_defaults(func=cmd_unmapped)
+
+    p_standing = sub.add_parser(
+        "standing",
+        help="citation-only projection of every topic's own `standing:` "
+             "pointer list -- delivered live by sessionstart-remind.sh, "
+             "never a rendered rules file",
+    )
+    add_common_args(p_standing, optional_root=True)
+    p_standing.add_argument("--json", action="store_true")
+    p_standing.set_defaults(func=cmd_standing)
 
     p_code_reindex = sub.add_parser(
         "code-reindex",

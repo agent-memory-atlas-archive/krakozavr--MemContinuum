@@ -2502,6 +2502,201 @@ class TestSessionStartRemind(HookTestBase):
         self.assertEqual(state.get("start_code_sha"), git_head(self.code_root))
 
 
+class TestSessionStartStandingDigest(HookTestBase):
+    """TOP-0132 L1/L2: sessionstart-remind.sh's own delivery of the
+    standing-decisions digest -- every source, dedupe, always-inject on
+    clear/compact, skip on a refused index, and the no-write property.
+    `HookTestBase`'s own fixture topics carry no `standing:` (see
+    TestSessionStartRemind's silence assertions, which depend on that),
+    so every test here adds its own eligible standing topic first."""
+
+    STANDING_TOPIC = """---
+type: topic
+id: TOP-9500
+title: A standing decision
+area: testing
+current: L1
+standing: [L1]
+links:
+  - link: L1
+    date: 2026-01-01
+    status: active
+    kind: adopted
+    ruling:
+      text: "this ruling stands for the whole project"
+      authority: owner-verbatim
+      source: "test"
+    recorded_by: agent
+    recorded_at: 2026-01-01
+---
+
+Body.
+"""
+
+    def _add_standing_topic(self):
+        _write(self.store_root / "topics" / "testing" / "standing-topic.md", self.STANDING_TOPIC)
+        subprocess.run(["git", "add", "-A"], cwd=self.store_root, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "add standing topic"], cwd=self.store_root, check=True)
+        db = self.home / f"{self.project}.sqlite"
+        with contextlib.redirect_stdout(io.StringIO()):
+            reindex(self.store_root, db, project=self.project)
+
+    def _standing_line(self, log_text):
+        matching = [l for l in log_text.splitlines() if "sessionstart outcome=" in l]
+        self.assertTrue(matching, log_text)
+        return matching[-1]
+
+    def test_startup_injects_when_an_eligible_standing_link_exists(self):
+        self._add_standing_topic()
+        session_id = "s-standing-startup"
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "startup"), self.base_env()
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("this ruling stands for the whole project", ctx)
+        self.assertIn("TOP-9500 L1", ctx)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("standing=injected links=1", self._standing_line(log_text))
+
+    def test_resume_dedupes_after_startup_already_injected(self):
+        self._add_standing_topic()
+        session_id = "s-standing-dedup"
+        proc1, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "startup"), self.base_env()
+        )
+        self.assertTrue(proc1.stdout.strip())
+
+        proc2, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "resume"), self.base_env()
+        )
+        self.assertEqual(
+            proc2.stdout.strip(), "", "resume with an unchanged digest must dedupe silently"
+        )
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("standing=dedup", self._standing_line(log_text))
+
+    def test_clear_always_injects_even_though_a_prior_hash_exists(self):
+        self._add_standing_topic()
+        session_id = "s-standing-clear"
+        run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "startup"), self.base_env()
+        )
+
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "clear"), self.base_env()
+        )
+        self.assertTrue(proc.stdout.strip(), "clear must always re-inject, never dedupe")
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("this ruling stands for the whole project", ctx)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("standing=injected", self._standing_line(log_text))
+
+    def test_skipped_when_the_index_is_stale(self):
+        self._add_standing_topic()
+        # On-disk drift after the last reindex -- MEMCONTINUUM_ROOT is
+        # always set by base_env(), so --root is always passed and
+        # "stale" is observable here (unlike a rootless caller).
+        (self.store_root / "topics" / "testing" / "new.md").write_text(
+            "---\ntype: topic\nid: TOP-9501\ntitle: New\nlinks: []\n---\nBody.\n"
+        )
+        session_id = "s-standing-stale"
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "startup"), self.base_env()
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("standing=skipped-stale", self._standing_line(log_text))
+
+    def test_compact_appends_standing_after_coverage_evidence(self):
+        self._add_standing_topic()
+        session_id = "s-standing-compact-coverage"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        state = self.load_state(session_id)
+        state["pending"] = {
+            "unmapped": ["src/unmapped.py"],
+            "coverage_status": "ok",
+            "code_head_changed": True,
+            "store_head_changed": False,
+            "computed_at": time.time(),
+        }
+        self.state_file(session_id).write_text(json.dumps(state))
+
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "compact"), self.base_env()
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Coverage signal", ctx)
+        self.assertIn("this ruling stands for the whole project", ctx)
+        self.assertLess(
+            ctx.index("Coverage signal"), ctx.index("this ruling stands"),
+            "coverage's own text must stay first when it has evidence",
+        )
+        log_text = (self.home / "hook.log").read_text()
+        last = self._standing_line(log_text)
+        self.assertIn("outcome=compact-injected", last)
+        self.assertIn("standing=injected", last)
+
+    def test_compact_injects_standing_alone_when_no_state_file_exists_yet(self):
+        self._add_standing_topic()
+        session_id = "s-standing-compact-no-state"
+        self.assertFalse(self.state_file(session_id).exists())
+        proc, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "compact"), self.base_env()
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("this ruling stands for the whole project", ctx)
+        self.assertNotIn("Coverage signal", ctx)
+        log_text = (self.home / "hook.log").read_text()
+        last = self._standing_line(log_text)
+        self.assertIn("outcome=compact-no-state", last)
+        self.assertIn("standing=injected", last)
+
+    def test_compact_never_dedupes_across_two_calls(self):
+        self._add_standing_topic()
+        session_id = "s-standing-compact-always"
+        self.seed_ledger(session_id, [])
+
+        proc1, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "compact"), self.base_env()
+        )
+        self.assertTrue(proc1.stdout.strip())
+
+        proc2, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "compact"), self.base_env()
+        )
+        self.assertTrue(
+            proc2.stdout.strip(),
+            "compact must inject the standing digest every time, never dedupe",
+        )
+
+    def test_no_write_to_store_or_index_across_repeated_runs(self):
+        self._add_standing_topic()
+        self.assertTrue(git_is_clean(self.store_root))
+        head_before = git_head(self.store_root)
+        db = self.home / f"{self.project}.sqlite"
+        sha_before = hashlib.sha256(db.read_bytes()).hexdigest()
+
+        session_id = "s-standing-nowrite"
+        for _ in range(20):
+            proc, _ = run_script(
+                SESSIONSTART_HOOK, self.session_start_payload(session_id, "startup"), self.base_env()
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        self.assertTrue(git_is_clean(self.store_root))
+        self.assertEqual(git_head(self.store_root), head_before)
+        self.assertEqual(hashlib.sha256(db.read_bytes()).hexdigest(), sha_before)
+
+
 class TestSessionStartHookLogRotation(HookTestBase):
     """eval-topic-logging section 5 (owner-approved add-on): rotation runs
     from sessionstart-remind.sh, once per session, at the startup/resume/

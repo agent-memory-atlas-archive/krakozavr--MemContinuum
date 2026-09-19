@@ -10,7 +10,39 @@
 #                        current git HEAD, via setdefault so a *resume* never
 #                        resets a startup's original values), then prune
 #                        state files older than 24h across this project.
-#                        Always silent (no stdout).
+#                        Silent UNLESS the standing-decisions digest (next
+#                        paragraph) has something new to inject.
+#
+#   TOP-0132 L1/L2 (every source): after the per-source work above, always
+#                        attempts the standing-decisions digest --
+#                        `memidx.py standing --json`'s citation-only
+#                        projection of every topic's own `standing:`
+#                        pointer list, computed AFTER every state mutation
+#                        the branch already makes (init/prune/rotate on
+#                        startup; pending consumption on compact) so a
+#                        watchdog kill during the digest's own subprocess
+#                        calls loses only the digest, never that
+#                        bookkeeping. A non-current index (missing,
+#                        uninitialized, upgrade-required, stale, OR
+#                        quarantined -- `standing` refuses on every one of
+#                        these, unlike every other reader here) or an empty
+#                        standing set injects nothing, logged
+#                        `standing=skipped-<state>` / `standing=empty`.
+#                        Otherwise: `startup`/`resume` dedupe by comparing
+#                        the digest's hash against `state["standing_hash"]`
+#                        inside the SAME locked state-update transform that
+#                        sets it (never a separate read-then-write -- see
+#                        mc_compute_standing's callers), logging
+#                        `standing=dedup` on a match; `clear` and `compact`
+#                        ALWAYS inject regardless of any stored hash (the
+#                        context is gone either way), logging
+#                        `standing=injected links=N bytes=B hash=H`. On
+#                        `compact`, the digest is appended AFTER coverage's
+#                        (or, failing that, look-back's) own text in the
+#                        same additionalContext -- coverage stays first
+#                        when it has evidence. Loaded is not applied -- this
+#                        raises the odds a standing ruling is honored, it
+#                        is not a guarantee.
 #
 #                        `clear` (INC-0108) is a fresh session, not a
 #                        continuation: /clear commonly fires on the SAME
@@ -126,6 +158,93 @@ eval "$(mc_extract_fields "$PAYLOAD" session_id source)" 2>/dev/null
 
 STATE_FILE="$(mc_state_file_for "$MC_PROJECT" "$SESSION_ID")"
 
+# mc_compute_standing -- TOP-0132 L1/L2. Runs `memidx.py standing --json`
+# (never touches session state itself; callers below decide dedupe/
+# persistence) and sets these globals:
+#   STANDING_STATUS  "ready" | "empty" | "skipped-<state>"
+#   STANDING_TEXT    the exact plain-text digest to inject (only set when
+#                     STANDING_STATUS=ready -- header + one line per
+#                     pointer, byte-identical to what --json's own hash/
+#                     bytes describe, since both come from the SAME
+#                     `memidx.py standing` query against an unchanged,
+#                     current index)
+#   STANDING_HASH / STANDING_LINKS / STANDING_BYTES  from --json, verbatim
+#                     -- never recomputed here, so this hook can never
+#                     disagree with `memidx.py standing --json` about what
+#                     the digest's own hash or size is.
+# Two `memidx.py standing` calls when there IS something to inject (one
+# --json, for the structured hash/links/bytes memidx.py itself computes;
+# one plain, for the exact text to inject) -- never more, and never a
+# second call at all when the index refuses or the set is empty. Bash 3.2:
+# no associative arrays, no `local -n`; globals by convention (this file is
+# a leaf script, never sourced elsewhere).
+STANDING_STATUS=""
+STANDING_TEXT=""
+STANDING_HASH=""
+STANDING_LINKS=0
+STANDING_BYTES=0
+
+mc_compute_standing() {
+    STANDING_STATUS="skipped-unavailable"
+    STANDING_TEXT=""
+    STANDING_HASH=""
+    STANDING_LINKS=0
+    STANDING_BYTES=0
+
+    local args
+    args=(standing --project "$MC_PROJECT" --db "$MC_DB_PATH")
+    [ -n "${MEMCONTINUUM_ROOT:-}" ] && args+=(--root "$MEMCONTINUUM_ROOT")
+
+    local json_out
+    json_out="$(env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" "${args[@]}" --json 2>>"$MC_LOG")"
+
+    local meta_tmp
+    meta_tmp="$(mktemp 2>/dev/null)" || return
+    env PYTHONPATH= "$MC_PY" -c '
+import json, sys
+
+try:
+    obj = json.loads(sys.argv[1] or "{}")
+except Exception:
+    obj = {}
+if "hash" in obj:
+    print("ok - %d %s %d" % (obj.get("links", 0), obj.get("hash", "-"), obj.get("bytes", 0)))
+else:
+    print("refused %s 0 - 0" % obj.get("state", "unknown"))
+' "$json_out" >"$meta_tmp" 2>>"$MC_LOG"
+
+    local kind rstate links hash nbytes
+    read -r kind rstate links hash nbytes <"$meta_tmp" 2>/dev/null
+    rm -f "$meta_tmp" 2>/dev/null
+
+    if [ "${kind:-}" != "ok" ]; then
+        STANDING_STATUS="skipped-${rstate:-unknown}"
+        return
+    fi
+    if [ "${links:-0}" = "0" ]; then
+        STANDING_STATUS="empty"
+        return
+    fi
+
+    STANDING_TEXT="$(env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" "${args[@]}" 2>>"$MC_LOG")"
+    STANDING_HASH="$hash"
+    STANDING_LINKS="$links"
+    STANDING_BYTES="$nbytes"
+    STANDING_STATUS="ready"
+}
+
+# mc_wrap_context TEXT -- prints `{"hookSpecificOutput": {"hookEventName":
+# "SessionStart", "additionalContext": TEXT}}` on stdout, or nothing if the
+# python call itself fails (fail-open, same as every other JSON build in
+# this file). Shared by every branch below that injects, so the envelope
+# shape is written exactly once.
+mc_wrap_context() {
+    env PYTHONPATH= "$MC_PY" -c '
+import json, sys
+print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": sys.argv[1]}}))
+' "$1" 2>>"$MC_LOG"
+}
+
 case "${SOURCE:-}" in
     startup|resume|clear)
         CODE_SHA="$(mc_git_head "${MEMCONTINUUM_CODE_ROOT:-}")"
@@ -216,11 +335,95 @@ print(json.dumps(state))
         # fail-open/race-safety discussion).
         mc_rotate_hook_log
 
-        finish "init"
+        # TOP-0132 L2: computed AFTER every state mutation above (init,
+        # prune, rotate) -- a watchdog kill during mc_compute_standing's
+        # own subprocess calls then loses only the digest, never the
+        # session-init bookkeeping those already-committed writes hold.
+        mc_compute_standing
+        STANDING_CTX=""
+        STANDING_LOG_TOKEN="$STANDING_STATUS"
+        if [ "$STANDING_STATUS" = "ready" ]; then
+            # Dedupe by hash, compare-and-set inside ONE locked transform
+            # (never a plain read here followed by a separate write below
+            # -- two concurrent SessionStart fires for this session could
+            # otherwise both read the old hash and both decide "inject").
+            # `clear` already rebuilt `state` to just {ledger,
+            # shell_baseline} earlier in THIS SAME case arm, so it never
+            # carries a stale standing_hash into this comparison --
+            # `state.get("standing_hash")` is unset post-clear and never
+            # equals a real hash, so clear always injects (when there is
+            # something to inject) without needing its own branch here.
+            export MC_STANDING_HASH="$STANDING_HASH"
+            STANDING_VERDICT_TMP="$(mktemp 2>/dev/null)"
+            export MC_STANDING_VERDICT_OUT="${STANDING_VERDICT_TMP:-}"
+            mc_update_state_json "$STATE_FILE" '
+import os
+
+_new_hash = os.environ.get("MC_STANDING_HASH", "")
+_verdict = "dedup"
+if state.get("standing_hash") != _new_hash:
+    state["standing_hash"] = _new_hash
+    _verdict = "inject"
+_out = os.environ.get("MC_STANDING_VERDICT_OUT")
+if _out:
+    try:
+        with open(_out, "w") as _f:
+            _f.write(_verdict)
+    except OSError:
+        pass
+
+print(json.dumps(state))
+' >>"$MC_LOG" 2>&1
+            STANDING_VERDICT="inject"
+            if [ -n "${STANDING_VERDICT_TMP:-}" ] && [ -s "$STANDING_VERDICT_TMP" ]; then
+                STANDING_VERDICT="$(cat "$STANDING_VERDICT_TMP")"
+            fi
+            rm -f "${STANDING_VERDICT_TMP:-}" 2>/dev/null
+            if [ "$STANDING_VERDICT" = "inject" ]; then
+                STANDING_CTX="$STANDING_TEXT"
+                STANDING_LOG_TOKEN="injected links=$STANDING_LINKS bytes=$STANDING_BYTES hash=$STANDING_HASH"
+            else
+                STANDING_LOG_TOKEN="dedup"
+            fi
+        fi
+
+        if [ -n "$STANDING_CTX" ]; then
+            PY_OUT="$(mc_wrap_context "$STANDING_CTX")"
+            [ -n "$PY_OUT" ] && printf '%s\n' "$PY_OUT"
+        fi
+
+        finish "init" "standing=$STANDING_LOG_TOKEN"
         ;;
 
     compact)
-        [ -f "$STATE_FILE" ] || finish "compact-no-state"
+        # TOP-0132 L2: attempted on EVERY compact -- unlike startup/resume
+        # it never dedup-skips (the context is gone after compaction), and
+        # unlike coverage/look-back below it needs no pre-existing state
+        # file (only their own `pending` read does). Computed before the
+        # "no state" early-exit so that exit can still carry the digest.
+        mc_compute_standing
+        STANDING_CTX=""
+        STANDING_LOG_TOKEN="$STANDING_STATUS"
+        if [ "$STANDING_STATUS" = "ready" ]; then
+            STANDING_CTX="$STANDING_TEXT"
+            STANDING_LOG_TOKEN="injected links=$STANDING_LINKS bytes=$STANDING_BYTES hash=$STANDING_HASH"
+            if [ -f "$STATE_FILE" ]; then
+                export MC_STANDING_HASH="$STANDING_HASH"
+                mc_update_state_json "$STATE_FILE" '
+import os
+state["standing_hash"] = os.environ.get("MC_STANDING_HASH", "")
+print(json.dumps(state))
+' >>"$MC_LOG" 2>&1
+            fi
+        fi
+
+        if [ ! -f "$STATE_FILE" ]; then
+            if [ -n "$STANDING_CTX" ]; then
+                PY_OUT="$(mc_wrap_context "$STANDING_CTX")"
+                [ -n "$PY_OUT" ] && printf '%s\n' "$PY_OUT"
+            fi
+            finish "compact-no-state" "standing=$STANDING_LOG_TOKEN"
+        fi
 
         OUTPUT_JSON="$(MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" env PYTHONPATH= "$MC_PY" -c '
 import json, os, sys
@@ -396,15 +599,57 @@ print(json.dumps(state))
 ' >>"$MC_LOG" 2>&1
         fi
 
-        if [ $RC -eq 0 ] && [ -n "$OUTPUT_JSON" ]; then
-            printf '%s\n' "$OUTPUT_JSON"
-            finish "compact-injected"
-        elif [ $LB_RC -eq 0 ] && [ -n "$LB_JSON" ]; then
-            printf '%s\n' "$LB_JSON"
-            finish "compact-lookback" "turn=$LB_TURN since=$LB_SINCE count=${LB_COUNT:-0}"
-        else
-            finish "compact-no-evidence"
+        # Merge: coverage's own ctx (if RC==0) else look-back's (if
+        # LB_RC==0) else nothing, THEN the standing digest appended after
+        # it -- coverage (and, failing that, look-back) stays first when
+        # it has evidence; standing is delivered every compact regardless
+        # (computed above, unconditionally). One python call does the
+        # whole merge -- it never re-derives coverage/look-back's own
+        # ctx text, only lifts it back out of the JSON those two branches
+        # above already built, so this can never disagree with what they
+        # actually decided.
+        MERGE_META_TMP="$(mktemp 2>/dev/null)"
+        FINAL_JSON="$(env PYTHONPATH= "$MC_PY" -c '
+import json, sys
+
+
+def ctx_of(raw):
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None
+    return obj.get("hookSpecificOutput", {}).get("additionalContext")
+
+
+output_json, lb_json, standing_ctx = sys.argv[1], sys.argv[2], sys.argv[3]
+
+base = ctx_of(output_json)
+kind = "coverage" if base is not None else None
+if base is None:
+    base = ctx_of(lb_json)
+    kind = "lookback" if base is not None else None
+
+parts = [p for p in (base, standing_ctx or None) if p]
+final = "\n\n".join(parts)
+if final:
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": final}}))
+print(kind or "none", file=sys.stderr)
+' "$OUTPUT_JSON" "$LB_JSON" "$STANDING_CTX" 2>"${MERGE_META_TMP:-/dev/null}")"
+        MERGE_KIND="none"
+        if [ -n "${MERGE_META_TMP:-}" ] && [ -s "$MERGE_META_TMP" ]; then
+            read -r MERGE_KIND <"$MERGE_META_TMP" 2>/dev/null
         fi
+        rm -f "${MERGE_META_TMP:-}" 2>/dev/null
+
+        [ -n "$FINAL_JSON" ] && printf '%s\n' "$FINAL_JSON"
+
+        case "$MERGE_KIND" in
+            coverage) finish "compact-injected" "standing=$STANDING_LOG_TOKEN" ;;
+            lookback) finish "compact-lookback" "turn=$LB_TURN since=$LB_SINCE count=${LB_COUNT:-0} standing=$STANDING_LOG_TOKEN" ;;
+            *) finish "compact-no-evidence" "standing=$STANDING_LOG_TOKEN" ;;
+        esac
         ;;
 
     *)

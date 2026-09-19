@@ -91,6 +91,12 @@ after real edits, the session gets **nudged** that something here might be worth
 writing down. Neither trigger reads what you typed. If a nudge fired just before
 a compaction, it survives into the session on the other side.
 
+A third channel needs no edit and no nudge at all. A handful of rulings hold
+for the whole project, always — marked standing on their own topic — and are
+handed to every session unprompted, at the start, before any edit happens: a
+citation of the ruling's own sentence, never a summary, and refusing outright
+rather than serving one that might already be out of date.
+
 **Nothing is captured automatically.** A record is written deliberately, and a
 ruling quoted as the owner's own words is meant to be written only after the
 owner has seen and confirmed the exact text. That is an authoring rule
@@ -410,6 +416,7 @@ memidx.py search "<question>" --project NAME --status active                    
 memidx.py code-search "<what it does>" --project NAME                            # find existing code
 memidx.py for-path <file> --project NAME                                         # what governs this file?
 memidx.py chain <topic-id> --project NAME                                        # one question's full history
+memidx.py standing --project NAME [--root STORE] [--json]                        # what's standing, printed by hand
 memidx.py drift --code-root DIR --project NAME                                   # has the code grown a bypass?
 memidx.py reindex --root STORE --project NAME                                    # after editing the store by hand
 memidx.py embed-worker --root STORE --project NAME --db DB                       # run the background embed backfill by hand

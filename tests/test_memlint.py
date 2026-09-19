@@ -2628,5 +2628,193 @@ class TestMemlintDecisionMarkers(unittest.TestCase):
         )
 
 
+def _standing_topic(tid: str, standing: list, link_status: str = "active",
+                     link_authority: str = "owner-ratified", ruling_text: str = "the ruling text") -> str:
+    """A minimal two-link topic (`L1` superseded by `L2`) whose `L2` status/
+    authority are parameterized so a caller can put the link `standing:`
+    actually points at into whatever shape a test needs (active/provisional,
+    any authority), while `L1` stays a fixed, always-superseded predecessor
+    -- useful on its own as an "ineligible pointer" target (superseded).
+    `link_status="superseded"` is not supported here (it would need its own
+    `superseded_by`); no test below passes it."""
+    standing_yaml = "[" + ", ".join(standing) + "]" if standing else "[]"
+    return (
+        "---\n"
+        "type: topic\n"
+        f"id: {tid}\n"
+        "title: A standing test topic\n"
+        "area: testing\n"
+        "current: L2\n"
+        f"standing: {standing_yaml}\n"
+        "links:\n"
+        "  - link: L1\n"
+        "    date: 2026-01-01\n"
+        "    status: superseded\n"
+        "    kind: adopted\n"
+        "    superseded_by: L2\n"
+        "    ruling: {text: \"old ruling\", authority: owner-verbatim, source: s}\n"
+        "    recorded_by: agent\n"
+        "    recorded_at: 2026-01-01\n"
+        "  - link: L2\n"
+        "    date: 2026-01-02\n"
+        f"    status: {link_status}\n"
+        "    kind: amended\n"
+        "    reverses: L1\n"
+        "    reason_for_change: new-evidence\n"
+        f"    ruling: {{text: \"{ruling_text}\", authority: {link_authority}, source: s}}\n"
+        "    recorded_by: agent\n"
+        "    recorded_at: 2026-01-02\n"
+        + "---\n\nBody.\n"
+    )
+
+
+class TestStandingDigest(unittest.TestCase):
+    """TOP-0132 L2: the standing-decisions digest's lint-time gate and
+    store-wide cap. `_standing_topic` above keeps every case a normal,
+    schema-clean append-only chain -- these tests exercise ONLY the
+    `standing:` rules, never a co-incidental unrelated lint error."""
+
+    def _lint(self, files: dict) -> tuple:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for rel, text in files.items():
+                _write(root / rel, text)
+            return memlint.lint_root(root)
+
+    def test_clean_pointer_to_active_owner_ratified_link_is_clean(self):
+        topic = _standing_topic("TOP-9500", ["L2"])
+        errors, _ = self._lint({"topics/t.md": topic})
+        self.assertEqual(errors, [], errors)
+
+    def test_clean_pointer_to_active_owner_verbatim_link_is_clean(self):
+        topic = _standing_topic("TOP-9501", ["L2"], link_authority="owner-verbatim")
+        errors, _ = self._lint({"topics/t.md": topic})
+        self.assertEqual(errors, [], errors)
+
+    def test_pointer_to_nonexistent_link_id_is_an_error(self):
+        topic = _standing_topic("TOP-9502", ["L99"])
+        errors, _ = self._lint({"topics/t.md": topic})
+        self.assertTrue(
+            any("standing points at" in e and "L99" in e and "not a link" in e for e in errors),
+            errors,
+        )
+
+    def test_pointer_to_superseded_link_is_an_error(self):
+        """A pointer to a superseded link is an error ON PURPOSE (design
+        record): it forces the supersession and the pointer update into
+        the same commit, rather than silently letting a stale citation
+        keep pointing at history."""
+        topic = _standing_topic("TOP-9503", ["L1"])
+        errors, _ = self._lint({"topics/t.md": topic})
+        self.assertTrue(
+            any("standing link" in e and "'L1'" in e and "not active" in e for e in errors),
+            errors,
+        )
+
+    def test_pointer_to_provisional_link_is_an_error(self):
+        topic = _standing_topic("TOP-9504", ["L2"], link_status="provisional")
+        errors, _ = self._lint({"topics/t.md": topic})
+        self.assertTrue(
+            any("standing link" in e and "'L2'" in e and "not active" in e for e in errors),
+            errors,
+        )
+
+    def test_pointer_to_agent_inference_link_is_an_error(self):
+        topic = _standing_topic("TOP-9505", ["L2"], link_authority="agent-inference")
+        errors, _ = self._lint({"topics/t.md": topic})
+        self.assertTrue(
+            any(
+                "standing link" in e and "'L2'" in e and "ruling.authority" in e
+                and "agent-inference" in e
+                for e in errors
+            ),
+            errors,
+        )
+
+    def test_pointer_to_reviewer_finding_link_is_an_error(self):
+        topic = _standing_topic("TOP-9506", ["L2"], link_authority="reviewer-finding")
+        errors, _ = self._lint({"topics/t.md": topic})
+        self.assertTrue(
+            any("standing link" in e and "ruling.authority" in e for e in errors), errors,
+        )
+
+    def _cap_topics(self, n: int, chars_each: int = 10) -> dict:
+        files = {}
+        for i in range(n):
+            tid = f"TOP-{1000 + i}"
+            files[f"topics/t{i}.md"] = _standing_topic(
+                tid, ["L2"], ruling_text="x" * chars_each,
+            )
+        return files
+
+    def test_cap_overflow_on_link_count_names_the_topic_over_the_line(self):
+        files = self._cap_topics(memlint.STANDING_CAP_LINKS + 1)
+        errors, _ = self._lint(files)
+        cap_errors = [e for e in errors if "exceeds the store-wide cap" in e]
+        self.assertEqual(len(cap_errors), 1, errors)
+        # Sorted (topic id, link id) order -- the 25th (0-indexed 24th)
+        # entry is the one that pushes the count over 24, and topic ids
+        # here sort lexically in numeric order (TOP-1000 .. TOP-1024).
+        self.assertIn("TOP-1024", cap_errors[0])
+        self.assertNotIn("TOP-1000", cap_errors[0])
+
+    def test_cap_overflow_on_char_count_is_caught_even_under_the_link_cap(self):
+        # 10 topics, one link each, 1000 chars of ruling text apiece -- well
+        # under STANDING_CAP_LINKS but the rendered lines alone exceed
+        # STANDING_CAP_CHARS (4800).
+        files = self._cap_topics(10, chars_each=1000)
+        errors, _ = self._lint(files)
+        cap_errors = [e for e in errors if "exceeds the store-wide cap" in e]
+        self.assertEqual(len(cap_errors), 1, errors)
+
+    def test_under_cap_on_both_axes_is_clean(self):
+        files = self._cap_topics(memlint.STANDING_CAP_LINKS, chars_each=10)
+        errors, _ = self._lint(files)
+        self.assertFalse(any("exceeds the store-wide cap" in e for e in errors), errors)
+
+    def test_ineligible_pointer_does_not_count_toward_the_cap(self):
+        """An already-flagged ineligible pointer (superseded, in this case)
+        must not ALSO inflate the cap count -- it would never reach the
+        projection in the first place, so counting it here would name a
+        topic for content memidx.py standing never actually emits."""
+        files = self._cap_topics(memlint.STANDING_CAP_LINKS, chars_each=10)
+        # Add one more topic whose only standing pointer is ineligible
+        # (superseded) -- this alone must not tip the cap.
+        files["topics/extra.md"] = _standing_topic("TOP-9999", ["L1"])
+        errors, _ = self._lint(files)
+        self.assertFalse(any("exceeds the store-wide cap" in e for e in errors), errors)
+
+
+class TestStandingGateMutation(unittest.TestCase):
+    """Acceptance-style mutation check (TOP-0132 L2): widen the authority
+    gate, or the cap, and confirm the positive test above that depends on
+    it actually FAILS -- proving that test exercises the real guard rather
+    than passing regardless of whether the guard runs at all."""
+
+    def _assert_defeated(self, test_name):
+        test = TestStandingDigest(test_name)
+        with self.assertRaises(
+            AssertionError,
+            msg=f"TestStandingDigest.{test_name} did not fail with the guard "
+                "weakened -- it is not exercising that guard",
+        ):
+            test.debug()
+
+    def test_widening_the_authority_gate_defeats_the_agent_inference_case(self):
+        with mock.patch.object(
+            memlint, "CONSTRAINT_AUTHORITIES",
+            {"owner-verbatim", "owner-ratified", "agent-inference"},
+        ):
+            self._assert_defeated("test_pointer_to_agent_inference_link_is_an_error")
+
+    def test_raising_the_link_cap_defeats_the_overflow_case(self):
+        with mock.patch.object(memlint, "STANDING_CAP_LINKS", 1000):
+            self._assert_defeated("test_cap_overflow_on_link_count_names_the_topic_over_the_line")
+
+    def test_raising_the_char_cap_defeats_the_overflow_case(self):
+        with mock.patch.object(memlint, "STANDING_CAP_CHARS", 100000):
+            self._assert_defeated("test_cap_overflow_on_char_count_is_caught_even_under_the_link_cap")
+
+
 if __name__ == "__main__":
     unittest.main()

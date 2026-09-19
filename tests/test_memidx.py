@@ -5552,5 +5552,210 @@ class TestEmbedWorker(unittest.TestCase):
         self.assertFalse(backlog2["worker_lock_held"])
 
 
+def _standing_topic(tid: str, link_id: str, standing: list, status: str = "active",
+                     authority: str = "owner-ratified", text: str = "the ruling text") -> str:
+    """A one-link topic whose `standing:`, link status, and link authority
+    are all parameterized, for `TestStandingCommand` below."""
+    standing_yaml = "[" + ", ".join(standing) + "]" if standing else "[]"
+    return (
+        "---\n"
+        "type: topic\n"
+        f"id: {tid}\n"
+        f"title: Standing fixture {tid}\n"
+        "area: testing\n"
+        f"current: {link_id}\n"
+        f"standing: {standing_yaml}\n"
+        "links:\n"
+        f"  - link: {link_id}\n"
+        "    date: 2026-01-01\n"
+        f"    status: {status}\n"
+        "    kind: adopted\n"
+        f"    ruling: {{text: \"{text}\", authority: {authority}, source: s}}\n"
+        "    recorded_by: agent\n"
+        "    recorded_at: 2026-01-01\n"
+        "---\n\nBody.\n"
+    )
+
+
+class TestStandingCommand(unittest.TestCase):
+    """TOP-0132 L1/L2: `memidx.py standing`'s citation-only projection --
+    the eligibility gate re-applied by the reader itself, ordering,
+    determinism, and refusal on every index state but `current`."""
+
+    def _run(self, db, root=None, json_out=True):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = memidx.cmd_standing(ns(
+                project=memidx.DEFAULT_PROJECT, db=str(db),
+                root=str(root) if root else None, json=json_out,
+            ))
+        return rc, buf.getvalue()
+
+    def test_missing_index_refuses(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "nope.sqlite"
+            rc, out = self._run(db)
+            self.assertEqual(rc, 1)
+            self.assertEqual(json.loads(out), {"state": "missing", "links": 0, "lines": []})
+
+    def test_uninitialized_index_refuses(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "empty.sqlite"
+            conn = memidx.open_db(db, project=memidx.DEFAULT_PROJECT)
+            conn.close()
+            rc, out = self._run(db)
+            self.assertEqual(rc, 1)
+            self.assertEqual(json.loads(out)["state"], "uninitialized")
+
+    def test_upgrade_required_index_refuses(self):
+        """Unlike search/chain/for-path/why/drift (which proceed with a
+        warning on upgrade-required/stale/quarantined), `standing` refuses
+        on every one of them -- this is the one deliberate deviation from
+        ruling 68's "a positive match off a degraded index is still real
+        evidence" default."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "t.md", _standing_topic("TOP-9600", "L1", ["L1"]))
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            conn = sqlite3.connect(str(db))
+            conn.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '1')")
+            conn.commit(); conn.close()
+            rc, out = self._run(db, root=root)
+            self.assertEqual(rc, 1)
+            self.assertEqual(json.loads(out)["state"], "upgrade-required")
+
+    def test_stale_index_refuses(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "t.md", _standing_topic("TOP-9601", "L1", ["L1"]))
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            (root / "topics" / "new.md").write_text(
+                "---\ntype: topic\nid: TOP-9602\ntitle: New\nlinks: []\n---\nBody.\n"
+            )
+            rc, out = self._run(db, root=root)
+            self.assertEqual(rc, 1)
+            self.assertEqual(json.loads(out)["state"], "stale")
+
+    def test_quarantined_index_refuses(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "good.md", _standing_topic("TOP-9603", "L1", ["L1"]))
+            _write_record(root / "topics" / "bad.md", "---\ntype: topic\nid: TOP-9604\nlinks: [\n---\nBody.\n")
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            rc, out = self._run(db, root=root)
+            self.assertEqual(rc, 1)
+            self.assertEqual(json.loads(out)["state"], "quarantined")
+
+    def test_no_root_still_sees_missing_and_quarantined_but_never_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "t.md", _standing_topic("TOP-9605", "L1", ["L1"]))
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            (root / "topics" / "new.md").write_text(
+                "---\ntype: topic\nid: TOP-9606\ntitle: New\nlinks: []\n---\nBody.\n"
+            )
+            # No --root given -- on-disk drift is invisible; a valid,
+            # current-generation, unquarantined index reads "current".
+            rc, out = self._run(db, root=None)
+            self.assertEqual(rc, 0)
+
+    def test_current_with_eligible_link_projects_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "t.md", _standing_topic(
+                "TOP-9610", "L2", ["L2"], text="the standing sentence",
+            ))
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            rc, out = self._run(db, root=root)
+            self.assertEqual(rc, 0)
+            payload = json.loads(out)
+            self.assertEqual(payload["links"], 1)
+            self.assertEqual(len(payload["lines"]), 1)
+            self.assertIn("TOP-9610", payload["lines"][0])
+            self.assertIn("L2", payload["lines"][0])
+            self.assertIn("owner-ratified", payload["lines"][0])
+            self.assertIn("the standing sentence", payload["lines"][0])
+            self.assertGreater(payload["bytes"], 0)
+            self.assertEqual(len(payload["hash"]), 16)
+            # ruling text only -- never rationale, never chain lines.
+            self.assertNotIn("rationale", payload["lines"][0])
+
+            # Plain (non-JSON) rendering carries the same line plus a
+            # fixed header naming the store as the source of truth.
+            rc2, plain = self._run(db, root=root, json_out=False)
+            self.assertEqual(rc2, 0)
+            self.assertIn("source of truth", plain)
+            self.assertIn("TOP-9610 L2 (owner-ratified): the standing sentence", plain)
+
+    def test_ineligible_links_are_never_projected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "inactive.md", _standing_topic(
+                "TOP-9620", "L1", ["L1"], status="provisional",
+            ))
+            _write_record(root / "topics" / "wrong-auth.md", _standing_topic(
+                "TOP-9621", "L1", ["L1"], authority="agent-inference",
+            ))
+            _write_record(root / "topics" / "not-pointed.md", _standing_topic(
+                "TOP-9622", "L1", [],
+            ))
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            rc, out = self._run(db, root=root)
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out)["links"], 0)
+
+    def test_ordering_is_topic_id_then_numeric_link_id(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            # Two topics; the second topic's own two links are L2 and L10 --
+            # a plain lexical sort would put L10 before L2.
+            _write_record(root / "topics" / "a.md", _standing_topic("TOP-0100", "L1", ["L1"]))
+            multi = (
+                "---\ntype: topic\nid: TOP-0200\ntitle: Multi\narea: testing\ncurrent: L10\n"
+                "standing: [L10, L2]\nlinks:\n"
+                "  - link: L2\n    date: 2026-01-01\n    status: active\n    kind: adopted\n"
+                "    ruling: {text: \"second link\", authority: owner-verbatim, source: s}\n"
+                "    recorded_by: agent\n    recorded_at: 2026-01-01\n"
+                "  - link: L10\n    date: 2026-01-02\n    status: active\n    kind: adopted\n"
+                "    ruling: {text: \"tenth link\", authority: owner-verbatim, source: s}\n"
+                "    recorded_by: agent\n    recorded_at: 2026-01-02\n"
+                "---\n\nBody.\n"
+            )
+            _write_record(root / "topics" / "b.md", multi)
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            rc, out = self._run(db, root=root)
+            self.assertEqual(rc, 0)
+            lines = json.loads(out)["lines"]
+            self.assertEqual(len(lines), 3)
+            self.assertTrue(lines[0].startswith("TOP-0100 L1"))
+            self.assertTrue(lines[1].startswith("TOP-0200 L2"))
+            self.assertTrue(lines[2].startswith("TOP-0200 L10"))
+
+    def test_determinism_two_runs_byte_identical(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "t.md", _standing_topic("TOP-9630", "L1", ["L1"]))
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            _, out1 = self._run(db, root=root)
+            _, out2 = self._run(db, root=root)
+            self.assertEqual(out1, out2)
+
+
 if __name__ == "__main__":
     unittest.main()
