@@ -2607,10 +2607,13 @@ importing fastembed either, verified the same way.
 down:
 
 - **`search`** — `--mode fts` and `--mode vector` never both run; `hybrid` (the
-  default) runs both and fuses ranks with RRF, unless FTS's own top-1 pick
-  lacks real vocabulary overlap with the query, in which case hybrid returns
-  exactly `--mode vector`'s own result instead of fusing. `--status` defaults
-  to
+  default) runs both and fuses ranks with RRF, unless FTS's own top-1 pick's
+  content-term coverage of the query is below `FTS_STEP_ASIDE_COVERAGE`
+  (0.25 — not zero overlap), in which case hybrid returns exactly `--mode
+  vector`'s own result instead of fusing. `--json`'s envelope names which
+  happened, every hybrid search: `"fusion": "rrf"` or `"vector-only"`; a
+  step-aside also prints a one-line stderr note naming the measured
+  coverage. `--status` defaults to
   active-only when omitted entirely (`_resolve_search_status`, applied inside
   `cmd_search` on a shallow copy of `args` -- `build_filter_clause` itself,
   and every other caller of it, keeps "no status given" meaning "no filter");

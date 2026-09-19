@@ -2730,24 +2730,22 @@ def vector_ranked(
 # FTS's top-1 pick is a genuinely different, WRONG record that happens to
 # share real vocabulary with the query (paraphrase queries are constructed
 # to share no vocabulary with their own target, not with every other
-# record in the corpus): para-10 at 0.286, and para-05 at exactly 0.250
-# (the coverage this same query measured against BEFORE the 0.3.0 rebase
-# was 0.211-band noise; main independently reworded para-05's own text
-# after this comment was first written, to fix an unrelated corpus defect
-# -- an equally-defensible second answer, see bench/queries.jsonl's own
-# note on that id -- and the reworded text happens to land exactly on
-# FTS_STEP_ASIDE_COVERAGE's own boundary against this corpus). The two
-# exceptions are NOT interchangeable: for para-10 this gate correctly
-# leaves the query to fuse normally rather than second-guess a real (if
-# misdirected) FTS signal, and fusion still lands on the right answer
-# there via the vector channel's own contribution; for para-05, `--mode
-# vector` alone ALSO ranks the same wrong record top-1 (a genuine
-# corpus-level ambiguity between two records, unrelated to this gate), so
-# fusing instead of stepping aside costs nothing there either way. So: a
-# narrow band between 0.211 (the real paraphrase-noise ceiling) and 0.500
-# (the kw-/et- floor) holding exactly these two named exceptions and
-# nothing else, both correctly on the confident side of the gate, not
-# inside the noise class.
+# record in the corpus): para-10 at 0.286 (4/14: "actually", "keeping",
+# "separate", "take" against TOP-107), and para-05 at exactly 0.250 (3/12:
+# "app", "large", "stop" against INC-205). The two exceptions are NOT
+# interchangeable. para-10: neither channel's own top-1 is right (FTS:
+# TOP-107, vector: TOP-106) -- the gate correctly leaves it to fuse rather
+# than second-guess a real (if misdirected) FTS signal, and fusion is what
+# gets it right, because the actual answer (TOP-101) sits at FTS rank 2
+# AND vector rank 2: two rank-2 contributions from BOTH channels outweigh
+# either channel's own wrong rank-1 pick in RRF's sum. para-05: `--mode
+# vector` alone ALSO ranks the same wrong record (INC-205) top-1 for this
+# query -- a genuine corpus-level ambiguity between INC-205 and the
+# expected TOP-112, unrelated to this gate -- so fusing instead of
+# stepping aside costs nothing here either way. So: a narrow band between
+# 0.211 (the real paraphrase-noise ceiling) and 0.500 (the kw-/et- floor)
+# holding exactly these two named exceptions and nothing else, both
+# correctly on the confident side of the gate, not inside the noise class.
 #
 # FTS_STEP_ASIDE_COVERAGE sits in that empty band, deliberately closer to
 # the noise ceiling (0.211) than the confident floor (0.500): stepping
@@ -2781,16 +2779,32 @@ def _content_terms(text: str) -> set[str]:
     tests/test_bench.py's paraphrase-independence check uses to verify a
     paraphrase query shares no vocabulary with its target, now reused (not
     duplicated) here to decide, at query time, whether the FTS channel's
-    own top hit actually shares any."""
+    own top hit actually shares any.
+
+    STATED LIMIT (not fixed here -- the owner wants real query data before
+    touching tokenization): `_CONTENT_TOKEN_RE` (`[a-z0-9]+`) drops every
+    1-character and non-ASCII token, on both the query side and the
+    document side. FTS5's own tokenizer keeps 1-character tokens (a bare
+    digit, a single letter used as an identifier), so a query anchored on
+    one -- "the 6 attempts limit", "an x coordinate" -- never puts that
+    anchor into `qtok` at all, even when FTS5 itself matched on it and the
+    document contains it verbatim. Coverage is computed only over the
+    tokens this function keeps; a short, anchor-heavy query can therefore
+    read a lower coverage than FTS5's own match actually earned it."""
     return {w for w in _CONTENT_TOKEN_RE.findall(text.lower()) if w not in _STOPWORDS and len(w) > 1}
 
 
-def _fts_top_hit_is_confident(conn, project: str, query: str, top_fts_path: str) -> bool:
-    """True unless the FTS channel's own top-1 candidate's content-term
-    coverage of `query` is below FTS_STEP_ASIDE_COVERAGE (see above). One
-    extra single-row lookup by primary key (`path`), only ever run when
-    hybrid mode's FTS and vector channels have BOTH already returned at
-    least one candidate -- no new dependency, no model call, no
+def _fts_top_hit_coverage(conn, project: str, query: str, top_fts_path: str) -> float | None:
+    """The FTS channel's own top-1 candidate's content-term coverage of
+    `query`: the fraction of `query`'s own `_content_terms` literally
+    present in that candidate's own indexed text. `None` when there is
+    nothing to score (see below) -- callers that need a plain yes/no
+    should use `_fts_top_hit_is_confident` instead of re-deriving one from
+    this float.
+
+    One extra single-row lookup by primary key (`path`), only ever run
+    when hybrid mode's FTS and vector channels have BOTH already returned
+    at least one candidate -- no new dependency, no model call, no
     measurable added latency next to the fts_ranked/vector_ranked calls
     that already ran this query. `title`/`body`/`ruling_text` are read
     exactly as stored (insert_record_rows): a topic/incident row carries
@@ -2800,19 +2814,29 @@ def _fts_top_hit_is_confident(conn, project: str, query: str, top_fts_path: str)
     (fts_ranked ranks both), so both are read the same way here rather
     than assumed to be a topic row. A query with no content tokens of its
     own (e.g. `--mode hybrid ""`, or a query that is pure stopwords) has
-    nothing to gate on and is left alone -- FTS is not second-guessed on a
-    query this heuristic cannot meaningfully score."""
+    nothing to gate on -- returns `None`, not `0.0`, so a caller can tell
+    "nothing to score" apart from "scored zero"."""
     qtok = _content_terms(query)
     if not qtok:
-        return True
+        return None
     row = conn.execute(
         "SELECT title, body, ruling_text FROM records WHERE project=? AND path=?",
         (project, top_fts_path),
     ).fetchone()
     if row is None:
-        return True
+        return None
     doctok = _content_terms(" ".join(filter(None, [row["title"], row["body"], row["ruling_text"]])))
-    coverage = len(qtok & doctok) / len(qtok)
+    return len(qtok & doctok) / len(qtok)
+
+
+def _fts_top_hit_is_confident(conn, project: str, query: str, top_fts_path: str) -> bool:
+    """True unless `_fts_top_hit_coverage` is below FTS_STEP_ASIDE_COVERAGE
+    (see above); also True when there is nothing to score (coverage is
+    `None`) -- FTS is not second-guessed on a query this heuristic cannot
+    meaningfully score."""
+    coverage = _fts_top_hit_coverage(conn, project, query, top_fts_path)
+    if coverage is None:
+        return True
     return coverage >= FTS_STEP_ASIDE_COVERAGE
 
 
@@ -2916,12 +2940,26 @@ def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list
         # degrades correctly (an empty channel contributes nothing to the
         # sum), and is NOT this incident's mechanism (an empty channel is
         # never the paraphrase case: see the block comment above).
+        #
+        # Visibility (Grok/Opus PR #21 gate): `embed_info["fusion"]`
+        # names which of the two branches below actually ran --
+        # "vector-only" for a step-aside, "rrf" for the fused branch
+        # (including when it degrades to one effective channel because
+        # the other returned nothing) -- so a caller reading the `--json`
+        # envelope's `fusion` field never has to infer it from
+        # `contributing == {}`, which is also empty on an ordinary single-
+        # link-family hit. `embed_info["step_aside_coverage"]` carries the
+        # measured coverage float only on a step-aside, for cmd_search's
+        # own stderr note below.
         if (
             fts_list and vec_scored
             and not _fts_top_hit_is_confident(conn, args.project, args.query, fts_list[0])
         ):
             results = vec_scored
+            embed_info["fusion"] = "vector-only"
+            embed_info["step_aside_coverage"] = _fts_top_hit_coverage(conn, args.project, args.query, fts_list[0])
         else:
+            embed_info["fusion"] = "rrf"
             # Fix-round item 2 (coordinator review): ONE batched query for
             # both channels' combined candidate set, replacing what used to be
             # a _record_family call PLUS a record_row_by_path call per item
@@ -3101,6 +3139,22 @@ def cmd_search(args) -> int:
             "results may be incomplete",
             file=sys.stderr,
         )
+    fusion = embed_info.get("fusion")
+    if fusion == "vector-only":
+        # PR #21 gate (Grok/Opus): a step-aside used to be invisible --
+        # `contributing` stays {} exactly like an ordinary single-link-
+        # family hit, so there was nothing in either the human or --json
+        # output distinguishing "FTS agreed, nothing to report" from "FTS
+        # was overruled". Named here, and in the --json envelope's own
+        # `fusion` field below, every time it fires -- not only when
+        # something else also went wrong.
+        cov = embed_info.get("step_aside_coverage")
+        cov_text = f"{cov:.2f}" if cov is not None else "n/a"
+        print(
+            f"search: hybrid: FTS top hit not confident (coverage {cov_text}); "
+            "vector ranking only",
+            file=sys.stderr,
+        )
 
     results = results[: args.limit]
     out = []
@@ -3152,6 +3206,17 @@ def cmd_search(args) -> int:
         # added the same way, independent of --root/state -- both can be
         # present at once (a stale, root-given store whose embedding
         # backend also failed), so this is a merge, not an either/or.
+        #
+        # PR #21 gate: `fusion` is different from the fields above -- it
+        # is not naming a problem, it is naming which of hybrid's own two
+        # branches ran, and both values ("rrf"/"vector-only") are
+        # ordinary, expected outcomes, not something worth hiding behind
+        # an envelope-only-when-notable convention. `args.mode == "hybrid"`
+        # is the only gate: `embed_info["fusion"]` is set on every hybrid
+        # search (see _search_hits), so a hybrid `--json` call always gets
+        # the envelope now; `fts`/`vector` mode output is unaffected (no
+        # `fusion` concept applies there, so no key, same bare-list shape
+        # as before whenever nothing else forces the envelope).
         extra: dict = {}
         if root is not None and state in ("upgrade-required", "stale", "quarantined"):
             extra["state"] = state
@@ -3159,6 +3224,8 @@ def cmd_search(args) -> int:
             extra["embedding"] = embed_state
         if dim_mismatch_rows:
             extra["dimension_mismatch_rows"] = dim_mismatch_rows
+        if fusion:
+            extra["fusion"] = fusion
         if extra:
             print(json.dumps({**extra, "results": out}, indent=2))
         else:
