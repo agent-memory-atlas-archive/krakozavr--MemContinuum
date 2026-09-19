@@ -5003,17 +5003,69 @@ class TestMcRotateHookLog(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse((self.home / "hook.log.1").exists())
 
-    def test_second_rotation_replaces_dot_1_never_creates_dot_2(self):
+    def test_keep_1_reproduces_original_replace_dot_1_never_creates_dot_2(self):
+        """hook.log: bounded retention of N rotated files --
+        MEMCONTINUUM_LOG_KEEP=1 must reproduce the pre-feature, two-
+        file-total policy byte-for-byte: each rotation replaces
+        hook.log.1 in place and no hook.log.2 is ever created."""
         hook_log = self.home / "hook.log"
         hook_log.write_text("first\n" * 100)
-        self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10")
+        self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10", MEMCONTINUUM_LOG_KEEP="1")
         rotated = self.home / "hook.log.1"
         self.assertEqual(rotated.read_text(), "first\n" * 100)
 
         hook_log.write_text("second\n" * 100)
-        self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10")
+        self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10", MEMCONTINUUM_LOG_KEEP="1")
         self.assertEqual(rotated.read_text(), "second\n" * 100)
         self.assertFalse((self.home / "hook.log.2").exists())
+
+    def test_default_keep_is_twelve_when_env_unset(self):
+        """No MEMCONTINUUM_LOG_KEEP set -- 13 rotations must retain exactly
+        .1 .. .12 (pinning the default at 12, not merely "more than one")
+        and drop the oldest (marker-1) the moment a 13th would-be file
+        would exist."""
+        hook_log = self.home / "hook.log"
+        for i in range(1, 14):
+            hook_log.write_text(f"marker-{i}\n" + ("x" * 100 + "\n") * 5)
+            proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        self.assertFalse((self.home / "hook.log.13").exists())
+        self.assertIn("marker-13\n", (self.home / "hook.log.1").read_text())
+        self.assertIn(
+            "marker-2\n", (self.home / "hook.log.12").read_text(),
+            "default MEMCONTINUUM_LOG_KEEP must be 12: the 13th rotation's "
+            "shift must still carry marker-2 (the 2nd write) into .12",
+        )
+        for n in range(1, 13):
+            self.assertNotIn(
+                "marker-1\n", (self.home / f"hook.log.{n}").read_text(),
+                f"marker-1 (the 1st write, now the 13th-oldest) must be gone from .{n}",
+            )
+
+    def test_keep_3_shifts_across_four_rotations_and_drops_the_oldest(self):
+        """hook.log: bounded retention of N rotated files -- KEEP=3 across
+        four session-start rotations must produce exactly .1 .2 .3 (each
+        with its own content, verified by a marker line), and the content
+        from the very first rotation (now older than the retained window)
+        must be gone."""
+        hook_log = self.home / "hook.log"
+        markers = ["marker-A", "marker-B", "marker-C", "marker-D"]
+        for marker in markers:
+            hook_log.write_text(f"{marker}\n" + ("x" * 100 + "\n") * 5)
+            proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10", MEMCONTINUUM_LOG_KEEP="3")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        self.assertFalse((self.home / "hook.log.4").exists())
+        # Newest rotated content (marker-D, the 4th write) is never rotated
+        # in this loop -- the rotation call after writing marker-D moves
+        # marker-D's own content to .1; marker-C ends up at .2, marker-B at
+        # .3, and marker-A (the oldest, now past the KEEP=3 window) is gone.
+        self.assertIn("marker-D", (self.home / "hook.log.1").read_text())
+        self.assertIn("marker-C", (self.home / "hook.log.2").read_text())
+        self.assertIn("marker-B", (self.home / "hook.log.3").read_text())
+        for p in (self.home / "hook.log.1", self.home / "hook.log.2", self.home / "hook.log.3"):
+            self.assertNotIn("marker-A", p.read_text())
 
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores permission bits")
     def test_unwritable_home_dir_fails_open_leaves_log_alone(self):

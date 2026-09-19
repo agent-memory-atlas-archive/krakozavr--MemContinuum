@@ -1170,13 +1170,15 @@ class TestStatsPreEditTopics(StatsTestBase):
 
 
 class TestStatsSpansRotatedHookLog(StatsTestBase):
-    """eval-topic-logging section 5 (owner-approved add-on): nothing used
-    to truncate or prune hook.log -- sessionstart-remind.sh now rotates it
-    into hook.log.1 (replacing any previous one) once it crosses
+    """eval-topic-logging section 5 (owner-approved add-on), extended by
+    hook.log: bounded retention of N rotated files -- nothing used to
+    truncate or prune hook.log -- sessionstart-remind.sh now rotates it
+    into hook.log.1 .. hook.log.$MEMCONTINUUM_LOG_KEEP once it crosses
     MEMCONTINUUM_LOG_MAX_BYTES. `stats` must read hook.log.1 (when
     present) alongside hook.log so a `--days N` window spanning a rotation
     still sees the rotated-out side exactly once -- not dropped, not
-    double-counted."""
+    double-counted. (TestStatsSpansMultipleRotatedHookLogs below covers
+    the multi-file KEEP>1 case this class predates.)"""
 
     def write_rotated_log(self, lines):
         (self.home / "hook.log.1").write_text("\n".join(lines) + "\n")
@@ -1226,6 +1228,70 @@ class TestStatsSpansRotatedHookLog(StatsTestBase):
         rc, out = run_stats_json(home=str(self.home))
         self.assertEqual(rc, 0)
         self.assertEqual(out["pre_edit"]["matched"], 1, "only hook.log's own line should be counted")
+
+
+class TestStatsSpansMultipleRotatedHookLogs(StatsTestBase):
+    """hook.log: bounded retention of N rotated files -- mc_rotate_hook_log
+    can now leave hook.log.1 .. hook.log.$MEMCONTINUUM_LOG_KEEP on disk
+    (default KEEP=12), not just a single hook.log.1. `stats` must read
+    every hook.log.<digits> file it finds, not just `.1`, so a --days
+    window spanning several rotations still sees everything retained."""
+
+    def write_numbered_rotated_log(self, n, lines):
+        (self.home / f"hook.log.{n}").write_text("\n".join(lines) + "\n")
+
+    def test_counts_rows_from_all_three_rotated_files_plus_current(self):
+        self.write_numbered_rotated_log(3, [
+            f"{ts(4)} outcome=matched elapsed=0s project=demo file=/oldest.py",
+        ])
+        self.write_numbered_rotated_log(2, [
+            f"{ts(3)} outcome=matched elapsed=0s project=demo file=/older.py",
+        ])
+        self.write_numbered_rotated_log(1, [
+            f"{ts(2)} outcome=matched elapsed=0s project=demo file=/old.py",
+        ])
+        self.write_log([
+            f"{ts(1)} outcome=matched elapsed=0s project=demo file=/new.py",
+        ])
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            out["pre_edit"]["matched"], 4,
+            "all three rotated files plus the current hook.log must be counted",
+        )
+
+    def test_a_days_window_spanning_all_rotations_excludes_only_out_of_window_rows(self):
+        self.write_numbered_rotated_log(3, [
+            # 10 days ago -- outside a 7-day window
+            f"{ts(24 * 10)} outcome=matched elapsed=0s project=demo file=/too-old.py",
+        ])
+        self.write_numbered_rotated_log(2, [
+            # 6 days ago -- inside a 7-day window, but two rotations back
+            f"{ts(24 * 6)} outcome=matched elapsed=0s project=demo file=/still-in-window.py",
+        ])
+        self.write_numbered_rotated_log(1, [
+            f"{ts(24 * 2)} outcome=matched elapsed=0s project=demo file=/recent.py",
+        ])
+        self.write_log([
+            f"{ts(1)} outcome=matched elapsed=0s project=demo file=/fresh.py",
+        ])
+        rc, out = run_stats_json(home=str(self.home), days=7)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["pre_edit"]["matched"], 3)
+
+    def test_a_leftover_rotating_temp_file_is_never_counted(self):
+        """mc_rotate_hook_log's own atomic-claim temp file
+        (hook.log.rotating.<pid>) must never be swept in as a data file --
+        only a pure-digit suffix counts as a rotated file."""
+        (self.home / "hook.log.rotating.12345").write_text(
+            f"{ts(2)} outcome=matched elapsed=0s project=demo file=/stray.py\n"
+        )
+        self.write_log([
+            f"{ts(1)} outcome=matched elapsed=0s project=demo file=/new.py",
+        ])
+        rc, out = run_stats_json(home=str(self.home))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["pre_edit"]["matched"], 1)
 
 
 if __name__ == "__main__":

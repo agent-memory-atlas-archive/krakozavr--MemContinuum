@@ -132,15 +132,24 @@ startup/resume/clear session-init boundary only — never from `mc_log`'s own
 append path, or from `pre-edit-chain.sh`'s independent logger, both of which
 are hot paths that must not gain a `stat()` call for this, and never
 re-checked on a mid-session `compact`. Once hook.log exceeds
-`MEMCONTINUUM_LOG_MAX_BYTES` (default 5242880 bytes, 5 MiB), its current
-content moves to `hook.log.1` — replacing whatever was there before — and a
-fresh, empty hook.log starts. At most two files exist, ever: no `.2`, no
-dated archive, no compression, and data older than the *previous* rotation
-is gone by design once a second one happens. `memidx.py stats` reads
-`hook.log.1` (when present) alongside hook.log, so a `--days N` window that
-spans a rotation still sees the rotated-out side. Fail-open like every other
-path here: a missing/unwritable `$MEMCONTINUUM_HOME`, an unreadable size, or
-a concurrent session racing the same rotation all leave the log alone and
+`MEMCONTINUUM_LOG_MAX_BYTES` (default 5242880 bytes, 5 MiB), it is rotated:
+the chain `hook.log.1` (newest) .. `hook.log.$MEMCONTINUUM_LOG_KEEP` (oldest)
+shifts up by one (`.N` → `.N+1`, the oldest file dropped), then hook.log's
+current content becomes the new `hook.log.1` and a fresh, empty hook.log
+starts. `MEMCONTINUUM_LOG_KEEP` (default 12) bounds how many rotated files
+are ever kept — no file beyond `.$MEMCONTINUUM_LOG_KEEP`, no dated archive,
+no compression, and data older than the oldest retained file is gone by
+design once retention fills up. Sizing: a real store's live hook.log grew
+~5 MB in 21 days (~240 KB/day — somewhat above the ~177 KB/day first
+measured above, but the more recent, directly-relevant figure here), so
+the default `12 × 5 MiB` gives roughly 8-9 months of retained history at
+that rate — a bounded, documented allowance, not unlimited archival
+(`MEMCONTINUUM_LOG_KEEP=1` reproduces the original replace-`.1`-only policy
+exactly, for anyone who wants that instead). `memidx.py stats` reads every `hook.log.N` it finds (oldest first)
+alongside hook.log, so a `--days N` window spanning one or more rotations
+still sees everything still retained. Fail-open like every other path here:
+a missing/unwritable `$MEMCONTINUUM_HOME`, an unreadable size, or a
+concurrent session racing the same rotation all leave the log alone and
 never block `SessionStart`.
 
 `userprompt-remind.sh` has its own exception too (Codex 12, fix wave 1 G4): a

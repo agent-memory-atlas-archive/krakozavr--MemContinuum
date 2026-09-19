@@ -7454,6 +7454,33 @@ def _hook_log_fields(rest: str) -> dict:
     return fields
 
 
+def _rotated_hook_log_paths(log_path: Path) -> list:
+    """Every `<log_path>.<digits>` file next to log_path, oldest (highest
+    N) first -- hook.log: bounded retention of N rotated files.
+    mc_rotate_hook_log (hooks/memlib.sh) writes `.1` (newest) up through
+    `.MEMCONTINUUM_LOG_KEEP` (oldest); this function does not read
+    MEMCONTINUUM_LOG_KEEP or assume any particular count, it just lists
+    whatever numbered files exist, so `stats` stays correct even across a
+    KEEP value change. Only a pure-digit suffix counts: mc_rotate_hook_log's
+    own atomic-claim temp file (`hook.log.rotating.<pid>`), never meant to
+    survive a rotation, and any other stray suffix are ignored, never swept
+    in as a data file. Fail-open like every other hook.log reader here: an
+    unlistable directory yields an empty list, never a raised error."""
+    prefix = log_path.name + "."
+    numbered: list = []
+    try:
+        for p in log_path.parent.iterdir():
+            if not p.name.startswith(prefix):
+                continue
+            suffix = p.name[len(prefix):]
+            if suffix.isdigit():
+                numbered.append((int(suffix), p))
+    except OSError:
+        return []
+    numbered.sort(key=lambda t: t[0], reverse=True)
+    return [p for _, p in numbered]
+
+
 def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
     """Returns (buckets: {project: bucket}, unknown_lines: int,
     projects_seen: set[str], unparseable_lines: int, untimestamped_lines:
@@ -7483,30 +7510,35 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
     new/unexpected breakage") under permanent, harmless noise. They are
     counted here instead, separately.
 
-    eval-topic-logging section 5: `<log_path>.1` (hooks/memlib.sh's
-    mc_rotate_hook_log rotates hook.log there once it crosses
-    MEMCONTINUUM_LOG_MAX_BYTES) is read FIRST, when present, so a --days
-    window spanning a rotation still sees the older, rotated-out side --
-    every count below is order-independent (Counters and sets, never a
-    windowed sequence), so simply concatenating the two files' lines
-    before the per-line loop is enough; nothing here needs the two kept
-    or scanned separately. A missing or unreadable `.1` contributes
-    nothing and is never itself a failure -- it is normal on every host
-    that has never rotated yet, and the primary hook.log's own OSError
-    branch immediately below already carries this function's real
-    self-liveness signal."""
+    bounded retention (hook.log: bounded retention of N rotated files):
+    every `<log_path>.<N>` (hooks/memlib.sh's mc_rotate_hook_log rotates
+    hook.log into this chain, `.1` newest .. `.MEMCONTINUUM_LOG_KEEP`
+    oldest, once hook.log crosses MEMCONTINUUM_LOG_MAX_BYTES) is read,
+    oldest first, so a --days window spanning one or more rotations still
+    sees every rotated-out side -- every count below is order-independent
+    (Counters and sets, never a windowed sequence), so simply
+    concatenating all the rotated files' lines ahead of hook.log's own
+    before the per-line loop is enough; nothing here needs them kept or
+    scanned separately, and this function never reads MEMCONTINUUM_LOG_KEEP
+    itself -- it discovers whatever `.<digits>` files are actually present
+    (see _rotated_hook_log_paths) rather than assuming a count, so it stays
+    correct regardless of what KEEP was set to when each file was written.
+    A missing or unreadable rotated file contributes nothing and is never
+    itself a failure -- it is normal on every host that has never rotated
+    yet, and the primary hook.log's own OSError branch immediately below
+    already carries this function's real self-liveness signal."""
     buckets: dict[str, dict] = {}
     unknown_lines = 0
     unparseable_lines = 0
     untimestamped_lines = 0
     projects_seen: set[str] = set()
 
-    rotated_path = log_path.parent / (log_path.name + ".1")
     rotated_lines: list[str] = []
-    try:
-        rotated_lines = rotated_path.read_text(errors="replace").splitlines()
-    except OSError:
-        pass
+    for rotated_path in _rotated_hook_log_paths(log_path):
+        try:
+            rotated_lines.extend(rotated_path.read_text(errors="replace").splitlines())
+        except OSError:
+            pass
 
     try:
         raw_lines = rotated_lines + log_path.read_text(errors="replace").splitlines()

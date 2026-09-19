@@ -149,11 +149,22 @@ mc_log() {
 # only ever clears session-state JSON) -- measured on a real machine,
 # ~177 KB/day, tens of MB/year, unbounded, and every `memidx.py stats` run
 # reads the whole file cold. If $MC_LOG is larger than
-# MEMCONTINUUM_LOG_MAX_BYTES (default 5242880 = 5 MiB), its current
-# content is moved to $MC_LOG.1 (replacing whatever was there before) and
-# a fresh, empty $MC_LOG is created. At most two files, ever -- no `.2`,
-# no dated archive, no compression; data older than the PREVIOUS rotation
-# is gone by design (memidx.py stats only ever reads hook.log.1 + hook.log).
+# MEMCONTINUUM_LOG_MAX_BYTES (default 5242880 = 5 MiB), it is rotated: the
+# chain hook.log.1 (newest) .. hook.log.$MEMCONTINUUM_LOG_KEEP (oldest) is
+# shifted up by one (.N -> .N+1, oldest dropped), then $MC_LOG's current
+# content becomes the new hook.log.1 and a fresh, empty $MC_LOG is created.
+# MEMCONTINUUM_LOG_KEEP (default 12) bounds how many rotated files are ever
+# kept -- no `.2` beyond it, no dated archive, no compression; data older
+# than the oldest retained file is gone by design (memidx.py stats reads
+# every hook.log.N it finds, N=1..KEEP, alongside hook.log itself).
+# MEMCONTINUUM_LOG_KEEP=1 reproduces the original two-file-total policy
+# exactly (hook.log.1 always replaced, never a .2). Sizing rationale: a
+# real store's live hook.log measured ~5 MB of growth in 21 days
+# (~240 KB/day -- somewhat above the ~177 KB/day first measured above, but
+# the more recent, directly-relevant figure for sizing this bound), so the
+# default 12 x 5 MiB gives roughly 8-9 months of retained history at that
+# rate -- bounded and documented, not "archive forever" (an external
+# review ruled out unbounded retention; this is the sized alternative).
 #
 # Called ONLY from sessionstart-remind.sh's own startup/resume/clear
 # branch, once per session -- NEVER from mc_log above, or from
@@ -168,8 +179,8 @@ mc_log() {
 # step below (rather than a direct `mv "$MC_LOG" "$MC_LOG.1"`) means at
 # most ONE of two sessions racing this same rotation ever wins: the
 # loser's own `mv "$MC_LOG" ...` simply fails (the winner already moved
-# it) and returns cleanly, rather than both racing to write `.1` and one
-# silently clobbering the other's already-rotated content.
+# it) and returns cleanly -- only the winner ever reaches the shift loop
+# below, so there is no shift-vs-shift race to guard against either.
 mc_rotate_hook_log() {
     [ -f "$MC_LOG" ] || return 0
 
@@ -186,8 +197,30 @@ mc_rotate_hook_log() {
     esac
     [ "$size" -gt "$max_bytes" ] || return 0
 
+    local keep="${MEMCONTINUUM_LOG_KEEP:-}"
+    case "$keep" in
+        ''|*[!0-9]*) keep=12 ;;
+    esac
+    [ "$keep" -ge 1 ] || keep=12
+
     local tmp="$MC_LOG.rotating.$$"
     mv "$MC_LOG" "$tmp" 2>/dev/null || return 0
+
+    # Shift .N -> .N+1 for N from keep-1 down to 1 (highest first, so a
+    # shift never overwrites a file before that file itself has been
+    # shifted along) -- this drops whatever previously sat at .keep, the
+    # oldest retained file, and opens up .1 for the tmp (former hook.log)
+    # content below. keep=1 makes this loop a no-op (n starts at 0), so
+    # the final mv below lands directly on .1 exactly as the old
+    # two-file-total code always did.
+    local n=$((keep - 1))
+    while [ "$n" -ge 1 ]; do
+        if [ -f "$MC_LOG.$n" ]; then
+            mv -f "$MC_LOG.$n" "$MC_LOG.$((n + 1))" 2>/dev/null || true
+        fi
+        n=$((n - 1))
+    done
+
     mv -f "$tmp" "$MC_LOG.1" 2>/dev/null || return 0
     # `touch`, never `: >`/`>`: a concurrent writer (a second session's
     # mc_log/pre-edit-chain.sh append) can create a brand-new hook.log via
