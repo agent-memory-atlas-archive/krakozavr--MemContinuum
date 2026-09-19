@@ -131,6 +131,40 @@ class TestCommitCitationRecognizer(unittest.TestCase):
         cites = memlint._extract_commit_citations("commit abc1234 (16:03) added links")
         self.assertEqual(cites, [{"hash": "abc1234", "subject": None}])
 
+    def test_owner_quote_after_an_at_triggered_hash_is_not_a_subject_claim(self):
+        """Fix round (Opus MINOR): a quote directly after an at/as-triggered
+        hash used to be misread as a claimed commit subject -- this store's
+        owner-verbatim convention often puts a quote of the OWNER'S words
+        shortly after ANY kind of reference, unrelated to a commit. Only
+        commit/merge-triggered hashes are subject-eligible now."""
+        text = (
+            'Owner, 2026-09-14, gate at af95af2 '
+            '"Codex is back, use it rather than Opus"'
+        )
+        cites = memlint._extract_commit_citations(text)
+        self.assertEqual(cites, [{"hash": "af95af2", "subject": None}])
+
+    def test_backtick_wrapped_hash_followed_by_a_quote_is_not_a_subject_claim(self):
+        cites = memlint._extract_commit_citations('`abc1234` "unrelated quoted text"')
+        self.assertEqual(cites, [{"hash": "abc1234", "subject": None}])
+
+    def test_quote_on_a_later_line_is_not_a_subject_claim(self):
+        """A commit/merge-triggered hash whose "nearest" quote sits on a
+        LATER line (a YAML `|` block scalar preserves real newlines) must
+        never bind to it -- same-line only."""
+        text = 'commit abc1234 landed here.\nA later paragraph says "unrelated quote".'
+        cites = memlint._extract_commit_citations(text)
+        self.assertEqual(cites, [{"hash": "abc1234", "subject": None}])
+
+    def test_8_hex_backtick_token_is_never_a_commit(self):
+        """This store carries `e28e83a8` (8-hex) three times; none are
+        commits. A length-widened recognizer ({7,8} instead of exactly 7 or
+        40) would wrongly start reading them as short hashes."""
+        self.assertEqual(memlint._extract_commit_citations("`e28e83a8`"), [])
+        self.assertEqual(
+            memlint._extract_commit_citations("gate at e28e83a8 today"), []
+        )
+
 
 class TestFileLineCitationRecognizer(unittest.TestCase):
     def test_plain_path_line_recognized(self):
@@ -151,6 +185,18 @@ class TestFileLineCitationRecognizer(unittest.TestCase):
     def test_url_host_port_is_not_a_citation(self):
         self.assertEqual(
             memlint._extract_file_line_citations("see http://example.com:8080/x for details"), []
+        )
+
+    def test_backslash_joined_path_is_not_a_citation(self):
+        """Fix round (Grok MINOR): a Windows-style "hooks\\missing.py:3"
+        used to match starting right after the backslash, silently citing
+        "missing.py" -- a different, real file at the store root, if one
+        happened to exist -- instead of matching nothing. `\\` is now
+        excluded from the lookbehind, same as the other path/word
+        characters, so a backslash-preceded candidate is never a citation
+        at all."""
+        self.assertEqual(
+            memlint._extract_file_line_citations("see hooks\\missing.py:3 for detail"), []
         )
 
 
@@ -251,6 +297,58 @@ class TestCitationsAgainstFixtureRepo(unittest.TestCase):
             (store / "topics" / "memory").mkdir(parents=True)
             (store / "topics" / "memory" / "t.md").write_text(
                 topic_md("TOP-CITE-GOODSUBJ", source=f'commit {first} "{first_subject}"')
+            )
+            errors, warnings = memlint.lint_root(store, code_roots=[code_root])
+            self.assertFalse([e for e in errors if "cites commit" in e], errors)
+            self.assertFalse([w for w in warnings if "cites commit" in w], warnings)
+
+    def test_subject_differing_only_in_its_tail_is_an_error(self):
+        """Fix round (both reviewers, MINOR): the earlier
+        test_wrong_quoted_subject test used a subject wrong from its very
+        first character ("Wrong subject entirely" vs "Add a.py with
+        f()"), so even a compare of only the first few characters would
+        have passed it -- not a real guard against a subject wrong only at
+        the END. real_subject is "Add a.py with f()" (make_fixture_repo);
+        cited as "Add a.py with g()", differing only in the one character
+        right before the closing paren."""
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            code_root = td / "code"
+            code_root.mkdir()
+            first, first_subject, _second, _ = make_fixture_repo(code_root)
+            self.assertEqual(first_subject, "Add a.py with f()")
+            wrong_tail_subject = "Add a.py with g()"
+            store = td / "store"
+            (store / "topics" / "memory").mkdir(parents=True)
+            (store / "topics" / "memory" / "t.md").write_text(
+                topic_md("TOP-CITE-TAILSUBJ", source=f'commit {first} "{wrong_tail_subject}"')
+            )
+            errors, warnings = memlint.lint_root(store, code_roots=[code_root])
+            self.assertFalse([w for w in warnings if "cites commit" in w], warnings)
+            hit = [e for e in errors if "cites commit" in e]
+            self.assertTrue(hit, errors)
+            self.assertIn(wrong_tail_subject, hit[0])
+            self.assertIn(first_subject, hit[0])
+
+    def test_correct_subject_with_doubled_internal_spaces_is_clean(self):
+        """Fix round (both reviewers, MINOR): the earlier
+        test_correct_quoted_subject test cited the subject byte-for-byte
+        identical to the real one, so it never exercised whitespace
+        normalization at all -- an exact-byte compare would have passed it
+        too. A citation that preserves the real subject's WORDS but not its
+        exact internal spacing must still be clean (docs/SCHEMA.md sec3:
+        "compared after whitespace normalization")."""
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            code_root = td / "code"
+            code_root.mkdir()
+            first, first_subject, _second, _ = make_fixture_repo(code_root)
+            self.assertEqual(first_subject, "Add a.py with f()")
+            doubled_space_subject = "Add  a.py with  f()"
+            store = td / "store"
+            (store / "topics" / "memory").mkdir(parents=True)
+            (store / "topics" / "memory" / "t.md").write_text(
+                topic_md("TOP-CITE-DBLSPACE", source=f'commit {first} "{doubled_space_subject}"')
             )
             errors, warnings = memlint.lint_root(store, code_roots=[code_root])
             self.assertFalse([e for e in errors if "cites commit" in e], errors)
@@ -434,11 +532,22 @@ class TestNonGitCodeRootSkipsCommitCheckOnly(unittest.TestCase):
 
 class TestCommitResolutionMutation(unittest.TestCase):
     """Acceptance 7: stub cat-file to always succeed and confirm the
-    altered-hash test (test 2 / test_altered_hash_by_one_character_is_an_error_naming_it)
-    fails as a test -- proving that test actually exercises _commit_resolves
-    rather than passing for an unrelated reason."""
+    altered-hash-under-strict test
+    (test_altered_hash_with_strict_citations_is_an_error_naming_it) fails as
+    a test -- proving that test actually exercises _commit_resolves rather
+    than passing for an unrelated reason.
 
-    def test_stubbed_commit_resolves_makes_the_bad_hash_case_pass_wrongly(self):
+    Fix round (Opus MAJOR): the ORIGINAL version of this test asserted on
+    `errors` without `strict_citations=True` -- but an unresolved hash is a
+    WARNING by default (coordinator ruling), never in `errors` either way,
+    so the assertion passed whether or not the mock had any effect at all
+    (verified: it still passed with `return_value=False`, i.e. cat-file
+    behaving normally). Fixed by running under strict, where an unresolved
+    hash IS an error, and by putting the unmocked arm in the SAME test so
+    the flip -- normally an error, wrongly clean once cat-file is stubbed to
+    always succeed -- is actually demonstrated, not merely asserted."""
+
+    def test_stubbed_commit_resolves_makes_the_strict_bad_hash_case_pass_wrongly(self):
         with tempfile.TemporaryDirectory() as td_str:
             td = Path(td_str)
             code_root = td / "code"
@@ -450,12 +559,19 @@ class TestCommitResolutionMutation(unittest.TestCase):
             (store / "topics" / "memory" / "t.md").write_text(
                 topic_md("TOP-CITE-MUTATION", source=f"landed as commit {bad_hash}")
             )
+            # Unmocked (real cat-file): the fabricated hash is correctly
+            # flagged under --strict-citations.
+            errors, _warnings = memlint.lint_root(
+                store, code_roots=[code_root], strict_citations=True
+            )
+            self.assertTrue([e for e in errors if "cites commit" in e], errors)
+            # Mocked (cat-file stubbed to always succeed): the same
+            # fabricated hash is now (wrongly) accepted -- the flip that
+            # demonstrates this test actually exercises _commit_resolves.
             with mock.patch.object(memlint, "_commit_resolves", return_value=True):
-                errors, _warnings = memlint.lint_root(store, code_roots=[code_root])
-            # With cat-file stubbed to always succeed, the fabricated hash is
-            # (wrongly) accepted -- demonstrating that the real (unstubbed)
-            # test above is actually exercising _commit_resolves, not passing
-            # for some unrelated reason.
+                errors, _warnings = memlint.lint_root(
+                    store, code_roots=[code_root], strict_citations=True
+                )
             self.assertFalse([e for e in errors if "cites commit" in e], errors)
 
 
@@ -520,6 +636,27 @@ class TestStrictCitationsEndToEnd(unittest.TestCase):
                 [str(store), "--code-root", str(code_root), "--strict-citations"]
             )
             self.assertEqual(rc, 1)
+
+    def test_strict_citations_is_rejected_together_with_against_ref(self):
+        """Fix round (NIT): --strict-citations under --against-ref used to
+        be silently stripped and ignored -- inconsistent with --code-root's
+        own explicit rejection in that same mode, for the identical reason
+        (append-only mode never uses a code root). Same message shape."""
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as td_str:
+            store = Path(td_str)
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                rc = memlint.main(
+                    ["--against-ref", "HEAD", "--strict-citations", str(store)]
+                )
+            self.assertEqual(rc, 2)
+            self.assertIn(
+                "--strict-citations is rejected together with --against-ref",
+                buf.getvalue(),
+            )
 
 
 if __name__ == "__main__":

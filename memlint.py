@@ -482,28 +482,56 @@ def lint_concept(
 # THE RECOGNIZER IS THE WHOLE DIFFICULTY (see module docstring's design
 # note): this store's own evidence carries many hex-looking tokens that are
 # NOT commits -- 16-hex snapshot hashes, sha256 prefixes, session ids,
-# render fingerprints, TOP-xxxx ids, dates. Two independent, narrow patterns,
-# not one greedy one:
+# render fingerprints, TOP-xxxx ids, dates. Three independent, narrow
+# patterns, not one greedy one:
 #
-#   (a) CONTEXT-triggered: a hex run immediately preceded by one of four
-#       words this store actually uses to introduce a commit in prose --
-#       "commit ", "merge ", "at " (as in "gate on PR #18 at f7fe011"), " as "
-#       (as in "merged as 87663ec") -- case-insensitive on the word, never on
-#       the hex.
-#   (b) BACKTICK-wrapped: a hex run inside `` `...` `` with no context word
-#       at all (a reviewer note quoting a bare hash).
+#   (a) COMMIT/MERGE-triggered, subject-eligible: a hex run immediately
+#       preceded by "commit " or "merge " -- the only two words this
+#       schema's own §3 example pairs with a quoted subject
+#       (`commit a1b2c3d "the exact subject"`) -- MAY also carry a claimed
+#       subject right after it.
+#   (b) AT/AS-triggered, subject-INeligible: a hex run immediately preceded
+#       by "at " (as in "gate on PR #18 at f7fe011") or " as " (as in
+#       "merged as 87663ec") -- this store's own terse cross-reference
+#       words, which never carry a subject in real use. Deliberately never
+#       subject-eligible even when a quote happens to follow (fix round,
+#       Opus MINOR): this store's owner-verbatim convention often puts a
+#       quote of the OWNER'S words shortly after ANY kind of reference --
+#       "...gate at af95af2 "Codex is back, use it rather than Opus""
+#       quotes the owner about something unrelated, not the commit's
+#       subject -- and treating that as a subject claim produced a false
+#       ERROR (the real commit's actual subject never matches an
+#       unconnected owner quote). Splitting the subject-eligible grammar
+#       out of the at/as alternative entirely, rather than trying to
+#       pattern-match "which quote is real," is what fixes this class
+#       outright instead of chasing one fixture.
+#   (c) BACKTICK-wrapped: a hex run inside `` `...` `` with no context word
+#       at all (a reviewer note quoting a bare hash) -- also never
+#       subject-eligible, for the same reason as (b).
 #
-# BOTH shapes require the hex run to be EXACTLY 7 or 40 characters long --
-# git's two canonical hash lengths (abbreviated short form, full form) --
-# enforced with a trailing \b so a longer run (a 12-hex render fingerprint,
-# a 16-hex snapshot hash, a 40+ non-hash token) never partially matches at
-# either length. This is what keeps the recognizer precise rather than
-# greedy: verified against this project's own real store (2026-09-19), it
-# is what correctly EXCLUDES "rendered by 118974ef7600 against an engine at
+# ALL THREE shapes require the hex run to be EXACTLY 7 or 40 characters
+# long -- git's two canonical hash lengths (abbreviated short form, full
+# form) -- enforced with a trailing \b so a longer OR SHORTER run (an
+# 8-hex near-miss, a 12-hex render fingerprint, a 16-hex snapshot hash, a
+# 40+ non-hash token) never partially matches at either length: this store
+# carries `` `e28e83a8` `` (8-hex) three times and none of them are read as
+# commits. This is what keeps the recognizer precise rather than greedy:
+# verified against this project's own real store (2026-09-19), it is what
+# correctly EXCLUDES "rendered by 118974ef7600 against an engine at
 # 049884e8b2ed" (INC-0117 evidence; both 12-hex, both render fingerprints,
-# "at" is one of the four trigger words but the length gate rejects them)
-# while still catching every real 7-char commit hash the store cites through
+# "at" is a trigger word but the length gate rejects them) while still
+# catching every real 7-char commit hash the store cites through
 # "commit "/"merge "/"at "/" as ".
+#
+# A CLAIMED SUBJECT (branch (a) only) must be a double-quoted string on the
+# SAME LINE as the hash, separated only by spaces/tabs, and containing no
+# newline itself -- both restrictions exist for the same reason (fix round,
+# Opus MINOR): the original `\s*"..."` used `\s` (matches newline) and `.`
+# implicitly via `[^"]` (also matches newline), so a YAML `|` block scalar
+# -- which preserves real newlines -- let "commit X" bind to a completely
+# unrelated quoted sentence many PARAGRAPHS later, as long as no other `"`
+# appeared first. `[ \t]*"[^"\n]*"` makes both directions of that
+# impossible: a hash and its subject must share one physical line.
 #
 # KNOWN MISSES, by design, not oversight:
 #   - a bare hash with NO context word and no backticks ("...fixed by
@@ -515,19 +543,36 @@ def lint_concept(
 #     store already uses "commit "/"at " for a CITATION and "against" for
 #     describing a git compare, and folding "against" in would flag prose
 #     that names a ref, not a claim about that ref's authenticity.
+#   - an ordinary ENGLISH WORD that happens to be exactly 7 characters, all
+#     drawn from a-f, is indistinguishable from a short hash once it
+#     follows "at "/"as " -- "deadbee" and "acceded" are both valid
+#     lowercase hex AND plausible prose (Grok fix-round finding). Not
+#     solvable by the recognizer (it cannot know English from hex); a false
+#     positive here reads as an unresolved WARNING, never an ERROR, unless
+#     --strict-citations is set for a store that promises never to do this.
+#   - a BACKTICK-wrapped 40-hex token is indistinguishable by design from a
+#     sha256 (or other 40-hex) prefix that is not a commit at all -- a
+#     40-character hex string could be either, and there is no mechanical
+#     way to tell them apart without resolving it (which is exactly what
+#     this checker then does; a non-commit 40-hex string simply reports as
+#     an unresolved WARNING, same as any other miss).
 #   - a hash quoted alongside `hash: rest-of-sentence` (no context word
-#     before the hash) is invisible -- see (a) above; this is deliberate,
-#     not a gap discovered late.
-#   - a comma-separated second line number ("progress.md:86,89") -- only
-#     the first number is checked; the citation format this schema
-#     documents is one path, one line.
-#   - only a DOUBLE-QUOTED string immediately following the hash (optional
-#     whitespace, nothing else between) is treated as a claimed subject
-#     ("commit abc1234 "Subject text""). A parenthetical, a colon-joined
-#     sentence, or a quote separated by other punctuation is never read as
-#     a subject claim -- this store's real citations never quote a subject
-#     this way today, so being strict here costs nothing on the real store
-#     and avoids inventing a subject out of unrelated prose that happens to
+#     before the hash) is invisible -- see (a)/(b) above; this is
+#     deliberate, not a gap discovered late.
+#   - a comma- or second-colon-separated line locator ("progress.md:86,89",
+#     "file.py:123:45", a "-"-joined range "file.py:123-130") -- only the
+#     FIRST number after the first colon is ever checked; the citation
+#     format this schema documents is one path, one line.
+#   - `file.py:L123` (an "L"-prefixed line number, a shape this store does
+#     not use but some do) is invisible -- the line-number group requires
+#     bare digits immediately after the colon.
+#   - only a DOUBLE-QUOTED string immediately following a commit/merge hash
+#     -- same line, spaces/tabs only in between, see above -- is treated as
+#     a claimed subject. A parenthetical, a colon-joined sentence, or a
+#     quote separated by other punctuation is never read as a subject
+#     claim -- this store's real citations never quote a subject this way
+#     today, so being strict here costs nothing on the real store and
+#     avoids inventing a subject out of unrelated prose that happens to
 #     follow a hash.
 #   - a citation to a commit or a file:line that is real but lives in a
 #     DIFFERENT repository than the one --code-root points at resolves to
@@ -544,11 +589,13 @@ def lint_concept(
 _COMMIT_CITE_RE = re.compile(
     r"""
     (?:
-        \b(?i:commit|merge|at|as)\b\s+(?P<hash_ctx>[0-9a-f]{40}|[0-9a-f]{7})\b
+        \b(?i:commit|merge)\b\s+(?P<hash_ctx_subj>[0-9a-f]{40}|[0-9a-f]{7})\b
+        (?:[ \t]*"(?P<subject>[^"\n]*)")?
+      |
+        \b(?i:at|as)\b\s+(?P<hash_ctx_bare>[0-9a-f]{40}|[0-9a-f]{7})\b
       |
         `(?P<hash_bt>[0-9a-f]{40}|[0-9a-f]{7})`
     )
-    (?:\s*"(?P<subject>[^"]*)")?
     """,
     re.VERBOSE,
 )
@@ -556,17 +603,31 @@ _COMMIT_CITE_RE = re.compile(
 # path/to/file.ext:123[-456] -- the path portion must carry a dotted
 # extension (so "16:09 EDT" and a bare "TOP-0124:5"-shaped token never
 # match: neither contains a "."), and must not be immediately preceded by
-# another path/word character OR a colon -- the colon is what keeps a
-# URL's "host.tld:port" from matching (http://host.tld:port/path.py:12
-# would otherwise start matching right after "http:", where the two
-# slashes are themselves swallowed into the path group; excluding a
+# another path/word character, a colon, OR A BACKSLASH -- the colon is
+# what keeps a URL's "host.tld:port" from matching (http://host.tld:port/
+# path.py:12 would otherwise start matching right after "http:", where the
+# two slashes are themselves swallowed into the path group; excluding a
 # colon immediately before the match start closes that, since this
 # store's own "field: value" YAML lines always have a space after the
-# colon, never a bare path glued to it). Only the FIRST line number of a
+# colon, never a bare path glued to it). The backslash exclusion (fix
+# round, Grok MINOR) closes a separate hole: `\` was in neither the path
+# character class nor this lookbehind, so a Windows-style
+# "hooks\missing.py:3" matched starting right after the backslash,
+# silently citing "missing.py" -- a real, different file at the store
+# root, if one happened to exist there -- instead of correctly matching
+# nothing at all (this store's own paths are always forward-slashed, so a
+# backslash immediately before a candidate path is never legitimate).
+# KNOWN MISS, not fixed here (no specific repair requested; the citation
+# format this schema documents assumes no spaces in a path): a path
+# containing a literal space ("my t.py:123") still matches only its
+# suffix after the space ("t.py:123"), the same "silently take a
+# basename" shape as the backslash case, for the structural reason that
+# nothing marks where such a path starts. Only the FIRST line number of a
 # "path:123-456" or "path:123,456" citation is captured -- a range's or
-# list's remaining numbers are a known miss (see module comment above).
+# list's remaining numbers, and an "L"-prefixed line number
+# ("file.py:L123"), are known misses (see module comment above).
 _FILE_LINE_CITE_RE = re.compile(
-    r"(?<![\w./:-])([A-Za-z0-9_.\-/]+\.[A-Za-z0-9]{1,8}):(\d+)(?:[-,]\d+)?"
+    r"(?<![\w./:\\-])([A-Za-z0-9_.\-/]+\.[A-Za-z0-9]{1,8}):(\d+)(?:[-,]\d+)?"
 )
 
 
@@ -619,13 +680,16 @@ def _commit_subject(root: Path, commit_hash: str) -> str | None:
 
 def _extract_commit_citations(text: str) -> list[dict]:
     """Every commit citation _COMMIT_CITE_RE finds in one string, as
-    {"hash": str, "subject": str | None} -- "subject" is the quoted text
-    immediately following the hash, when present, else None (see module
-    comment: only a directly-adjacent double-quoted string counts)."""
+    {"hash": str, "subject": str | None} -- "subject" is the same-line
+    quoted text immediately following a commit/merge-triggered hash, when
+    present, else None. An at/as-triggered or backtick-wrapped hash is
+    never subject-eligible (see module comment) even when a quote happens
+    to follow it in the source text."""
     out = []
     for m in _COMMIT_CITE_RE.finditer(text):
-        h = m.group("hash_ctx") or m.group("hash_bt")
-        out.append({"hash": h, "subject": m.group("subject")})
+        h = m.group("hash_ctx_subj") or m.group("hash_ctx_bare") or m.group("hash_bt")
+        subject = m.group("subject") if m.group("hash_ctx_subj") else None
+        out.append({"hash": h, "subject": subject})
     return out
 
 
@@ -2365,10 +2429,14 @@ def _extract_strict_citations_flag(argv: list[str]) -> tuple[list[str], bool]:
     SEPARATE function, not folded into _extract_against_ref_flags, so the
     two preprocessing passes merge cleanly with any other branch touching
     that one. Meaningless without --code-root (the whole citation check is
-    skipped then) and meaningless under --against-ref (append-only mode
-    never uses a code root either) -- in both cases the flag is simply
-    never consulted, not specially rejected, to avoid adding another
-    rejection branch next to code this function does not own."""
+    skipped then, silently, same as every other --code-root-gated check).
+    Meaningless under --against-ref too (append-only mode never uses a code
+    root either) -- but there main() REJECTS it explicitly (fix round,
+    NIT: it used to be silently stripped and ignored, inconsistent with
+    --code-root's own explicit rejection in that same mode for the
+    identical reason), so this function itself never special-cases
+    --against-ref -- it only extracts the flag's presence, leaving the
+    accept/reject decision to main(), which already owns that branch."""
     rest: list[str] = []
     strict = False
     for a in argv:
@@ -2412,7 +2480,7 @@ def parse_argv(argv: list[str]) -> tuple[str | None, list[str], str | None]:
     return root, code_roots, unknown
 
 
-USAGE = """usage: memlint.py ROOT [--code-root PATH ...]
+USAGE = """usage: memlint.py ROOT [--code-root PATH ...] [--strict-citations]
        memlint.py --against-ref REF [--staged] ROOT
 
 Validate every MemContinuum record under ROOT against the schema and print one
@@ -2455,9 +2523,9 @@ ERROR:/WARNING: line per finding. Exit 1 if any error was found, 0 otherwise
                      above) to a lint ERROR too -- for a store whose
                      records are known to cite only the wired repo, where
                      "not found" really does mean wrong. Has no effect
-                     without --code-root, and no effect under
-                     --against-ref (append-only mode never uses a code
-                     root either).
+                     without --code-root (nothing to promote). Rejected
+                     together with --against-ref, same as --code-root
+                     (append-only mode never uses a code root either).
   -h, --help         print this and exit
 
 Append-only history mode (a second, independent check -- given
@@ -2613,6 +2681,22 @@ def main(argv=None) -> int:
             # with no sign the flag did nothing -- rejected instead.
             print(
                 "--code-root is rejected together with --against-ref "
+                "(append-only mode never uses a code root)",
+                file=sys.stderr,
+            )
+            print(USAGE, file=sys.stderr)
+            return 2
+        if strict_citations:
+            # Fix round (NIT): --strict-citations used to be silently
+            # stripped and ignored here, inconsistent with --code-root's
+            # own explicit rejection one branch up for exactly the same
+            # reason -- append-only mode never uses a code root, so a
+            # citation-strictness flag that only means anything WITH a
+            # code root has nothing to attach to either. Same message
+            # shape as the --code-root rejection, so a reader sees the
+            # two flags are refused the same way, not two different ways.
+            print(
+                "--strict-citations is rejected together with --against-ref "
                 "(append-only mode never uses a code root)",
                 file=sys.stderr,
             )
