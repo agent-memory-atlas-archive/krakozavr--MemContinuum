@@ -76,73 +76,116 @@ fail (no python, an unborn HEAD, memlint erroring out, its own cwd not being
 the store) still fails open exactly
 like every other hook.
 
-**Search fallback (owner-ratified, 2026-09-19).** `memidx.py search` was the
-only channel that could deliver a decision NOT bound to the file being
-edited, and it had never once been invoked in this project's recorded
-history. So the hook calls it: on `pre-edit-chain.sh`'s own genuine-miss
-branch (never on a match, never on `worktree-unwired`/`worktree-unresolved`,
-both of which already end the run first), and on `newfile-nudge.sh`'s
-wired-new-file reminder, `memidx.py search --hydrate` is queried on the
-edited path's OWN words, and the nearest decisions (if any) are handed to
-the agent labelled as a guess, never as a match. Both hooks skip this
-entirely for a path under `$MEMCONTINUUM_ROOT` (the store itself — that is
+**Search fallback.** `memidx.py search` was the only channel that could
+deliver a decision NOT bound to the file being edited, and it had never
+once been invoked in this project's recorded history. So the hook calls
+it: on `pre-edit-chain.sh`'s own genuine-miss branch (never on a match,
+never on `worktree-unwired`/`worktree-unresolved`, both of which already
+end the run first), and on `newfile-nudge.sh`'s wired-new-file reminder,
+`memidx.py search --read-only --hydrate` is queried on the edited path's
+OWN words, and the nearest decisions (if any) are handed to the agent
+labelled as a guess, never as a match. Both hooks skip this entirely for a
+path under `$MEMCONTINUUM_ROOT` (the store itself — that is
 duplicate-detection's job, out of scope here).
 
 The query: the path is relativized first (`pre-edit-chain.sh` uses the
 worktree-remapped main-checkout-equivalent path when one exists, so a
 worktree path's `.worktrees/x/...` segment is never spelled into the
-query), then its extension is stripped and it is split into words on
-`/ _ - .` and camelCase boundaries, lowercased, deduped, and filtered:
-tokens shorter than 3 characters and a fixed generic-stem list (`src lib
-sources source docs doc test tests spec main index utils util helpers
-internal app core common base`) are dropped, and the result is capped at
-12 tokens (`hooks/mc-query-lib.sh`, side-effect-free, its own header
-states these limits). An empty query after filtering never runs a search.
+query), then its extension is stripped, `\` is normalized as a path
+separator alongside `/ _ - .`, and the result is split into words on
+those separators and on camelCase boundaries, lowercased, deduped, and
+filtered: tokens shorter than 3 characters and a fixed generic-stem list
+(`src lib sources source docs doc test tests spec main index utils util
+helpers internal app core common base readme package makefile config init
+setup`) are dropped, and the result is capped at 12 tokens
+(`hooks/mc-query-lib.sh`, side-effect-free, its own header states these
+limits — including the tokenizer's own ASCII-only limitation: a path
+whose meaningful words are non-ASCII degrades to "no query" or a
+partial/garbled one, a stated limit, not a bug this feature fixes). An
+empty query after filtering never runs a search.
 
-The search itself is ONE `memidx.py search --limit 2 --json --hydrate`
-call — `--hydrate` (new) adds a `chain_text` field to each JSON hit,
-reusing `topic_chain_lines`/`chain_lines` (the exact rendering `chain`
-already produces for that hit's own topic), so no second `chain`/`for-path`
+The search itself is ONE `memidx.py search --read-only --root <store>
+--limit 2 --json --hydrate` call. `--read-only` (new) opens the index
+strictly read-only (`open_db_readonly`, mode=ro) and never migrates a
+schema behind the current generation to answer a guess — a schema generation gap refuses by name
+(`state=upgrade-required reason=index-needs-migration`) instead of the
+ordinary rw path's silent migrate-on-open. `--root` (new) makes on-disk
+staleness visible instead of silently swallowed, same warning `for-path`
+already surfaces on the match path. `--hydrate` adds a `chain_text` field
+to each JSON hit, reusing `topic_chain_lines_capped` (the same rendering
+`chain` produces, capped — see below), so no second `chain`/`for-path`
 call per hit is ever needed. No `--status`/`--authority` filter (the
 engine's own defaults apply); mode is `MEMCONTINUUM_FALLBACK_MODE`
 (`hybrid`/`vector`/`fts`) when set, else the engine's own default
-(`hybrid`) — an unrecognized value falls back to that same default. On a
-hit, `additionalContext` gets a fixed first line, verbatim:
+(`hybrid`) — an unrecognized value falls back to that same default. A
+drvfs-backed store (SQLite WAL locking is unreliable there — see this
+repo's own Windows/WSL environment notes) is a candidate for
+`MEMCONTINUUM_FALLBACK_MODE=fts`, which never touches the embedding
+backend at all; this is a per-installation recommendation only — the
+shipped default stays `hybrid` — ship on the engine's own default,
+measure real queries before changing it.
+
+Each hit's `chain_text` is capped at `MEMCONTINUUM_FALLBACK_MAX_BYTES`
+(default 2000 UTF-8 bytes, `--hydrate-max-bytes`): the active/current link
+renders in full, older links are added newest-first until the cap, then
+one explicit `[... N older link(s) omitted]` marker replaces the rest — a
+topic that fits under the cap renders byte-identical to the uncapped
+`chain` output; one that doesn't (measured: a 16-link topic exceeded 10KB
+uncapped) never grows past the cap. On a hit, `additionalContext` gets a
+fixed first line, verbatim:
 
     No recorded decision binds this file. Nearest by search -- may be unrelated:
 
-followed by each hit's `chain_text` — never the `snippet` field. Two new
-outcomes, logged instead of (not alongside) the plain miss this branch used
-to log: `search-fallback` (≥1 hit; `hits=N ids=<comma ids> mode=<m>
-q=<+-joined tokens>`) and `search-fallback-empty` (`reason=no-query` /
-`reason=no-hits` / `reason=store-root`). The query is `+`-joined, not
-quoted-with-spaces: `memidx.py stats`'s own generic `key=value` field scan
-has no quote-awareness (`\S*`), so a quoted, space-containing value would
-truncate at the first space. `newfile-nudge.sh`'s own outcome name for this
-branch never changes (`outcome=nudged` — `memidx.py stats`' `nf.nudged`
-metric already keys on that literal string); the fallback's own result
-rides along as extra `fb_outcome=`/`fb_hits=`/`fb_ids=`/`fb_mode=`/`fb_q=`/
-`fb_reason=` fields on that same line instead. The 2s watchdog is unchanged
-and covers the fallback's own run too; on a watchdog timeout the existing
+followed by each hit's `chain_text` — never the `snippet` field. Two
+outcomes, logged instead of (not alongside) the plain miss this branch
+used to log: `search-fallback` (≥1 hit; `hits=N ids=<comma ids> mode=<m>
+q=<+-joined tokens> fb_ms=<N>`) and `search-fallback-empty`
+(`reason=no-query` / `reason=no-hits` / `reason=store-root` /
+`reason=missing` / `reason=uninitialized` / `reason=index-needs-migration`
+/ `reason=quarantined` / `reason=stale` / `reason=search-failed rc=N` /
+`reason=bad-json`, plus `fb_ms=<N>` whenever the search subprocess
+actually ran). `fb_ms` is millisecond-resolution wall time of the search
+subprocess call only (`date +%s%3N`, a python `time.time()` fallback where
+`%3N` isn't supported) — the same field name on both hooks, present only
+when the subprocess ran, so `no-query`/`store-root` never contribute a
+sample. The query is `+`-joined, not quoted-with-spaces: `memidx.py
+stats`'s own generic `key=value` field scan has no quote-awareness
+(`\S*`), so a quoted, space-containing value would truncate at the first
+space. `newfile-nudge.sh`'s own outcome name for this branch never changes
+(`outcome=nudged` — `memidx.py stats`' `nf.nudged` metric already keys on
+that literal string); the fallback's own result rides along as extra
+`fb_outcome=`/`fb_hits=`/`fb_ids=`/`fb_mode=`/`fb_q=`/`fb_reason=`/`fb_ms=`
+fields on that same line instead. The 2s watchdog is unchanged and covers
+the fallback's own run too (real hybrid-mode measurements: 0.91–0.96s
+end to end, well inside budget — see `pre-edit-chain.sh`'s own header for
+the watchdog-budget accounting); on a watchdog timeout the existing
 `MC_WATCHDOG_TIMEOUT_FALLBACK` line is what the model gets, same as any
-other timeout.
+other timeout. The fallback subprocess's own stderr is routed to
+`/dev/null`, never appended to hook.log (a stray, untimestamped line would
+otherwise break the "exactly one line per invocation" contract).
 
 **No write path.** The fallback never touches the store or the index
 beyond reading it — `git status --short` on a fixture store stays clean and
-the index file's sha256 is unchanged across repeated fallback runs. The one
-state write EITHER hook makes is titling: on a hit, each surfaced (id,
-title) pair is appended to the current session's own state file (the same
+the index file's sha256 is unchanged across repeated fallback runs (proven
+even against a schema behind the current generation, which the ordinary rw path WOULD
+migrate on open — see `--read-only` above). The one state write EITHER
+hook makes is titling: on a hit, each surfaced (id, title) pair is
+appended to the current session's own state file (the same
 `sessions/<project>/<session>.json`, `mc_update_state_json`, every
-write-side hook already shares) under a `search_fallbacks` list (capped at
-the last 20), so `userprompt-remind.sh`'s look-back nudge can name what was
-shown, reading only that state (never hook.log, never the prompt — ruling
-B is unchanged) and never re-searching: each entry renders as `search
-surfaced <title> (<id>) for <file>`, capped at 8 (the same cap coverage's
-own `unmapped[:8]` fact line uses) —
-`pre-edit-chain.sh`'s own hook.log lines carry no `session=` field at all
-(it never sources `memlib.sh`), so this state write is the ONLY place a
-title is recoverable per session. This is titling metadata, not a decision:
-the hook never binds anything, it only remembers what it already showed.
+write-side hook already shares) under a `search_fallbacks` list, deduped
+by (file, id) with the position refreshed on a repeat (never a growing run
+of near-duplicates for one repeated miss) and each title truncated to 120
+characters, capped at the last 20 entries — so `userprompt-remind.sh`'s
+look-back nudge can name what was shown, reading only that state (never
+hook.log, never the prompt — ruling B is unchanged) and never
+re-searching: each entry renders as `search surfaced <title> (<id>) for
+<file>`, capped at 8 (the same cap coverage's own `unmapped[:8]` fact line
+uses) — `pre-edit-chain.sh`'s own hook.log lines carry no `session=` field
+at all (`finish()`'s own fixed field list has none), so this state write is
+the ONLY place a title is recoverable per session; the write itself is
+sourced and paid for lazily, only on this already-rare branch. This is
+titling metadata, not a decision: the hook never binds anything, it only
+remembers what it already showed.
 
 **No relevance floor, by design.** This channel ships on the search engine's
 existing ranking as-is (hybrid default) with no minimum-score cutoff and no

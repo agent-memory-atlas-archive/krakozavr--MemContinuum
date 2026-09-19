@@ -6282,6 +6282,76 @@ class TestNewFileNudgeHook(unittest.TestCase):
         self.assertIn("fb_outcome=search-fallback-empty", log_text)
         self.assertIn("fb_reason=no-hits", log_text)
 
+    def test_store_root_file_skip_now_logs_fb_reason_store_root(self):
+        """MINOR fix-round item: this skip used to log NOTHING at all
+        (FB_EXTRA stayed empty) -- now matches pre-edit-chain.sh's own
+        identical store-root skip, naming itself on the same `outcome=
+        nudged` line via fb_outcome=/fb_reason=."""
+        # The store must be NESTED under code_root -- a path outside the
+        # code root never reaches even the wired-extension gate (see
+        # test_silent_for_a_path_outside_the_code_root above), and a
+        # non-wired extension (.md) would exit at "not-indexed-extension"
+        # before ever reaching this hook's own store-root fallback skip.
+        store = self.code_root / "mem-store"
+        store.mkdir()
+        target = store / "Something.swift"
+        env = self.base_env(MEMCONTINUUM_ROOT=str(store))
+        proc, _elapsed = run_script(
+            NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("fb_outcome=search-fallback-empty", log_text)
+        self.assertIn("fb_reason=store-root", log_text)
+
+    def test_hybrid_envelope_dict_shape_is_parsed_not_treated_as_zero_hits(self):
+        """Addendum (PR #21 merged): hybrid `search --json` now ALWAYS
+        wraps hits in `{"results": [...], "fusion": ...}`, never a bare
+        list -- the hook's own JSON parser must read `results` off the
+        dict, not assume a list (or every hybrid-mode fallback would
+        silently read as zero hits). A fake memidx.py stands in for the
+        real one and returns exactly that envelope shape, argv-
+        independent, to pin the parsing itself rather than depend on a
+        real embedding model producing that shape."""
+        fake = Path(self.td) / "fake-memidx.py"
+        fake.write_text(
+            "import json, sys\n"
+            "if sys.argv[1] == 'search':\n"
+            "    print(json.dumps({\n"
+            "        'results': [{'id': 'TOP-9111', 'title': 'Envelope shape topic', "
+            "'path': 'x.md', 'chain_text': 'TOP-9111 chain text here'}],\n"
+            "        'fusion': 'rrf',\n"
+            "    }))\n"
+            "    sys.exit(0)\n"
+            "sys.exit(1)\n"
+        )
+        wrapper = Path(self.td) / "fake-py-wrapper"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            f'REAL_PY="{VENV_PYTHON}"\n'
+            'if [ "$1" = "-c" ]; then\n'
+            '    exec "$REAL_PY" "$@"\n'
+            'fi\n'
+            'shift\n'
+            f'exec "$REAL_PY" "{fake}" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+
+        target = self.code_root / "Sources" / "envelope.swift"
+        env = self.base_env(MEMCONTINUUM_PYTHON=str(wrapper))
+        # the db must exist (any content) so the hook's own db-existence
+        # guard does not skip the subprocess call entirely.
+        (self.home / "default.sqlite").write_bytes(b"")
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("TOP-9111", ctx)
+        self.assertIn("chain text here", ctx)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("fb_outcome=search-fallback ", log_text)
+        self.assertIn("fb_hits=1", log_text)
+
     def test_silent_for_an_existing_file(self):
         target = self.code_root / "Existing.swift"
         target.write_text("// already here\n")

@@ -290,6 +290,19 @@ def _records_fresh_vector_counts(conn: "sqlite3.Connection", project: str) -> tu
 # cmd_reindex's own no_embed guard).
 CURRENT_INDEX_GENERATION = 5
 
+# MAJOR fix-round item c (TOP-0133 L1): `search --hydrate`'s per-hit byte
+# cap, read once at import time from MEMCONTINUUM_FALLBACK_MAX_BYTES (the
+# same env var hooks/mc-query-lib.sh's own docs point at) -- 2000 was
+# picked as a default that comfortably fits one topic's current link plus
+# a handful of older ones without threatening the PreToolUse
+# additionalContext budget the way an unbounded 16-link topic (measured
+# past 10KB) did. An unset/blank/non-integer env value falls back to 2000
+# rather than crashing the CLI over a typo'd override.
+try:
+    DEFAULT_FALLBACK_MAX_BYTES = int(os.environ.get("MEMCONTINUUM_FALLBACK_MAX_BYTES", "") or 2000)
+except ValueError:
+    DEFAULT_FALLBACK_MAX_BYTES = 2000
+
 # ---------------------------------------------------------------------------
 # frontmatter parsing (shared by memidx and memlint)
 # ---------------------------------------------------------------------------
@@ -1284,29 +1297,92 @@ def decision_index_state(
     if conn is None:
         return "missing"
     try:
-        stamp = conn.execute("SELECT value FROM db_meta WHERE key='last_reindexed_at'").fetchone()
-        has_rows = conn.execute("SELECT 1 FROM records WHERE project=? LIMIT 1", (project,)).fetchone()
-        if stamp is None:
-            return "uninitialized" if has_rows is None else "upgrade-required"
-        gen_row = conn.execute("SELECT value FROM db_meta WHERE key='index_generation'").fetchone()
-        # Whole-branch review item 6: a corrupted index_generation value
-        # raises ValueError (int() on garbage) -- unguarded here, that
-        # would crash all five CLI readers this function serves, before
-        # any of THEIR own try/except gets a chance to run. Same guard
-        # shape as cmd_reindex's own migration probe (line ~993): treat a
-        # non-integer stamp as older than current, the safe direction.
+        return _classify_index_state(conn, project, root=root, verify_content=verify_content)
+    finally:
+        conn.close()
+
+
+def _classify_index_state(
+    conn: sqlite3.Connection, project: str, root: Path | None = None, *, verify_content: bool = False,
+) -> str:
+    """The read-only classification BODY shared by decision_index_state
+    (rw: `conn` already came off open_db_noncreating, which has already
+    run every migration guard by the time this runs) and
+    decision_index_state_readonly (MAJOR fix-round item a: `conn` came
+    off open_db_readonly, mode=ro, NO guard has run -- a legacy/unmigrated
+    schema this function tries to read from raises sqlite3.OperationalError
+    partway through, which decision_index_state_readonly catches and
+    reports as "upgrade-required"; decision_index_state's own rw `conn`
+    never raises here since the guards already brought the schema
+    current). Executes no INSERT/UPDATE/ALTER/CREATE of its own either
+    way -- purely SELECTs. See decision_index_state's own docstring for
+    the five/six-state model this returns."""
+    stamp = conn.execute("SELECT value FROM db_meta WHERE key='last_reindexed_at'").fetchone()
+    has_rows = conn.execute("SELECT 1 FROM records WHERE project=? LIMIT 1", (project,)).fetchone()
+    if stamp is None:
+        return "uninitialized" if has_rows is None else "upgrade-required"
+    gen_row = conn.execute("SELECT value FROM db_meta WHERE key='index_generation'").fetchone()
+    # Whole-branch review item 6: a corrupted index_generation value
+    # raises ValueError (int() on garbage) -- unguarded here, that
+    # would crash all five CLI readers this function serves, before
+    # any of THEIR own try/except gets a chance to run. Same guard
+    # shape as cmd_reindex's own migration probe (line ~993): treat a
+    # non-integer stamp as older than current, the safe direction.
+    try:
+        generation = int(gen_row["value"]) if gen_row else 1
+    except (TypeError, ValueError):
+        return "upgrade-required"
+    if generation < CURRENT_INDEX_GENERATION:
+        return "upgrade-required"
+    if root is not None and _index_has_drift(conn, root, project, verify_content=verify_content):
+        return "stale"
+    has_errors = conn.execute("SELECT 1 FROM index_errors WHERE project=? LIMIT 1", (project,)).fetchone()
+    if has_errors is not None:
+        return "quarantined"
+    return "current"
+
+
+def open_db_readonly(db_path: Path) -> sqlite3.Connection | None:
+    """SQLite URI mode=ro: opens an EXISTING file strictly read-only --
+    unlike open_db_noncreating's mode=rw, this NEVER runs
+    `_run_decision_migration_guards` (which can ALTER a table, CREATE
+    index_errors, or INSERT/commit a db_meta project stamp -- see each
+    guard's own docstring), so opening a fully-current, already-stamped
+    db through this function writes zero bytes to it. MAJOR fix-round
+    item a: the search fallback (TOP-0133 L1) reads the index to answer a
+    guess, never to migrate it -- `cmd_search --read-only` is the one
+    caller today. Returns None when the file doesn't exist (or any other
+    OperationalError opening it, e.g. a locked/corrupt file) -- same
+    degrade-to-named-refusal shape as open_db_noncreating."""
+    try:
+        conn = sqlite3.connect(f"file:{quote(db_path.as_posix())}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        return None
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def decision_index_state_readonly(
+    db_path: Path, project: str, root: Path | None = None, *, verify_content: bool = False,
+) -> str:
+    """Read-only counterpart to decision_index_state (MAJOR fix-round item
+    a) -- opens via open_db_readonly (mode=ro, no migration guard ever
+    runs) and classifies via the SAME _classify_index_state body. A
+    legacy/unmigrated schema (a missing links/embeddings column, a
+    dropped index_errors table, anything the rw guards would have
+    silently ALTERed/CREATEd into existence) raises sqlite3.OperationalError
+    partway through classification on a ro connection -- caught here and
+    reported as "upgrade-required", the SAME state name decision_index_state
+    already uses for "this schema generation is behind", so callers
+    (cmd_search --read-only) need only one branch, not a new pseudo-state."""
+    conn = open_db_readonly(db_path)
+    if conn is None:
+        return "missing"
+    try:
         try:
-            generation = int(gen_row["value"]) if gen_row else 1
-        except (TypeError, ValueError):
+            return _classify_index_state(conn, project, root=root, verify_content=verify_content)
+        except sqlite3.OperationalError:
             return "upgrade-required"
-        if generation < CURRENT_INDEX_GENERATION:
-            return "upgrade-required"
-        if root is not None and _index_has_drift(conn, root, project, verify_content=verify_content):
-            return "stale"
-        has_errors = conn.execute("SELECT 1 FROM index_errors WHERE project=? LIMIT 1", (project,)).fetchone()
-        if has_errors is not None:
-            return "quarantined"
-        return "current"
     finally:
         conn.close()
 
@@ -3024,10 +3100,44 @@ def cmd_search(args) -> int:
     # passed through so an on-disk-drifted store is surfaced, not silently
     # answered as "current".
     root = Path(args.root).resolve() if getattr(args, "root", None) else None
-    state = decision_index_state(db_path, args.project, root=root)
+    read_only = bool(getattr(args, "read_only", False))
+    # MAJOR fix-round item a: --read-only (the search fallback's own
+    # caller, hooks/pre-edit-chain.sh + hooks/newfile-nudge.sh) never opens
+    # the index through open_db_noncreating -- that mode=rw open silently
+    # ALTERs/CREATEs/INSERTs on a legacy schema (see _run_decision_migration_
+    # guards). A read-only caller gets decision_index_state_readonly/
+    # open_db_readonly instead (mode=ro, no guard ever runs); the two
+    # helpers share the SAME classification body (_classify_index_state)
+    # as the rw path above, so this branch changes ONLY which connection
+    # mode is used, never the state vocabulary a caller has to understand.
+    if read_only:
+        state = decision_index_state_readonly(db_path, args.project, root=root)
+    else:
+        state = decision_index_state(db_path, args.project, root=root)
     if state in ("missing", "uninitialized"):
         return _decision_reply("search", args, state)
-    conn = open_db_noncreating(db_path, project=args.project)
+    if read_only and state == "upgrade-required":
+        # A read-only caller refuses by name instead of silently opening
+        # rw and migrating a legacy schema just to answer a guess -- the
+        # ONE state a genuinely read-only open cannot paper over (see
+        # decision_index_state_readonly's own docstring). Non-read-only
+        # callers keep the pre-existing behavior below (open rw, warn,
+        # migrate-on-open, search anyway -- ruling 68).
+        print(
+            f"search: the decision index needs migration for project {args.project!r} "
+            "and --read-only refuses to write it -- run `reindex --root <path>` first",
+            file=sys.stderr,
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(
+                {"state": "upgrade-required", "reason": "index-needs-migration", "results": []},
+                indent=2,
+            ))
+        return 1
+    if read_only:
+        conn = open_db_readonly(db_path)
+    else:
+        conn = open_db_noncreating(db_path, project=args.project)
     if conn is None:
         return _decision_reply("search", args, "missing")
     if state in ("upgrade-required", "stale", "quarantined"):
@@ -3206,9 +3316,18 @@ def cmd_search(args) -> int:
             # degrades to whatever chain_lines renders for a topic-shaped
             # row with no links ("... -- current: (none)"), via the same
             # function -- never a crash, never a second query implementation.
+            # MAJOR fix-round item c: capped, not the raw uncapped render
+            # -- a 16-link topic hydrated past 10KB with no bound. `--
+            # hydrate-max-bytes` (env MEMCONTINUUM_FALLBACK_MAX_BYTES,
+            # default 2000) is resolved once by argparse; a topic whose
+            # full render already fits stays byte-identical to the old
+            # uncapped topic_chain_lines output (topic_chain_lines_capped's
+            # own docstring; pinned by a 2-link fixture in test_memidx.py).
             topic_row = record_row_by_path(conn, entry["path"])
+            max_bytes = getattr(args, "hydrate_max_bytes", None) or DEFAULT_FALLBACK_MAX_BYTES
             entry["chain_text"] = (
-                "\n".join(topic_chain_lines(conn, topic_row)) if topic_row is not None else ""
+                "\n".join(topic_chain_lines_capped(conn, topic_row, max_bytes))
+                if topic_row is not None else ""
             )
         out.append(entry)
 
@@ -3295,48 +3414,66 @@ def assumptions_for_topic(conn, topic_path: str) -> dict[str, list]:
     return grouped
 
 
+def _chain_link_lines(topic_row, lr, edges_by_from) -> list[str]:
+    """One link's own rendered lines (its head line plus any ↳ edge
+    lines) -- extracted out of chain_lines' per-link loop body (MAJOR
+    fix-round item c) so topic_chain_lines_capped can render a KEPT link
+    with the exact same bytes chain_lines itself would, not a second,
+    driftable implementation. Never includes the shared header line (one
+    per topic, not per link) or the aggregate "broken assumptions:" block
+    (spans every link, not just this one) -- both stay the caller's own job."""
+    head = f"  {lr['link']} {lr['date']} {lr['kind']}"
+    if lr["reverses"]:
+        reason = lr["reason_for_change"] or ""
+        why = lr["rationale_text"] or lr["ruling_text"] or ""
+        head += f"  ← reverses {lr['reverses']} ({reason}: {why})"
+    else:
+        if lr["ruling_text"]:
+            quote = lr["ruling_text"]
+            if lr["ruling_authority"] in ("owner-verbatim", "owner-ratified"):
+                quote = f'"{quote}"'
+            head += f"   {quote} ({lr['ruling_authority']})"
+        if lr["rationale_text"]:
+            head += f" because {lr['rationale_text']} ({lr['rationale_authority']})"
+    lines = [head]
+    from_ref = f"{topic_row['id']}/{lr['link']}"
+    for edge in edges_by_from.get(from_ref, []):
+        lines.append(f"    ↳ {edge['rel']} → {edge['to_ref']}")
+    return lines
+
+
+def _chain_header_line(topic_row, current_link) -> str:
+    """The one shared header line both chain_lines and
+    topic_chain_lines_capped render first -- extracted alongside
+    _chain_link_lines (MAJOR fix-round item c) so the two can never drift
+    on this line's own format either."""
+    if current_link is not None:
+        return (
+            f"{topic_row['id']} {topic_row['title']} — current: {current_link['link']} "
+            f"({current_link['status']}, {current_link['ruling_authority'] or current_link['rationale_authority']})"
+        )
+    return f"{topic_row['id']} {topic_row['title']} — current: (none)"
+
+
+def _chain_current_link(link_rows):
+    """The active-else-first "current" link selection rule, shared by
+    chain_lines and topic_chain_lines_capped (MAJOR fix-round item c)."""
+    for lr in link_rows:
+        if lr["status"] == "active":
+            return lr
+    return link_rows[0] if link_rows else None
+
+
 def chain_lines(topic_row, link_rows, edges_by_from=None, assumptions_by_link=None) -> list[str]:
     edges_by_from = edges_by_from or {}
     assumptions_by_link = assumptions_by_link or {}
 
-    current_link = None
-    for lr in link_rows:
-        if lr["status"] == "active":
-            current_link = lr
-            break
-    if current_link is None and link_rows:
-        current_link = link_rows[0]
-
-    lines = []
-    if current_link is not None:
-        lines.append(
-            f"{topic_row['id']} {topic_row['title']} — current: {current_link['link']} "
-            f"({current_link['status']}, {current_link['ruling_authority'] or current_link['rationale_authority']})"
-        )
-    else:
-        lines.append(f"{topic_row['id']} {topic_row['title']} — current: (none)")
+    current_link = _chain_current_link(link_rows)
+    lines = [_chain_header_line(topic_row, current_link)]
 
     broken = []
     for lr in link_rows:
-        head = f"  {lr['link']} {lr['date']} {lr['kind']}"
-        if lr["reverses"]:
-            reason = lr["reason_for_change"] or ""
-            why = lr["rationale_text"] or lr["ruling_text"] or ""
-            head += f"  ← reverses {lr['reverses']} ({reason}: {why})"
-        else:
-            if lr["ruling_text"]:
-                quote = lr["ruling_text"]
-                if lr["ruling_authority"] in ("owner-verbatim", "owner-ratified"):
-                    quote = f'"{quote}"'
-                head += f"   {quote} ({lr['ruling_authority']})"
-            if lr["rationale_text"]:
-                head += f" because {lr['rationale_text']} ({lr['rationale_authority']})"
-        lines.append(head)
-
-        from_ref = f"{topic_row['id']}/{lr['link']}"
-        for edge in edges_by_from.get(from_ref, []):
-            lines.append(f"    ↳ {edge['rel']} → {edge['to_ref']}")
-
+        lines.extend(_chain_link_lines(topic_row, lr, edges_by_from))
         for a in assumptions_by_link.get(lr["link"], []):
             if a["status"] == "broken":
                 broken.append(a)
@@ -3741,6 +3878,71 @@ def topic_chain_lines(conn, topic_row) -> list:
         edges_for_topic(conn, topic_row["path"]),
         assumptions_for_topic(conn, topic_row["path"]),
     )
+
+
+def topic_chain_lines_capped(conn, topic_row, max_bytes: int) -> list:
+    """Byte-capped counterpart to topic_chain_lines -- MAJOR fix-round item
+    c (measured: two `--hydrate` hits off a 16-link topic exceeded 10KB
+    with no cap). Selection is by PRIORITY: the active/current link is
+    always kept in full, then remaining links newest-first (seq DESC)
+    until `max_bytes` is spent. The KEPT links are then rendered back in
+    chain_lines' own canonical seq-ASC order via the shared
+    _chain_link_lines/_chain_header_line helpers -- so a topic that fits
+    under the cap (nothing omitted) renders BYTE-IDENTICAL output to the
+    uncapped topic_chain_lines (pinned in tests/test_memidx.py with a
+    2-link fixture). A topic that does not fit gets exactly one explicit
+    marker line ahead of the oldest KEPT link naming how many older links
+    were left out -- never a silent truncation. `max_bytes` counts the
+    UTF-8 encoding of the final "\\n"-joined text (the same bytes a
+    caller embeds into additionalContext/chain_text), not character count."""
+    link_rows = conn.execute(
+        "SELECT * FROM links WHERE topic_path=? ORDER BY seq ASC", (topic_row["path"],)
+    ).fetchall()
+    edges_by_from = edges_for_topic(conn, topic_row["path"])
+    assumptions_by_link = assumptions_for_topic(conn, topic_row["path"])
+
+    current_link = _chain_current_link(link_rows)
+    header = _chain_header_line(topic_row, current_link)
+    budget = max_bytes - len(header.encode("utf-8"))
+
+    keep_ids = set()
+    if current_link is not None:
+        keep_ids.add(id(current_link))
+        current_block = "\n".join(_chain_link_lines(topic_row, current_link, edges_by_from))
+        budget -= len(current_block.encode("utf-8")) + 1   # +1 for the joining "\n"
+
+    others_newest_first = [lr for lr in reversed(link_rows) if lr is not current_link]
+    for lr in others_newest_first:
+        block = "\n".join(_chain_link_lines(topic_row, lr, edges_by_from))
+        cost = len(block.encode("utf-8")) + 1
+        if cost > budget:
+            # Older entries are no more likely to fit than this one, and
+            # skipping ahead of a not-fitting entry would break the
+            # newest-first priority order -- stop here rather than probe
+            # every remaining (older) link individually.
+            break
+        keep_ids.add(id(lr))
+        budget -= cost
+
+    omitted = len(link_rows) - len(keep_ids)
+
+    lines = [header]
+    if omitted:
+        lines.append(f"  [... {omitted} older link(s) omitted]")
+    broken = []
+    for lr in link_rows:   # canonical seq-ASC order
+        if id(lr) not in keep_ids:
+            continue
+        lines.extend(_chain_link_lines(topic_row, lr, edges_by_from))
+        for a in assumptions_by_link.get(lr["link"], []):
+            if a["status"] == "broken":
+                broken.append(a)
+    if broken:
+        lines.append("broken assumptions:")
+        for a in broken:
+            since = f" (since {a['since']})" if a["since"] else ""
+            lines.append(f"  {a['aid']}{since}: {a['text']}")
+    return lines
 
 
 def print_topic_chain(conn, topic_row) -> None:
@@ -7590,16 +7792,16 @@ def _new_stats_bucket():
         # hook's own header for why the base outcome name never changes).
         # Merged into ONE set of counters regardless of which hook fired
         # -- the spec's own "fallback" stats block is one combined view,
-        # not split by producer. `fallback_elapsed_s` is pre-edit-chain.sh
-        # ONLY (newfile-nudge.sh's own lines carry no `elapsed=` field at
-        # all -- see _hook_log_line_kind); named accordingly so a reader
-        # never mistakes it for a whole-fleet timing.
+        # not split by producer. `fallback_ms` (MAJOR fix-round item d)
+        # collects BOTH hooks' own `fb_ms=` field -- millisecond timing of
+        # the search subprocess call only, present only on a line where
+        # it actually ran (see _tally_fallback_fields).
         "fallback_outcomes": Counter(),
         "fallback_reasons": Counter(),
         "fallback_hit_counts": Counter(),
         "fallback_ids": Counter(),
         "fallback_modes": Counter(),
-        "fallback_elapsed_s": [],
+        "fallback_ms": [],
     }
 
 
@@ -7763,22 +7965,29 @@ def _percentile(sorted_values: list, pct: int):
     return sorted_values[min(idx, n) - 1]
 
 
-_FALLBACK_ELAPSED_S_RE = re.compile(r"^(\d+)s$")
-
-
-def _tally_fallback_fields(bucket: dict, fields: dict, outcome: str, elapsed_field: str = "", field_prefix: str = "") -> None:
+def _tally_fallback_fields(bucket: dict, fields: dict, outcome: str, field_prefix: str = "") -> None:
     """search-fallback (TOP-0133 L1): the one tally step BOTH producer
     shapes share -- pre-edit-chain.sh's own bare `hits=`/`ids=`/`mode=`/
-    `q=`/`reason=` fields (field_prefix="", elapsed_field=fields["elapsed"])
-    and newfile-nudge.sh's `fb_`-prefixed twins (field_prefix="fb_", no
-    elapsed -- that kind's lines never carry one). `outcome` is already
-    resolved by the caller (pre-edit-chain.sh's own `outcome=`, or
-    newfile-nudge.sh's `fb_outcome=`) -- always "search-fallback" or
-    "search-fallback-empty", the caller's own gate before calling this.
-    Never raises on a malformed/missing field (a non-digit `hits=`, an
-    empty `ids=`) -- this is a best-effort report over a log a human
-    or a broken host could have written anything into, same fail-open
-    discipline every other hook.log reader in this file already holds."""
+    `q=`/`reason=` fields (field_prefix="") and newfile-nudge.sh's `fb_`-
+    prefixed twins (field_prefix="fb_"). `outcome` is already resolved by
+    the caller (pre-edit-chain.sh's own `outcome=`, or newfile-nudge.sh's
+    `fb_outcome=`) -- always "search-fallback" or "search-fallback-empty",
+    the caller's own gate before calling this. Never raises on a
+    malformed/missing field (a non-digit `hits=`, an empty `ids=`) --
+    this is a best-effort report over a log a human or a broken host
+    could have written anything into, same fail-open discipline every
+    other hook.log reader in this file already holds.
+
+    MAJOR fix-round item d: `fb_ms=` is read UNPREFIXED regardless of
+    `field_prefix` -- both hooks now spell it identically (see hooks/
+    pre-edit-chain.sh and hooks/newfile-nudge.sh's own comments), unlike
+    the pre-existing `elapsed=`/`fb_`-split every OTHER field here still
+    needs (that field keeps its own 1-second-floor, whole-hook-run
+    meaning; `fb_ms=` is this channel's own, millisecond-resolution,
+    search-subprocess-only timing). Present ONLY on a line where the
+    search subprocess actually ran -- both hooks' own no-query/store-root
+    early exits never set it -- so `fallback_ms`'s own pool below is
+    "subprocess ran" ONLY by construction, never by a later filter here."""
     bucket["fallback_outcomes"][outcome] += 1
     mode = fields.get(field_prefix + "mode", "")
     if mode:
@@ -7795,10 +8004,9 @@ def _tally_fallback_fields(bucket: dict, fields: dict, outcome: str, elapsed_fie
         for tid in ids_raw.split(","):
             if tid:
                 bucket["fallback_ids"][tid] += 1
-    if elapsed_field:
-        m = _FALLBACK_ELAPSED_S_RE.match(elapsed_field)
-        if m:
-            bucket["fallback_elapsed_s"].append(int(m.group(1)))
+    ms_raw = fields.get("fb_ms", "")
+    if ms_raw.isascii() and ms_raw.isdigit():
+        bucket["fallback_ms"].append(int(ms_raw))
 
 
 def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
@@ -7977,7 +8185,7 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
             # search-fallback (TOP-0133 L1): outcome IS the fallback
             # outcome on this kind (pre-edit-chain.sh's own finish()).
             if outcome in ("search-fallback", "search-fallback-empty"):
-                _tally_fallback_fields(bucket, fields, outcome, elapsed_field=fields.get("elapsed", ""))
+                _tally_fallback_fields(bucket, fields, outcome)
         elif kind == "newfile-nudge":
             # search-fallback (TOP-0133 L1): the OUTCOME here is always
             # "nudged" (or one of this hook's other, unrelated outcomes) --
@@ -8180,9 +8388,13 @@ def _stats_report(
         for tid, count in sorted(b["fallback_ids"].items(), key=lambda kv: (-kv[1], kv[0]))[:5]
     ]
     fb_modes_seen = dict(b["fallback_modes"])
-    fb_elapsed = sorted(b["fallback_elapsed_s"])
-    fb_elapsed_p50 = _percentile(fb_elapsed, 50)
-    fb_elapsed_p95 = _percentile(fb_elapsed, 95)
+    # MAJOR fix-round item d: fb_ms= (millisecond-resolution, search-
+    # subprocess-only timing -- see _tally_fallback_fields) replaces the
+    # old 1-second-floor `elapsed=` reading, which made p50/p95
+    # meaningless for a call that mostly completes well under a second.
+    fb_ms_sorted = sorted(b["fallback_ms"])
+    fb_ms_p50 = _percentile(fb_ms_sorted, 50)
+    fb_ms_p95 = _percentile(fb_ms_sorted, 95)
 
     flags = []
     if args.project != UNKNOWN_STATS_PROJECT:
@@ -8278,8 +8490,8 @@ def _stats_report(
             "hit_count_distribution": fb_hit_dist,
             "top_ids": fb_top_ids,
             "modes_seen": fb_modes_seen,
-            "elapsed_s_p50": fb_elapsed_p50,
-            "elapsed_s_p95": fb_elapsed_p95,
+            "ms_p50": fb_ms_p50,
+            "ms_p95": fb_ms_p95,
             "outcomes": dict(fb_outcomes),
             "reasons": dict(b["fallback_reasons"]),
         },
@@ -8432,14 +8644,14 @@ def cmd_stats(args) -> int:
         print(f"pre-commit (store append-only guard): pass={pcm['pass']} "
               f"refused={pcm['refused']} skipped={pcm['skipped']}")
         fb = result["fallback"]
-        p50_txt = "n/a" if fb["elapsed_s_p50"] is None else f"{fb['elapsed_s_p50']}s"
-        p95_txt = "n/a" if fb["elapsed_s_p95"] is None else f"{fb['elapsed_s_p95']}s"
+        p50_txt = "n/a" if fb["ms_p50"] is None else f"{fb['ms_p50']}ms"
+        p95_txt = "n/a" if fb["ms_p95"] is None else f"{fb['ms_p95']}ms"
         modes_txt = ", ".join(f"{m}:{c}" for m, c in sorted(fb["modes_seen"].items())) or "(none)"
         reasons_txt = ", ".join(f"{r}:{c}" for r, c in sorted(fb["reasons"].items())) or "(none)"
         top_ids_txt = ", ".join(f"{t['id']}:{t['count']}" for t in fb["top_ids"]) or "(none)"
         print(f"search fallback (pre-edit-chain.sh + newfile-nudge.sh): "
               f"hits={fb['search_fallback']} empty={fb['search_fallback_empty']} "
-              f"(reasons: {reasons_txt}) modes={modes_txt} elapsed p50/p95={p50_txt}/{p95_txt} "
+              f"(reasons: {reasons_txt}) modes={modes_txt} ms p50/p95={p50_txt}/{p95_txt} "
               f"top-ids={top_ids_txt}")
         eb = result["embedding_backlog"]
         rows_txt = "unknown (db unreadable)" if eb["rows_without_fresh_vector"] is None else eb["rows_without_fresh_vector"]
@@ -8588,6 +8800,24 @@ def main(argv=None) -> int:
              "nearest decisions' chains off ONE search call, with no "
              "second `chain`/`for-path` call per hit. Ignored without "
              "--json (chain_text has no plain-text rendering slot).",
+    )
+    p_search.add_argument(
+        "--hydrate-max-bytes", type=int, default=DEFAULT_FALLBACK_MAX_BYTES,
+        help="cap (UTF-8 bytes) on each --hydrate hit's chain_text: the "
+             "active/current link renders in full, older links are added "
+             "newest-first until the cap, then an explicit omission "
+             "marker replaces the rest. Defaults to "
+             "MEMCONTINUUM_FALLBACK_MAX_BYTES or 2000. Ignored without "
+             "--hydrate.",
+    )
+    p_search.add_argument(
+        "--read-only", action="store_true", dest="read_only",
+        help="never open the index for write: a schema behind the current "
+             "generation is refused (state=upgrade-required, reason=index-needs-"
+             "migration) instead of being silently migrated on open. "
+             "Used by the search fallback (hooks/pre-edit-chain.sh, "
+             "hooks/newfile-nudge.sh), which reads the index to answer a "
+             "guess and must never write to it.",
     )
     p_search.set_defaults(func=cmd_search)
 

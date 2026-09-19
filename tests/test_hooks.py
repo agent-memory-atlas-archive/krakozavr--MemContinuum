@@ -859,6 +859,18 @@ class TestQueryLib(unittest.TestCase):
     def test_dedupe_preserves_first_occurrence_order(self):
         self.assertEqual(self._tokens("scan/scan/scan_plan.py"), "scan plan")
 
+    def test_backslash_normalized_as_a_path_separator(self):
+        """MINOR fix-round item: a Windows-style backslash-separated path
+        must tokenize exactly like its forward-slash form -- not glue two
+        segments into one bogus token (the pre-fix bug: `tr` silently
+        dropped an un-escaped `\\` from its match set entirely, leaving
+        `core\\scan` as one unsplit run)."""
+        self.assertEqual(self._tokens(r"src\core\scan\unbound.py"), "scan unbound")
+        self.assertEqual(
+            self._tokens(r"src\core\scan\unbound.py"),
+            self._tokens("src/core/scan/unbound.py"),
+        )
+
     def test_source_path_prefers_cwd_relative(self):
         self.assertEqual(
             self._source_path("/repo/src/core/scan/unbound.py", "/repo", ""),
@@ -1200,6 +1212,47 @@ class TestPreEditChainWorktreeGap(unittest.TestCase):
             outcome_line,
         )
 
+    def test_in_root_worktree_miss_logs_a_clean_query_no_worktree_or_branch_tokens(self):
+        """TESTS item (coordinator fix round): an in-root worktree MISS
+        (mirrors test_in_root_worktree_gets_same_chain_as_main's own
+        fixture, but at a path with no code_ref -- a genuine miss that
+        reaches the search fallback) must query on the path's own words
+        via QUERY_SRC_PATH=WT_REMAPPED, never the raw `.worktrees/feat/`
+        segment or the `wt-in-root` branch name. `src/core/scan/scan_
+        unbound.py` tokenizes to exactly "scan unbound" once `src`/`core`
+        (both generic stems) are dropped and `scan_unbound`'s `_` splits
+        -- asserted as an EXACT match on the logged `q=` field, not merely
+        the absence of "worktrees" (a weaker check a raw-path
+        implementation could still pass by accident)."""
+        in_root_wt = self.repo_a / ".worktrees" / "feat"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "wt-in-root", str(in_root_wt)],
+            cwd=self.repo_a, check=True,
+        )
+        miss_path = in_root_wt / "src" / "core" / "scan" / "scan_unbound.py"
+        miss_path.parent.mkdir(parents=True, exist_ok=True)
+        miss_path.write_text("# unbound\n")
+        proc, _ = run_hook(
+            self._payload(str(miss_path), cwd=str(self.repo_a)),
+            self._env(MEMCONTINUUM_FALLBACK_MODE="fts"),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        outcome_line = self._last_outcome_line(log_text)
+        self.assertNotIn("outcome=worktree-unwired", outcome_line)
+        self.assertNotIn("outcome=worktree-unresolved", outcome_line)
+        self.assertIn("q=scan+unbound", outcome_line)
+        # Scoped to the q= FIELD specifically, not the whole line -- the
+        # line's own `file=` field legitimately carries the real,
+        # absolute edited path (`.worktrees/feat/...` included, exactly
+        # as it should); this checks that the QUERY built off that path
+        # -- not the raw path itself -- is scrubbed of those segments.
+        q_match = re.search(r"\bq=(\S*)", outcome_line)
+        self.assertIsNotNone(q_match, outcome_line)
+        self.assertEqual(q_match.group(1), "scan+unbound")
+        self.assertNotIn("worktrees", q_match.group(1))
+        self.assertNotIn("wt-in-root", q_match.group(1))
+
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestPreEditChainSearchFallback(unittest.TestCase):
@@ -1434,6 +1487,128 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
             ["git", "status", "--short"], cwd=self.store, capture_output=True, text=True, check=True,
         )
         self.assertEqual(status.stdout.strip(), "", "the store must never be written by the fallback")
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_search_crash_names_search_failed_rc_not_no_hits(self):
+        """MAJOR fix-round item b, pinning: a `search` subprocess that
+        exits non-zero with NOTHING on stdout (a genuine crash, not a
+        JSON refusal envelope) used to collapse into `reason=no-hits`
+        (the old gate only ran the reason parser when stdout was
+        non-empty) -- now names `reason=search-failed rc=N`."""
+        wrapper = memidx_wrapper_python(
+            self.tmp, "crash-search",
+            'if sys.argv[1:2] == ["search"]:\n'
+            '    sys.exit(7)\n',
+        )
+        target = str(self.repo / "src" / "needle.py")
+        proc, _ = run_hook(self._payload(target), self._env(MEMCONTINUUM_PYTHON=str(wrapper)))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback-empty", line)
+        self.assertIn("reason=search-failed rc=7", line)
+        self.assertNotIn("reason=no-hits", line)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_flock_held_state_write_still_emits_exactly_one_json_document(self):
+        """BLOCKER, pinning: hold the session-state file's own flock in
+        THIS test process (mc_update_state_json's own lock, hooks/
+        memlib.sh) so the hook's locked state write blocks -- stdout
+        must still carry EXACTLY ONE JSON document (the additionalContext
+        envelope, printed LAST, after the state write gives up per its
+        own non-blocking-retry deadline) never two (an interleaved
+        partial write) and never zero."""
+        session_id = "sess-flock-1"
+        state_dir = Path(self.memtool_home) / "sessions" / self.project
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_file = state_dir / f"{session_id}.json"
+        state_file.write_text("{}")
+        lock_file = state_dir / f"{session_id}.json.lock"
+        lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            target = str(self.repo / "src" / "needle.py")
+            proc, elapsed = run_hook(
+                self._payload(target, session_id=session_id), self._env(), timeout=8.0,
+            )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        stdout = proc.stdout.strip()
+        self.assertTrue(stdout, "expected an additionalContext envelope even under a held lock")
+        # Exactly one JSON document: json.loads succeeds on the WHOLE
+        # stdout, and there is exactly one line (a second, interleaved
+        # document would either fail to parse as one object or leave a
+        # second `{` on a later line).
+        parsed = json.loads(stdout)
+        self.assertIn("hookSpecificOutput", parsed)
+        self.assertEqual(len(stdout.splitlines()), 1, stdout)
+        # Accepted: mc_update_state_json's own 2.0s non-blocking-retry
+        # deadline may lose the race against a lock held for the whole
+        # hook run -- the state write itself then logs its own
+        # lock-timeout/lock-open-failed diagnostic (hooks/memlib.sh,
+        # exit 97/98) separately, or is silently skipped by this hook's
+        # own `|| true` -- either way, nobody should "fix" that by
+        # reordering stdout again; the property this test pins is ONE
+        # document on stdout, not that the state write always succeeds.
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_ten_identical_misses_dedup_to_two_state_entries(self):
+        """MAJOR fix-round item e, pinning: the SAME miss (one file, one
+        hit id) run 10 times must leave exactly ONE entry for that
+        (file, id) pair in session state, not 10 -- and running it
+        against a SECOND file adds exactly one more (2 total), not 11."""
+        session_id = "sess-dedup-1"
+        target_a = str(self.repo / "src" / "needle.py")
+        for _ in range(10):
+            proc, _ = run_hook(self._payload(target_a, session_id=session_id), self._env())
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        target_b = str(self.repo / "src" / "needle_utils.py")
+        proc, _ = run_hook(self._payload(target_b, session_id=session_id), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        state_file = Path(self.memtool_home) / "sessions" / self.project / f"{session_id}.json"
+        state = json.loads(state_file.read_text())
+        fallbacks = state.get("search_fallbacks")
+        self.assertEqual(len(fallbacks), 2, fallbacks)
+        files = sorted(f["file"] for f in fallbacks)
+        self.assertEqual(files, sorted([target_a, target_b]))
+
+    def test_hybrid_envelope_dict_shape_is_parsed_not_treated_as_zero_hits(self):
+        """Addendum (PR #21 merged): hybrid `search --json` now ALWAYS
+        wraps hits in `{"results": [...], "fusion": ...}`, never a bare
+        list -- this hook's own JSON parser must read `results` off the
+        dict, not assume a list. `memidx.cmd_search` itself is
+        monkeypatched (via memidx_wrapper_python's body-injection) to
+        print exactly that envelope shape, argv-independent, pinning the
+        PARSING rather than depending on a real embedding model to
+        produce it."""
+        wrapper = memidx_wrapper_python(
+            self.tmp, "envelope-shape-search",
+            'import json as _json\n'
+            'def _fake_cmd_search(args):\n'
+            '    print(_json.dumps({\n'
+            '        "results": [{"id": "TOP-9222", "title": "Envelope shape topic", '
+            '"path": "x.md", "chain_text": "TOP-9222 chain text here"}],\n'
+            '        "fusion": "rrf",\n'
+            '    }))\n'
+            '    return 0\n'
+            'memidx.cmd_search = _fake_cmd_search\n',
+        )
+        target = str(self.repo / "src" / "envelope.py")
+        proc, _ = run_hook(self._payload(target), self._env(MEMCONTINUUM_PYTHON=str(wrapper)))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("TOP-9222", ctx)
+        self.assertIn("chain text here", ctx)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback ", line)
+        self.assertIn("hits=1", line)
 
 
 class TestF6RenderedTimeout(unittest.TestCase):

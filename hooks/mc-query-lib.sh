@@ -53,6 +53,30 @@
 #     reach the search call at all; how those words rank once they get
 #     there is memidx.py search's own job (deliberately unchanged by this
 #     feature -- see docs/DESIGN.md's search-fallback ruling for why).
+#
+#     Stated limit (MINOR fix-round item, not a bug to fix here): the
+#     lowercasing step (`tr '[:upper:]' '[:lower:]'`) and the length/split
+#     rules above are ASCII-only. A path whose meaningful words are
+#     non-ASCII (Cyrillic, CJK, accented Latin, etc.) is not lowercased,
+#     not camelCase-split, and its "length" is a BYTE count under `${#word}`
+#     in a non-UTF-8 locale (bash 3.2/macOS default `C`/`POSIX` locale
+#     included) -- a short multi-byte word can be dropped as "too short"
+#     or kept as an oversized byte-run depending on the runtime locale.
+#     This channel degrades to "no query" or a partial/garbled one on such
+#     a path rather than crashing; full Unicode-aware tokenization is out
+#     of scope for this feature (see docs/INTERNALS.md's own note).
+#
+# mc_now_ms -- millisecond-epoch timestamp, bash-3.2-safe (no
+# $EPOCHREALTIME, added in bash 5.0). `date +%s%3N` (GNU coreutils) prints
+# 3 zero-padded fractional digits; BSD/macOS `date` has no `%N` at all and
+# prints the literal characters `3N` back -- probed ONCE per process via
+# MC_QUERY_MS_MODE (empty until the first call) rather than re-probing on
+# every timing call a hook makes. The probe result is a plain digit
+# string check (`case ... in *[!0-9]*)`), not a hardcoded GNU-vs-BSD
+# uname branch, so it also degrades correctly on any OTHER date build
+# with partial/no %N support. Falls back to a python one-liner
+# (time.time()) when `date` itself can't do it -- always available here
+# (every caller already requires python for the search subprocess itself).
 
 # MC_QUERY_GENERIC_STEMS -- exact list per TOP-0133 L1's own spec: words that
 # describe "this is code" rather than naming a project-specific concept.
@@ -61,7 +85,7 @@
 # _ext_matches for the same unquoted-on-purpose pattern), checked via a
 # padded `case " $list " in *" $word "*)` substring test so no per-word
 # array/loop is needed to answer "is $word in this list".
-MC_QUERY_GENERIC_STEMS="src lib sources source docs doc test tests spec main index utils util helpers internal app core common base"
+MC_QUERY_GENERIC_STEMS="src lib sources source docs doc test tests spec main index utils util helpers internal app core common base readme package makefile config init setup"
 
 # mc_query_source_path PATH CWD STRIP_PREFIXES
 mc_query_source_path() {
@@ -109,13 +133,25 @@ mc_query_tokens() {
     else
         path="$base"
     fi
-    # Split on / _ - . (rule 2, path half) via `tr`; the camelCase half of
-    # rule 2 (`sed -E`) runs on the ALREADY-space-split text next -- doing
-    # both in one `tr` pass is not possible (tr has no lookaround), and
-    # running sed first (before the path separators are gone) would let
-    # `-E`'s own `.` metacharacter make the camelCase pattern match across
-    # a `/`, which it must never do.
-    words="$(printf '%s' "$path" | tr '/_.-' '    ')"
+    # Split on / \ _ - . (rule 2, path half) via `tr`; the camelCase half
+    # of rule 2 (`sed -E`) runs on the ALREADY-space-split text next --
+    # doing both in one `tr` pass is not possible (tr has no lookaround),
+    # and running sed first (before the path separators are gone) would
+    # let `-E`'s own `.` metacharacter make the camelCase pattern match
+    # across a `/`, which it must never do. MINOR fix-round item: `\` is
+    # normalized as a separator too -- a Windows-style path (a payload
+    # from a Windows checkout, or a query string authored with `\`
+    # literally) tokenizes exactly like its `/`-separated form instead of
+    # gluing two path segments into one bogus token. `\` is escaped as
+    # `\\` in tr's SET1 -- GNU/BSD tr both treat a bare, un-escaped `\`
+    # before a non-escape character (e.g. `\_`) as consuming the
+    # backslash without actually adding it to the match set (verified:
+    # `tr '/\_.-' ...` left `\` unmatched in an embedded-backslash
+    # fixture); `\\` is the one spelling that reliably means "match one
+    # literal backslash" on both. `-` stays LAST in the set (never
+    # adjacent to another literal after escape resolution), so it can
+    # never be misread as a `X-Y` range.
+    words="$(printf '%s' "$path" | tr '/\\_.-' '     ')"
     words="$(printf '%s' "$words" | sed -E 's/([a-z0-9])([A-Z])/\1 \2/g')"
     lower="$(printf '%s' "$words" | tr '[:upper:]' '[:lower:]')"
     for word in $lower; do
@@ -127,4 +163,26 @@ mc_query_tokens() {
         [ "$count" -ge 12 ] && break
     done
     printf '%s' "$out"
+}
+
+# MC_QUERY_MS_MODE -- "date" | "python", empty until mc_now_ms's first
+# call (per-process probe cache, see the header comment above).
+MC_QUERY_MS_MODE=""
+
+# mc_now_ms [PYTHON_INTERPRETER] -- millisecond-epoch on stdout. See the
+# file header comment for the GNU-%3N-vs-BSD-no-%N probe this caches.
+mc_now_ms() {
+    local py="${1:-python3}" probe
+    if [ -z "$MC_QUERY_MS_MODE" ]; then
+        probe="$(date +%3N 2>/dev/null)"
+        case "$probe" in
+            [0-9][0-9][0-9]) MC_QUERY_MS_MODE="date" ;;
+            *) MC_QUERY_MS_MODE="python" ;;
+        esac
+    fi
+    if [ "$MC_QUERY_MS_MODE" = "date" ]; then
+        date +%s%3N 2>/dev/null
+    else
+        PYTHONPATH= "$py" -c 'import time; print(int(time.time() * 1000))' 2>/dev/null
+    fi
 }

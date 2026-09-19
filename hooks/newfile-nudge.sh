@@ -662,6 +662,12 @@ if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
     mc_path_under_root "$FILE_PATH" "$MEMCONTINUUM_ROOT"
     if [ $? -eq 0 ]; then
         SKIP_FALLBACK=1
+        # MINOR fix-round item: this skip used to log nothing at all --
+        # pre-edit-chain.sh's own identical store-root skip already names
+        # itself (`search-fallback-empty reason=store-root`); this hook's
+        # own fb_* fields now match it so memidx.py stats' fallback tally
+        # sees every skip reason on both hooks, not a silent gap on this one.
+        FB_EXTRA="fb_outcome=search-fallback-empty fb_reason=store-root"
     fi
 fi
 
@@ -698,6 +704,8 @@ print(d.get("cwd", "") or "")
         FB_QUERY_LOGGED="${FB_QUERY// /+}"
         FB_JSON_RAW=""
         FB_RC=1
+        FB_RAN=0
+        FB_MS=""
         # Unlike pre-edit-chain.sh (which never reaches its own fallback
         # without an already-confirmed-present db, see its own header),
         # this hook has no earlier index check -- a brand-new project with
@@ -705,42 +713,89 @@ print(d.get("cwd", "") or "")
         # in. Skip the `search` call ENTIRELY when the db file plainly
         # does not exist: there is nothing it could find, and calling it
         # anyway would spawn python only to print `search: the decision
-        # index is missing ...` on stderr, which `2>>"$LOG"` below would
-        # otherwise fold into hook.log as a stray, untimestamped extra
-        # line -- breaking this hook's one-line-per-invocation contract
-        # for no benefit (the "search-fallback-empty reason=no-hits"
-        # outcome already says everything that stray line would have).
+        # index is missing ...` on stderr -- routed to /dev/null below
+        # either way now (MINOR fix-round item: never hook.log), but
+        # skipping the whole subprocess for a db that plainly does not
+        # exist still saves the spawn for no loss (the "search-fallback-
+        # empty reason=missing" outcome below says the same thing).
+        # `--read-only`/`--root` mirror pre-edit-chain.sh's own fallback
+        # call exactly (MAJOR fix-round items a/b): this channel reads the
+        # index to answer a guess, never migrates or writes it, and a
+        # stale store is now visible instead of silently swallowed.
         if [ -f "$FB_DB_PATH" ]; then
-            FB_ARGS=(search "$FB_QUERY" --mode "$FB_MODE" --project "$PROJECT" --db "$FB_DB_PATH" --limit 2 --json --hydrate)
-            FB_JSON_RAW="$(PYTHONPATH= "$PY" "$FB_MEMIDX" "${FB_ARGS[@]}" 2>>"$LOG")"
+            FB_ARGS=(search "$FB_QUERY" --mode "$FB_MODE" --project "$PROJECT" --db "$FB_DB_PATH" --limit 2 --json --hydrate --read-only)
+            if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+                FB_ARGS+=(--root "$MEMCONTINUUM_ROOT")
+            fi
+            # fb_ms (MAJOR fix-round item d): see pre-edit-chain.sh's
+            # identical comment -- millisecond timing of this subprocess
+            # call only, via mc_now_ms (hooks/mc-query-lib.sh); never set
+            # (and never logged) when the call above is skipped entirely.
+            FB_MS_T0="$(mc_now_ms "$PY")"
+            FB_JSON_RAW="$(PYTHONPATH= "$PY" "$FB_MEMIDX" "${FB_ARGS[@]}" 2>/dev/null)"
             FB_RC=$?
+            FB_RAN=1
+            FB_MS_T1="$(mc_now_ms "$PY")"
+            case "$FB_MS_T0$FB_MS_T1" in
+                *[!0-9]*|"") ;;
+                *) FB_MS=$((FB_MS_T1 - FB_MS_T0)); [ "$FB_MS" -lt 0 ] && FB_MS=0 ;;
+            esac
         fi
         FB_HITS=""
         FB_IDS=""
         FB_LABEL_AND_CHAINS=""
         FB_HITS_FOR_STATE=""
-        if [ $FB_RC -eq 0 ] && [ -n "$FB_JSON_RAW" ]; then
+        FB_REASON=""
+        # MAJOR fix-round item b: see pre-edit-chain.sh's identical parser
+        # for the full reason-vocabulary rationale -- runs whenever EITHER
+        # something reached stdout OR the subprocess ACTUALLY RAN and
+        # exited non-zero (FB_RAN, not FB_RC alone: this hook's own
+        # db-missing skip above never runs the subprocess at all and
+        # must NOT be reported as "search-failed rc=1" -- it degrades to
+        # the ordinary "no-hits" default below, same as before this fix).
+        FB_SHOULD_PARSE=0
+        [ -n "$FB_JSON_RAW" ] && FB_SHOULD_PARSE=1
+        [ "$FB_RAN" = "1" ] && [ "$FB_RC" -ne 0 ] && FB_SHOULD_PARSE=1
+        if [ "$FB_SHOULD_PARSE" = "1" ]; then
             export HOOK_FB_LABEL='No recorded decision binds this file. Nearest by search -- may be unrelated:'
+            export MC_FB_RC="$FB_RC"
             {
                 IFS= read -r -d '' FB_HITS
                 IFS= read -r -d '' FB_IDS
                 IFS= read -r -d '' FB_LABEL_AND_CHAINS
                 IFS= read -r -d '' FB_HITS_FOR_STATE
+                IFS= read -r -d '' FB_REASON
             } < <(printf '%s' "$FB_JSON_RAW" | PYTHONPATH= "$PY" -c '
 import json, os, sys
 
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    d = None
-if isinstance(d, dict):
-    hits = d.get("results", [])
-elif isinstance(d, list):
-    hits = d
+rc = int(os.environ.get("MC_FB_RC", "1") or "1")
+raw = sys.stdin.read()
+
+d = None
+if raw:
+    try:
+        d = json.loads(raw)
+    except Exception:
+        d = None
+
+hits = []
+state = None
+reason = ""
+if rc != 0:
+    if isinstance(d, dict):
+        reason = d.get("reason") or d.get("state") or ""
+    if not reason:
+        reason = f"search-failed rc={rc}"
+elif d is None:
+    reason = "bad-json"
 else:
-    hits = []
-if not isinstance(hits, list):
-    hits = []
+    if isinstance(d, dict):
+        state = d.get("state")
+        hits = d.get("results", [])
+    elif isinstance(d, list):
+        hits = d
+    if not isinstance(hits, list):
+        hits = []
 
 label = os.environ.get("HOOK_FB_LABEL", "")
 chain_texts = []
@@ -757,25 +812,37 @@ for h in hits:
     chain_texts.append(ct)
     for_state.append({"id": hid, "title": str(h.get("title", "") or "")})
 
+if not chain_texts and not reason:
+    reason = state if state in ("quarantined", "stale") else "no-hits"
+
 if not chain_texts:
-    fields = ("0", "", "", "")
+    fields = ("0", "", "", "", reason)
 else:
     fields = (
         str(len(chain_texts)), ",".join(ids),
-        label + "\n\n" + "\n\n".join(chain_texts), json.dumps(for_state),
+        label + "\n\n" + "\n\n".join(chain_texts), json.dumps(for_state), "",
     )
 
 for field in fields:
     sys.stdout.write(field.replace(chr(0), ""))
     sys.stdout.write(chr(0))
-' 2>>"$LOG")
+' 2>/dev/null)
         fi
+        FB_MS_PART=""
+        [ -n "$FB_MS" ] && FB_MS_PART=" fb_ms=$FB_MS"
         if [ -z "$FB_HITS" ] || [ "$FB_HITS" = "0" ]; then
-            FB_EXTRA="fb_outcome=search-fallback-empty fb_reason=no-hits fb_mode=$FB_MODE fb_q=$FB_QUERY_LOGGED"
+            [ -z "$FB_REASON" ] && FB_REASON="no-hits"
+            FB_EXTRA="fb_outcome=search-fallback-empty fb_reason=$FB_REASON fb_mode=$FB_MODE fb_q=$FB_QUERY_LOGGED$FB_MS_PART"
         else
-            MESSAGE="${MESSAGE}
-${FB_LABEL_AND_CHAINS}"
-            FB_EXTRA="fb_outcome=search-fallback fb_hits=$FB_HITS fb_ids=$FB_IDS fb_mode=$FB_MODE fb_q=$FB_QUERY_LOGGED"
+            # MINOR fix-round item (label-glue unification): a blank line
+            # between the ordinary nudge message and the fallback's own
+            # label+chains block, matching the double-newline separator
+            # style pre-edit-chain.sh's additionalContext already uses
+            # throughout (label to chain_text, chain_text to chain_text) --
+            # the old single-newline join here was the one place this
+            # feature glued two blocks together differently.
+            MESSAGE="${MESSAGE}"$'\n\n'"${FB_LABEL_AND_CHAINS}"
+            FB_EXTRA="fb_outcome=search-fallback fb_hits=$FB_HITS fb_ids=$FB_IDS fb_mode=$FB_MODE fb_q=$FB_QUERY_LOGGED$FB_MS_PART"
 
             # Session-state title storage (docs/INTERNALS.md "search
             # fallback"): same mechanism, same `search_fallbacks` state key
@@ -820,13 +887,28 @@ if not isinstance(existing, list):
     existing = []
 
 fb_file = os.environ.get("MC_FB_FILE", "")
+
+# MAJOR fix-round item e: same dedup-by-(file, id) as pre-edit-chain.sh
+# own identical state write -- see that file own comment for the full
+# rationale. Both hooks share this one `search_fallbacks` state key, so
+# both need the same dedup rule or a mix of the two hooks firing on the
+# same file/id would still double up.
+new_keys = set()
+for h in new_hits:
+    if isinstance(h, dict):
+        new_keys.add((fb_file, str(h.get("id", ""))))
+existing = [
+    e for e in existing
+    if not (isinstance(e, dict) and (e.get("file"), e.get("id")) in new_keys)
+]
 for h in new_hits:
     if not isinstance(h, dict):
         continue
+    title = str(h.get("title", "") or "")[:120]
     existing.append({
         "file": fb_file,
         "id": str(h.get("id", "")),
-        "title": str(h.get("title", "")),
+        "title": title,
         "hook": "newfile-nudge",
     })
 state["search_fallbacks"] = existing[-20:]

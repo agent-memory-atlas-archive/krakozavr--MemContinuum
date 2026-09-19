@@ -122,7 +122,23 @@ MEMIDX="$SCRIPT_DIR/../memidx.py"
 # not sessionend-stamp.sh's tighter 1.2s: one for-path call per candidate,
 # and a miss walks every candidate, so the fuller budget still covers
 # that multi-candidate worst case), so 2s is confirmed by measurement,
-# not assumed. Sourcing this also resolves MEMCONTINUUM_HOME and MC_GUARD_PY
+# not assumed.
+#
+# Fix-round measurement update (search fallback, TOP-0133 L1): a genuine
+# MISS now also runs `memidx.py search --hydrate` on the same budget --
+# measured end to end (hook launch through the search subprocess's own
+# rc) at 0.91-0.96s for hybrid mode (its RRF fusion pays for two ranking
+# passes plus one embedding-model load/query per run; fts mode alone
+# measured well under 0.1s in the same runs, vector mode close to
+# hybrid's own cost). Still comfortably inside the 2s budget, but with
+# far less headroom than the matched-branch measurement above -- a store
+# on a slow drvfs mount (SQLite WAL locking is unreliable there; see this
+# repo's own Windows/WSL environment notes) is the candidate case worth
+# watching, and MEMCONTINUUM_FALLBACK_MODE=fts (docs/INTERNALS.md) is the
+# per-installation escape hatch for it. The shipped default stays hybrid
+# either way -- this is a per-installation override, not a default change;
+# ship on the engine's own default, let real queries decide whether that
+# should move. Sourcing this also resolves MEMCONTINUUM_HOME and MC_GUARD_PY
 # (env -> config.sh -> engine venv), so the duplicate resolution this file
 # used to carry inline is gone -- PY below reads MC_GUARD_PY directly
 # instead of re-deriving it.
@@ -519,11 +535,18 @@ done
 # --- worktree gap: reached ONLY once every existing candidate has already
 # failed for FILE_PATH itself (docs/internal/SESSION-HANDOFF-releases-0.3-
 # to-0.6.md SS"0.2.0 final" item 1) ---------------------------------------
-# pre-edit-chain.sh deliberately never sources hooks/memlib.sh (the
-# mkdir/config.sh/MC_PY cost that would add on every already-a-miss lookup
-# is exactly what this hook's own header explains it exists to avoid) --
-# so the "configured code roots" it can check a remap against are read
-# from MEMCONTINUUM_STRIP_PREFIX instead of mc_code_roots. repo-init.sh
+# THIS block never sources hooks/memlib.sh (the mkdir/config.sh/MC_PY cost
+# that would add on every already-a-miss lookup is exactly what this
+# hook's own header explains it exists to avoid) -- so the "configured
+# code roots" it can check a remap against are read from
+# MEMCONTINUUM_STRIP_PREFIX instead of mc_code_roots. MINOR fix-round
+# correction: this used to say the SCRIPT never sources memlib.sh at all
+# -- no longer true since the search fallback (TOP-0133 L1) added its own
+# session-state write further down, which lazily sources memlib.sh ONLY
+# on that already-rare branch (a genuine miss AND at least one search
+# hit) -- see that branch's own comment. This worktree-gap block, reached
+# on every miss regardless of what the fallback later does, still pays
+# nothing extra. repo-init.sh
 # renders exactly ONE STRIP_PREFIX entry per invocation (= the single code
 # root that invocation's settings.json "if" filter is already scoped to,
 # templates/code-root-filter-pair.json.tmpl), so this is a faithful reading
@@ -680,12 +703,43 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     # `for-path` call away the same way) -- `--hydrate` carries each hit's
     # own chain_text in the same JSON envelope, so no separate `chain`
     # call per hit. `--limit 2`, no `--status`/`--authority` filter (the
-    # engine's own defaults apply). Never `--root`: a stale-index warning
-    # on stderr here would be noise -- staleness is for-path's own concern
-    # above, already surfaced (index-stale-served) on the match path.
-    FB_ARGS=(search "$FALLBACK_QUERY" --mode "$FALLBACK_MODE" --project "$PROJECT" --db "$DB_PATH" --limit 2 --json --hydrate)
-    FALLBACK_JSON="$(PYTHONPATH= "$PY" "$MEMIDX" "${FB_ARGS[@]}" 2>>"$LOG")"
+    # engine's own defaults apply). `--read-only` (MAJOR fix-round item a):
+    # this channel reads the index to answer a guess, never writes to it --
+    # a legacy/unmigrated schema is refused by name (state=upgrade-required,
+    # reason=index-needs-migration) instead of being silently migrated on
+    # open, which the pre-fix-round `open_db_noncreating` path did. `--root`
+    # is now passed WHEN KNOWN (MAJOR item b: staleness must be visible,
+    # not swallowed) -- the old "never --root, it'd be noise" comment
+    # covered a real concern (index-stale-served already reports staleness
+    # on the MATCH path above) but left the FALLBACK path unable to tell a
+    # genuinely current miss from a stale one; `_decision_warn`'s own
+    # stderr line for it is discarded below same as every other subprocess
+    # stderr (MINOR item: routed to /dev/null, never hook.log).
+    FB_ARGS=(search "$FALLBACK_QUERY" --mode "$FALLBACK_MODE" --project "$PROJECT" --db "$DB_PATH" --limit 2 --json --hydrate --read-only)
+    if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+        FB_ARGS+=(--root "$MEMCONTINUUM_ROOT")
+    fi
+    # fb_ms (MAJOR fix-round item d): millisecond-resolution timing of the
+    # search subprocess itself -- `elapsed=`'s 1-second `date +%s` floor
+    # made p50/p95 meaningless (a bounded-under-a-second call rounds to
+    # "0s" or "1s" depending only on which side of a tick boundary it
+    # started). mc_now_ms is bash-3.2-safe (see hooks/mc-query-lib.sh).
+    # Measured only around THIS call, on purpose: it is the one variable-
+    # cost step in this branch (hybrid mode's model load/embed), and
+    # timing it around the query-build/state-write steps too would just
+    # add noise from unrelated I/O. Emitted only past this point, so a
+    # `no-query`/`store-root` early-exit above (finish already called)
+    # never contributes an fb_ms sample -- stats' own p50/p95 pool is
+    # this-subprocess-ran-only by construction, not by a later filter.
+    FB_MS_T0="$(mc_now_ms "$PY")"
+    FALLBACK_JSON="$(PYTHONPATH= "$PY" "$MEMIDX" "${FB_ARGS[@]}" 2>/dev/null)"
     FALLBACK_RC=$?
+    FB_MS_T1="$(mc_now_ms "$PY")"
+    FB_MS=""
+    case "$FB_MS_T0$FB_MS_T1" in
+        *[!0-9]*|"") ;;
+        *) FB_MS=$((FB_MS_T1 - FB_MS_T0)); [ "$FB_MS" -lt 0 ] && FB_MS=0 ;;
+    esac
 
     # Query encoding for the log line (item 5): `_hook_log_fields`
     # (memidx.py stats) splits on whitespace with no quote-awareness --
@@ -693,32 +747,64 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     # the rest as bogus bare tokens. `+`-joined survives untouched.
     FALLBACK_QUERY_LOGGED="${FALLBACK_QUERY// /+}"
 
+    # MAJOR fix-round item b: every non-zero/bad outcome used to collapse
+    # into the same `reason=no-hits` -- this parser now runs regardless of
+    # FALLBACK_RC (as long as SOMETHING reached stdout: `--json` refusal
+    # envelopes from `_decision_reply`/the new `--read-only` early-refusal
+    # branch print on stdout even at rc=1), and computes ITS OWN reason:
+    # `search-failed rc=N` (a crash, or output the refusal shape doesn't
+    # recognize), `bad-json` (rc=0 but stdout didn't parse), or a state
+    # name lifted straight off the envelope (`missing`/`uninitialized`/
+    # `index-needs-migration`/`quarantined`/`stale`) -- one place decides
+    # the reason vocabulary, not a second bash-side re-derivation of it.
     FB_HITS=""
     FB_IDS=""
     FB_JSON=""
-    if [ $FALLBACK_RC -eq 0 ] && [ -n "$FALLBACK_JSON" ]; then
-        export HOOK_FB_LABEL='No recorded decision binds this file. Nearest by search -- may be unrelated:'
+    FB_REASON=""
+    export HOOK_FB_LABEL='No recorded decision binds this file. Nearest by search -- may be unrelated:'
+    export MC_FB_RC="$FALLBACK_RC"
+    # Runs whenever EITHER something reached stdout OR the subprocess
+    # exited non-zero -- a genuine crash (rc != 0, nothing on stdout at
+    # all) still needs `reason=search-failed rc=N` named, not silently
+    # defaulting to "no-hits" the way gating on stdout alone would.
+    if [ -n "$FALLBACK_JSON" ] || [ "$FALLBACK_RC" -ne 0 ]; then
         {
             IFS= read -r -d '' FB_HITS
             IFS= read -r -d '' FB_IDS
             IFS= read -r -d '' FB_JSON
             IFS= read -r -d '' FB_HITS_FOR_STATE
+            IFS= read -r -d '' FB_REASON
         } < <(printf '%s' "$FALLBACK_JSON" | PYTHONPATH= "$PY" -c '
 import json, os, sys
 
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    d = None
+rc = int(os.environ.get("MC_FB_RC", "1") or "1")
+raw = sys.stdin.read()
 
-if isinstance(d, dict):
-    hits = d.get("results", [])
-elif isinstance(d, list):
-    hits = d
+d = None
+if raw:
+    try:
+        d = json.loads(raw)
+    except Exception:
+        d = None
+
+hits = []
+state = None
+reason = ""
+if rc != 0:
+    if isinstance(d, dict):
+        reason = d.get("reason") or d.get("state") or ""
+    if not reason:
+        reason = f"search-failed rc={rc}"
+elif d is None:
+    reason = "bad-json"
 else:
-    hits = []
-if not isinstance(hits, list):
-    hits = []
+    if isinstance(d, dict):
+        state = d.get("state")
+        hits = d.get("results", [])
+    elif isinstance(d, list):
+        hits = d
+    if not isinstance(hits, list):
+        hits = []
 
 label = os.environ.get("HOOK_FB_LABEL", "")
 chain_texts = []
@@ -735,8 +821,11 @@ for h in hits:
     chain_texts.append(ct)
     for_state.append({"id": hid, "title": str(h.get("title", "") or "")})
 
+if not chain_texts and not reason:
+    reason = state if state in ("quarantined", "stale") else "no-hits"
+
 if not chain_texts:
-    fields = ("0", "", "", "")
+    fields = ("0", "", "", "", reason)
 else:
     ctx = label + "\n\n" + "\n\n".join(chain_texts)
     envelope = json.dumps({
@@ -745,20 +834,37 @@ else:
             "additionalContext": ctx,
         }
     })
-    fields = (str(len(chain_texts)), ",".join(ids), envelope, json.dumps(for_state))
+    fields = (str(len(chain_texts)), ",".join(ids), envelope, json.dumps(for_state), "")
 
 for field in fields:
     sys.stdout.write(field.replace(chr(0), ""))
     sys.stdout.write(chr(0))
-' 2>>"$LOG")
+' 2>/dev/null)
     fi
+
+    FB_MS_PART=""
+    [ -n "$FB_MS" ] && FB_MS_PART=" fb_ms=$FB_MS"
 
     if [ -z "$FB_HITS" ] || [ "$FB_HITS" = "0" ]; then
-        finish "search-fallback-empty" "reason=no-hits mode=$FALLBACK_MODE q=$FALLBACK_QUERY_LOGGED"
+        [ -z "$FB_REASON" ] && FB_REASON="no-hits"
+        finish "search-fallback-empty" "reason=$FB_REASON mode=$FALLBACK_MODE q=$FALLBACK_QUERY_LOGGED$FB_MS_PART"
     fi
 
-    printf '%s\n' "$FB_JSON"
-
+    # BLOCKER fix-round item: stdout (the additionalContext envelope) used
+    # to print HERE, before the locked session-state write below --
+    # mc_update_state_json's own flock has up to a 2.0s non-blocking-retry
+    # deadline (hooks/memlib.sh), which the SAME 2s MC_WATCHDOG_TIMEOUT_
+    # FALLBACK budget this hook runs under can lose the race against. A
+    # watchdog kill mid-write left TWO documents on stdout (this one,
+    # already flushed, plus the watchdog's own timeout envelope) or lost
+    # this one entirely depending on exactly where the kill landed --
+    # either way, not the "one JSON document on stdout" contract this
+    # script's own header promises. Emitting stdout LAST, after every
+    # potentially-blocking write below, mirrors hooks/newfile-nudge.sh's
+    # own pre-existing order (that hook's reminder text was always
+    # assembled before ITS OWN state write, for the same reason) -- see
+    # the flock-holding fixture test in tests/test_hooks.py pinning this.
+    #
     # Session-state title storage (docs/INTERNALS.md "search fallback"):
     # hook.log's own `ids=` field carries no title (item 5's field list is
     # fixed) -- the look-back block (hooks/userprompt-remind.sh) needs a
@@ -814,13 +920,31 @@ if not isinstance(existing, list):
     existing = []
 
 fb_file = os.environ.get("MC_FB_FILE", "")
+
+# MAJOR fix-round item e: dedup keyed on (file, id) -- ten identical
+# misses on the same file used to append ten near-duplicate entries
+# (title only, no de-dup), which then repeated the SAME decision up to
+# four times in the look-back own last-8 window (hooks/userprompt-
+# remind.sh). A repeat (file, id) pair is removed from its OLD position
+# and re-appended with a freshly-truncated title, so the look-back
+# "most recent" ordering reflects when it was last surfaced, not merely
+# first seen -- not a second, growing entry.
+new_keys = set()
+for h in new_hits:
+    if isinstance(h, dict):
+        new_keys.add((fb_file, str(h.get("id", ""))))
+existing = [
+    e for e in existing
+    if not (isinstance(e, dict) and (e.get("file"), e.get("id")) in new_keys)
+]
 for h in new_hits:
     if not isinstance(h, dict):
         continue
+    title = str(h.get("title", "") or "")[:120]
     existing.append({
         "file": fb_file,
         "id": str(h.get("id", "")),
-        "title": str(h.get("title", "")),
+        "title": title,
         "hook": "pre-edit-chain",
     })
 state["search_fallbacks"] = existing[-20:]
@@ -828,7 +952,12 @@ print(json.dumps(state))
 ' >>"$MC_LOG" 2>&1 || true
     fi
 
-    finish "search-fallback" "hits=$FB_HITS ids=$FB_IDS mode=$FALLBACK_MODE q=$FALLBACK_QUERY_LOGGED"
+    # BLOCKER fix-round item (continued): stdout emitted HERE -- strictly
+    # after the locked state write above -- see this branch's own comment
+    # a few lines up for the full rationale.
+    printf '%s\n' "$FB_JSON"
+
+    finish "search-fallback" "hits=$FB_HITS ids=$FB_IDS mode=$FALLBACK_MODE q=$FALLBACK_QUERY_LOGGED$FB_MS_PART"
 fi
 
 TOPIC_COUNT="$MATCHED_TOPIC_COUNT"
