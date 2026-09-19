@@ -490,6 +490,53 @@ def lint_file(
     return errors, warnings + more_warnings
 
 
+# INC-0127: thirteen records (five incidents, two topics, six
+# investigations) were committed with no opening `---` -- some also with
+# no closing one. `parse_record_text` treats anything not starting with
+# `---` as a plain note with empty frontmatter (a deliberate, legitimate
+# shape for `sources/`, `inbox/`, and the store README): valid=True,
+# no diagnostics, so lint_file's normal path never sees a problem, the
+# append-only guard's `_is_topic_like` gate skips it (no `links`, no
+# `type: topic`), and memidx never types it as its real kind. Nothing
+# anywhere printed a line. Directory membership -- never raw-text
+# canonicity guessing -- decides this: a file physically filed under
+# `topics/`, `incidents/`, or `investigations/` is asserting its kind by
+# LOCATION, and either fence problem there is an ERROR naming the file,
+# independent of whether its content also happens to look canonical.
+_FENCE_REQUIRED_DIRS = frozenset({"topics", "incidents", "investigations"})
+
+
+def _fence_error(root: Path, path: Path) -> str | None:
+    try:
+        rel_parts = path.relative_to(root).parts
+    except ValueError:
+        rel_parts = path.parts
+    if not rel_parts or rel_parts[0] not in _FENCE_REQUIRED_DIRS:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        # Unreadable/non-UTF-8 is already reported by parse_record's own
+        # diagnostic (lint_file's `if not result.valid` branch) -- never a
+        # second error for the same file here.
+        return None
+    if not text.startswith("---"):
+        return (
+            f"{path}: missing opening frontmatter fence (the file's first line "
+            f"must be exactly \"---\") -- a record under {rel_parts[0]}/ that is "
+            "not fenced silently parses as an empty note: no schema check, no "
+            "append-only protection, no correct type in the index (INC-0127)"
+        )
+    for line in text.splitlines()[1:]:
+        if line.rstrip() == "---":
+            return None
+    return (
+        f"{path}: frontmatter has no closing fence (a lone \"---\" line to end "
+        f"the block) -- a record under {rel_parts[0]}/ with an unterminated "
+        "block is not reliably parsed (INC-0127)"
+    )
+
+
 def _duplicate_claim_errors(root: Path) -> list[str]:
     """docs/SCHEMA.md.1 addendum SS4 extension: two concepts must never
     both claim the same implemented_by "path#symbol" -- that's not two
@@ -535,7 +582,15 @@ def lint_root(root: Path, code_roots: list[Path] | None = None) -> tuple[list[st
     known_topic_ids: set[str] = set()
     id_owners: dict[str, list[Path]] = {}
     stem_owners: dict[str, list[Path]] = {}
+    fence_errors: list[str] = []
     for f in sorted(walk_markdown(root)):
+        # INC-0127: independent of parse validity -- a fence problem is
+        # exactly what leaves parse_record reporting "valid, empty, no
+        # diagnostics" in the first place, so it must not be gated behind
+        # the `if not result.valid: continue` below.
+        fence_error = _fence_error(root, f)
+        if fence_error is not None:
+            fence_errors.append(fence_error)
         result = parse_record(f)
         if not result.valid:
             continue
@@ -556,7 +611,7 @@ def lint_root(root: Path, code_roots: list[Path] | None = None) -> tuple[list[st
             # inbox/*/README.md colliding is the normal state of the tree.
             stem_owners.setdefault(f.stem, []).append(f)
 
-    all_errors: list[str] = []
+    all_errors: list[str] = list(fence_errors)
     all_warnings: list[str] = []
     for f in sorted(walk_markdown(root)):
         errors, warnings = lint_file(f, code_roots, known_topic_ids=known_topic_ids)
@@ -1565,20 +1620,30 @@ def _link_raw_spans(text: str, parsed_links: list) -> dict[str, str] | None:
     regexing an id back out of the raw text -- immune to quoting, key
     order, and (YAML always preserves list order) reordering.
 
+    A trailing space after `links:` (`.rstrip()`, not `.rstrip("\\n")`) and
+    a `#`-comment line at any indent (attributed to whichever span is
+    already open, never mistaken for the first content line, an item
+    marker, or a boundary) are both tolerated -- PR #22 gate finding
+    (MAJOR, both reviewers): either used to bail the WHOLE FILE to a NOTE,
+    permanently turning the byte layer off for every link in it, on a
+    perfectly valid YAML shape.
+
     Returns None -- "cannot safely say", never "unchanged" -- whenever the
     structure will not support that positional zip with confidence:
       * no top-level `links:` key on its own line (frontmatter missing,
         or `links` written as an inline flow list -- no real store file
         does this, but this function must not guess if one someday does)
-      * the first line under it is not a list-item marker (`- `) at some
-        consistent indent
+      * the first real (non-blank, non-comment) line under it is not a
+        list-item marker (`- `) at some consistent indent
       * the number of structurally-found items does not exactly match
         `len(parsed_links)` -- e.g. a REF-side duplicate id that
         `_recovered_old_links` already resolved to one entry still shows
         up as two structural items; rather than guess which structural
         item the surviving parsed entry corresponds to, this bails and
         the caller falls back to parsed-field comparison alone for that
-        file (append-only is still enforced, just not the byte layer)
+        file (append-only is still enforced, just not the byte layer) --
+        this is the one bail-out this fix round did not close; the caller
+        turns it into a NOTE (never silent -- see check_append_only)
       * any parsed link's own `link` id is missing/unhashable, or two
         parsed links resolve to the same id string (would silently drop
         a span otherwise)
@@ -1608,22 +1673,42 @@ def _link_raw_spans(text: str, parsed_links: list) -> dict[str, str] | None:
 
     links_idx = None
     for i, line in enumerate(fm_lines):
-        if line.rstrip("\n") == "links:":
+        # Grok/Opus gate finding (MAJOR): `.rstrip("\n")` alone missed
+        # `links: ` (a trailing space before the newline, a real shape a
+        # hand edit or an editor's trim-on-save can leave) -- a full
+        # `.rstrip()` catches trailing whitespace too, and still refuses a
+        # flow-style `links: [...]` (that line does not become bare
+        # "links:" after stripping), which stays a documented bail-out.
+        if line.rstrip() == "links:":
             links_idx = i
             break
     if links_idx is None:
         return None
 
+    # A comment-only line (any indent) is never structure -- it belongs to
+    # whichever span is already open (or, before the first item, to none
+    # at all) and must never be mistaken for the first real content line,
+    # an item marker, or a top-level-key boundary. Grok/Opus gate finding
+    # (MAJOR): a `# recorded history`-style comment directly under
+    # `links:`, before the first item, used to be read AS that first
+    # line -- its own indent then "detected" a marker of `"# "`, which
+    # never equals `"- "`, so the whole file bailed to a NOTE with the
+    # byte layer silently off for every link in it.
+    def _is_comment_only(line: str) -> bool:
+        return line.lstrip().startswith("#")
+
     # Indent of the item marker itself: PyYAML's default dump renders
     # sequences indentless (marker at the SAME column as `links:`, column
     # 0); the store's own hand/agent-written style indents by 2. Detect it
-    # from whatever the first non-blank line under `links:` actually is,
-    # rather than assuming either convention.
+    # from whatever the first real (non-blank, non-comment) line under
+    # `links:` actually is, rather than assuming either convention.
     first = None
     for i in range(links_idx + 1, len(fm_lines)):
-        if fm_lines[i].strip("\n") != "":
-            first = i
-            break
+        line = fm_lines[i]
+        if line.strip("\n") == "" or _is_comment_only(line):
+            continue
+        first = i
+        break
     if first is None:
         return None
     indent = _leading_spaces(fm_lines[first])
@@ -1635,7 +1720,7 @@ def _link_raw_spans(text: str, parsed_links: list) -> dict[str, str] | None:
     block_end = len(fm_lines)
     for i in range(links_idx + 1, len(fm_lines)):
         line = fm_lines[i]
-        if line.strip("\n") == "":
+        if line.strip("\n") == "" or _is_comment_only(line):
             continue
         ls = _leading_spaces(line)
         if ls < indent:
@@ -1843,9 +1928,33 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         # winner from.
         new_links_by_id = {
             str(l.get("link")): l
-            for l in (new_result.frontmatter.get("links") or [])
+            for l in new_links_full
             if l.get("link") is not None
         }
+
+        # Grok/Opus gate finding (MINOR, both, pre-existing): newest-first
+        # order was never enforced -- a new link inserted BETWEEN two
+        # recorded ones (rather than above all of them) left every old
+        # link's own bytes untouched, so nothing above ever saw it. This
+        # catches only that shape (a new id following an old one in the
+        # new file's own order); it does not police reordering AMONG old
+        # ids themselves, which is a separate, unasked-for check.
+        old_ids = {str(l.get("link")) for l in old_links if l.get("link") is not None}
+        seen_old_id = False
+        for l in new_links_full:
+            nid = l.get("link")
+            if nid is None:
+                continue
+            nid = str(nid)
+            if nid in old_ids:
+                seen_old_id = True
+            elif seen_old_id:
+                errors.append(
+                    f"{full_path}:{nid}: link inserted out of order "
+                    "(append-only; a new link must be added above every "
+                    "previously recorded link, newest-first)"
+                )
+
         for old_link in old_links:
             lid = old_link.get("link")
             if lid is None:
@@ -1870,9 +1979,20 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                 # the plan item's own framing ("a legitimate reformat of
                 # history is refused too -- that is the point") -- rather
                 # than silently trusting a blob our own extractor could
-                # not account for.
+                # not account for. Opus gate finding (MINOR): this is a
+                # DIFFERENT claim from an actual proven byte diff, so it
+                # gets its own, honest message -- the old text ("raw text
+                # changed") asserted something this branch never checked.
                 new_span = new_spans.get(lid) if new_spans is not None else None
-                if new_span is None or _link_bytes_changed(old_spans[lid], new_span):
+                if new_span is None:
+                    errors.append(
+                        f"{full_path}:{lid}: link's span could not be extracted on "
+                        "the new side; treated as changed (append-only; a link "
+                        "recorded at REF must stay byte-verifiable, and a structural "
+                        "extraction failure on the new blob is judged the same as a "
+                        "proven change rather than trusted)"
+                    )
+                elif _link_bytes_changed(old_spans[lid], new_span):
                     errors.append(
                         f"{full_path}:{lid}: link reformatted, not appended "
                         "(append-only; raw text changed after being recorded "
@@ -2037,11 +2157,20 @@ def _run_append_only(root_str: str, ref: str, staged: bool) -> int:
     except Exception as exc:  # never a bare traceback -- spec test (j)/(i)
         print(f"memlint: unexpected failure checking append-only history: {exc}", file=sys.stderr)
         return 2
+    # Grok/Opus gate finding (MAJOR): a NOTE ("could not verify byte-
+    # identity here") used to print to stdout unconditionally and the
+    # summary line carried no count of it -- on a clean (rc=0) run,
+    # hooks/pre-commit-append-only.sh never echoes $OUT at all, so the one
+    # signal that the byte layer was inconclusive for a file reached
+    # nobody. Notes now go to stderr (never treated as an error -- exit
+    # stays 0 for a NOTE, per both reviewers) and the summary line names
+    # how many fired, so a caller that greps the summary (the hook does)
+    # can see it even without capturing stderr separately.
     for n in notes:
-        print(f"NOTE: {n}")
+        print(f"NOTE: {n}", file=sys.stderr)
     for e in errors:
         print(f"ERROR: {e}")
-    print(f"memlint: append-only against {ref}: changed={changed} errors={len(errors)}")
+    print(f"memlint: append-only against {ref}: changed={changed} errors={len(errors)} notes={len(notes)}")
     return 1 if errors else 0
 
 

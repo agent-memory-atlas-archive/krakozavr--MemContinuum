@@ -173,6 +173,12 @@ copied inline.
   canonical record), or a typed field in the wrong shape (`links` not a list of mappings, a link
   missing its `link` id, `ruling`/`rationale`/`invariant` not a mapping, a list field carrying a
   non-scalar) → error naming the file/field; the same on a note (no schema id/links/type) → warning
+- a file under `topics/`, `incidents/`, or `investigations/` whose first line is not exactly `---`,
+  or whose frontmatter block has no closing `---` → error naming the file and the missing fence —
+  directory membership decides this, independent of whether the raw text otherwise looks canonical;
+  without it the file silently parses as an empty note (no schema check, no append-only protection,
+  no correct type anywhere downstream). Notes stay legal and fence-free only under `sources/`,
+  `inbox/`, and the store README, exactly as before.
 
 **A link edited after being recorded is caught too**, in a second, independent
 check: `memlint.py --against-ref REF [--staged] ROOT` compares every topic
@@ -206,15 +212,25 @@ Comparing parsed fields alone leaves one gap: a link regenerated through a
 YAML dumper can preserve every parsed field while its bytes change entirely
 (quoting, key order, wrapping) — invisible to the comparison above. So a
 link present at `REF` also has its RAW BYTES frozen — the exact text span
-from its `- link: L<n>` line through the last line belonging to that list
-item, as it appears in the file — whenever its parsed fields survive
-unchanged; a byte difference there is refused as `<path>:<link>: link
-reformatted, not appended`, the same as any other append-only violation. A
-legitimate reformat of history is refused too — reformatting history is
-what append-only forbids. This adds no new exception: a link whose parsed
+from the item's first line (its own list marker — `- link: L<n>` by hand,
+but a `yaml.safe_dump` re-render starts each item with whichever field
+sorts first, e.g. `- alternatives:` or `- date:`, never necessarily
+`link:`) through the last line belonging to that list item, as it appears
+in the file — whenever its parsed fields survive unchanged; a byte
+difference there is refused as `<path>:<link>: link reformatted, not
+appended`, the same as any other append-only violation. A legitimate
+reformat of history is refused too — reformatting history is what
+append-only forbids. This adds no new exception: a link whose parsed
 fields changed (a valid lifecycle move, or an already-refused edit) is
 judged by the field-level rules above only, never by this byte comparison as
 well.
+
+Newest-first order is enforced too, narrowly: every link new at `REF`+now
+must sort, in the new file, above every link that already existed at `REF`
+— a new link inserted BETWEEN two recorded ones (rather than above all of
+them) is refused as `<path>:<link>: link inserted out of order`, even
+though the old links' own bytes stay untouched. Reordering AMONG links that
+already existed at `REF` is not separately checked.
 
 ---
 

@@ -1061,10 +1061,13 @@ TOPIC_L1_L2 = (
 
 def _run_memlint(args):
     """memlint.main([...]) is a pure function of argv (no subprocess) --
-    this just captures stdout so the caller can assert on the printed
-    ERROR:/summary lines without a subprocess round trip."""
+    this just captures stdout+stderr COMBINED (Grok/Opus gate finding:
+    `--against-ref`'s NOTE: lines print to stderr, everything else still
+    goes to stdout) so the caller can assert on any printed ERROR:/NOTE:/
+    summary line without a subprocess round trip or caring which stream
+    it landed on."""
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         rc = memlint.main(args)
     return rc, buf.getvalue()
 
@@ -1643,15 +1646,14 @@ class TestMemlintAgainstRef(unittest.TestCase):
 
     def test_q_whitespace_only_change_inside_old_link_is_caught(self):
         """Acceptance 4: a single trailing space added inside L1's recorded
-        ruling text. Parsed YAML scalars do not carry a distinction here
-        that matters to `_link_diff_errors` -- wait, they do: a trailing
-        space INSIDE the quoted string changes the parsed string too, so
-        this specific edit is already (correctly) caught as an ordinary
-        `ruling.text` field change. The byte rule's OWN contribution is a
-        change that survives parsing losslessly -- covered by test_o and
-        test_p above; kept here, pinned separately, as the acceptance
-        list's literal (4) so a regression in either mechanism is visible
-        on its own line rather than only through the whole-file case."""
+        link -- OUTSIDE the closing quote of `ruling.text`, so the parsed
+        YAML scalar is UNCHANGED (a bare trailing space after a quoted
+        scalar is YAML-insignificant). `_link_diff_errors` alone would see
+        `old_link == new_link` and stay silent -- this is exactly the new
+        byte rule's own case, not the ordinary field-diff rule test_b
+        already covers. Kept separate from test_o's whole-file regeneration
+        so a regression narrower than "the whole file changed" is still
+        visible on its own line."""
         with tempfile.TemporaryDirectory() as td:
             root = self._base_store(td)
             text = TOPIC_L1_L2.replace(
@@ -1684,6 +1686,143 @@ class TestMemlintAgainstRef(unittest.TestCase):
             self.assertIn("reformatted, not appended", out)
             self.assertIn(":L1:", out)
             self.assertNotIn(":L2:", out)
+
+    # -- Fix round on PR #22 (Opus internal + Grok external gate, same
+    # MAJOR independently): the extraction bailed on several VALID YAML
+    # shapes, each turning the byte layer permanently off for that topic
+    # rather than merely "cannot verify this one file" -- and a bail's own
+    # NOTE reached nobody on a clean (rc=0) run. These pin the fix.
+
+    def test_u_trailing_space_after_links_key_no_longer_bails(self):
+        """`links: ` (one trailing space before the newline -- a shape a
+        hand edit or an editor's trim-on-save can produce) used to fail
+        `line.rstrip("\\n") == "links:"` and bail the whole file to a NOTE.
+        With the fix, a reformat on this topic is caught exactly like the
+        ordinary case."""
+        with tempfile.TemporaryDirectory() as td:
+            base = TOPIC_L1_L2.replace("links:\n", "links: \n")
+            self.assertNotEqual(base, TOPIC_L1_L2, "fixture stale: nothing matched")
+            root = self._store_with_base_text(td, base)
+            edited = base.replace('text: "first ruling"', "text: 'first ruling'")
+            (root / "topics" / "foo.md").write_text(edited)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("reformatted, not appended", out)
+            self.assertNotIn("NOTE:", out)
+
+    def test_v_comment_line_between_items_no_longer_bails(self):
+        """Opus's own end-to-end repro: a `# recorded history` comment
+        right after `links:`, before the first item. Its own indent used
+        to be read AS the first item's marker (`"# "` never equals `"- "`),
+        bailing the whole file to a NOTE with the byte layer silently off.
+        A later quote-flip on L1 must now be caught, comment and all."""
+        with tempfile.TemporaryDirectory() as td:
+            base = TOPIC_L1_L2.replace("links:\n", "links:\n  # recorded history\n")
+            self.assertNotEqual(base, TOPIC_L1_L2, "fixture stale: nothing matched")
+            root = self._store_with_base_text(td, base)
+            edited = base.replace('text: "first ruling"', "text: 'first ruling'")
+            (root / "topics" / "foo.md").write_text(edited)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("reformatted, not appended", out)
+            self.assertNotIn("NOTE:", out)
+
+    def test_w_duplicate_id_case_still_notes_with_count_on_summary_line(self):
+        """The one REMAINING documented bail-out this fix round does not
+        close: a REF-side duplicate link id (`_recovered_old_links` already
+        resolved it to its first occurrence) leaves the structural item
+        count mismatched against the parsed list, on purpose (see
+        `_link_raw_spans`'s docstring) -- extraction still bails, but the
+        bail is no longer silent: the NOTE is on stderr (captured here
+        alongside stdout, see `_run_memlint`) and the summary line's
+        `notes=` count reflects it. Two notes fire for this exact fixture,
+        not one -- the pre-existing "REF blob could not be safely parsed"
+        repair-note (the duplicate id itself) PLUS the new structural-
+        extraction-inconclusive note (the byte layer bailing on the same
+        file for the same underlying reason) -- both real, both counted."""
+        with tempfile.TemporaryDirectory() as td:
+            dup_base = (
+                "---\ntype: topic\nid: TOP-9403\ntitle: T\nlinks:\n"
+                '  - link: L1\n    status: active\n'
+                '    ruling: {text: "first", authority: agent-inference}\n'
+                '  - link: L1\n    status: active\n'
+                '    ruling: {text: "second", authority: owner-verbatim, source: s}\n'
+                "---\n\nBody.\n"
+            )
+            root = self._store_with_base_text(td, dup_base)
+            clean_first = (
+                "---\ntype: topic\nid: TOP-9403\ntitle: T\nlinks:\n"
+                '  - link: L1\n    status: active\n'
+                '    ruling: {text: "first", authority: agent-inference}\n'
+                "---\n\nBody.\n"
+            )
+            (root / "topics" / "foo.md").write_text(clean_first)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+            self.assertIn("NOTE:", out)
+            self.assertIn("notes=2", out)
+
+    def test_x_new_link_inserted_between_old_links_is_out_of_order(self):
+        """Pre-existing gap, both reviewers: newest-first order was never
+        enforced -- a link inserted BETWEEN two recorded ones (rather than
+        above both) leaves every old link's own bytes untouched, so nothing
+        above ever saw it. `current` is left at L2 deliberately (a real
+        insertion like this would also normally bump `current`, but the
+        order check must fire on the insertion itself, not on `current`
+        being wrong)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace(
+                '  - link: L1\n'
+                '    date: \'2024-01-01\'\n'
+                '    status: historical\n'
+                '    kind: adopted\n'
+                '    ruling:\n'
+                '      text: "first ruling"\n'
+                '      authority: agent-inference\n',
+                '  - link: L3\n'
+                '    date: \'2024-01-03\'\n'
+                '    status: active\n'
+                '    kind: adopted\n'
+                '    ruling:\n'
+                '      text: "third ruling, inserted out of order"\n'
+                '      authority: agent-inference\n'
+                '  - link: L1\n'
+                '    date: \'2024-01-01\'\n'
+                '    status: historical\n'
+                '    kind: adopted\n'
+                '    ruling:\n'
+                '      text: "first ruling"\n'
+                '      authority: agent-inference\n',
+            )
+            self.assertNotEqual(text, TOPIC_L1_L2, "fixture stale: nothing matched")
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("L3", out)
+            self.assertIn("link inserted out of order", out)
+
+    def test_y_new_link_prepended_above_both_old_links_is_not_out_of_order(self):
+        """The legitimate shape (test_a's own fixture, restated here so the
+        order check's OWN clean case is pinned next to its violation case
+        above): a new link above every old one is not "inserted between"
+        anything."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace("current: L2\n", "current: L3\n").replace(
+                "links:\n",
+                "links:\n"
+                "  - link: L3\n"
+                "    date: '2024-01-03'\n"
+                "    status: active\n"
+                "    kind: adopted\n"
+                "    ruling:\n"
+                "      text: \"third ruling\"\n"
+                "      authority: agent-inference\n",
+            )
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
 
     # -- Acceptance 5: standalone records (incidents/investigations).
     # docs/SCHEMA.md section 9 calls a standalone record "one flat
@@ -1812,6 +1951,106 @@ class TestAppendOnlyByteGuardAgainstRealStore(unittest.TestCase):
                 "task brief, report the commit and diff and STOP rather than loosen "
                 "the check: " + "\n".join(f"{c} vs {p}: {e}" for c, p, e in failures),
             )
+            # Fix round on PR #22 (both reviewers): a NOTE means the byte
+            # layer went inconclusive for a real file -- worth knowing on
+            # its own, not folded into "no errors". Ten legitimate append
+            # commits produced zero notes when this was last checked by
+            # hand (verbatim output in the session report); if that ever
+            # stops being true this assertion is the one to relax, with a
+            # STOP-and-report the same as a real `errors` failure above,
+            # never a silent loosening.
+            all_notes = [(c, p, n) for c, p, ch, e, n in results if n]
+            self.assertEqual(
+                all_notes, [],
+                "a real store commit produced a byte-layer NOTE (structural "
+                "extraction inconclusive) -- report the commit and the note "
+                "text rather than silently accepting a new blind spot: "
+                + "\n".join(f"{c} vs {p}: {n}" for c, p, n in all_notes),
+            )
+
+    def test_current_head_schema_lint_is_clean(self):
+        """INC-0127: the real store's tip (as of this fix, `59e538e` --
+        `ea710fe`/`186cbcd` restored every missing fence found by this same
+        review) must stay clean under the plain schema check, the same
+        invocation `hooks/pre-commit-append-only.sh` now also runs."""
+        with tempfile.TemporaryDirectory() as td:
+            clone = Path(td) / "store-clone"
+            subprocess.run(
+                ["git", "clone", "-q", str(self.REAL_STORE), str(clone)],
+                check=True, capture_output=True, text=True,
+            )
+            errors, warnings = memlint.lint_root(clone)
+            self.assertEqual(
+                errors, [],
+                "the real store's tip fails the plain schema check -- report "
+                "and stop rather than loosen the check: " + "\n".join(errors),
+            )
+
+
+class TestUnfencedRecordIsAnError(unittest.TestCase):
+    """INC-0127 (this fix round, both reviewers): thirteen records were
+    committed with no opening `---` and nothing ever said so -- `memlint.py
+    ROOT`'s plain schema pass now refuses this by DIRECTORY membership
+    (topics/, incidents/, investigations/), independent of whether the raw
+    text otherwise looks canonical. Never runs under fixtures/ or the real
+    store -- a throwaway store per test."""
+
+    def _lint(self, files: dict):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for rel, text in files.items():
+                p = root / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(text)
+            return memlint.lint_root(root)
+
+    def test_unfenced_topic_is_an_error(self):
+        errors, _ = self._lint({
+            "topics/t.md": "type: topic\nid: TOP-9500\ntitle: T\nlinks:\n  - link: L1\n    status: active\n",
+        })
+        self.assertTrue(
+            any("missing opening frontmatter fence" in e and "topics/" in e for e in errors),
+            errors,
+        )
+
+    def test_unfenced_incident_is_an_error(self):
+        errors, _ = self._lint({
+            "incidents/i.md": "type: incident\nid: INC-9500\ntitle: T\nstatus: active\nauthority: agent-inference\n",
+        })
+        self.assertTrue(
+            any("missing opening frontmatter fence" in e and "incidents/" in e for e in errors),
+            errors,
+        )
+
+    def test_unfenced_investigation_is_an_error(self):
+        errors, _ = self._lint({
+            "investigations/x.md": "type: investigation\nid: INV-9500\ntitle: T\nstatus: active\nauthority: agent-inference\n",
+        })
+        self.assertTrue(
+            any("missing opening frontmatter fence" in e and "investigations/" in e for e in errors),
+            errors,
+        )
+
+    def test_topic_missing_closing_fence_is_an_error(self):
+        errors, _ = self._lint({
+            "topics/t.md": "---\ntype: topic\nid: TOP-9501\ntitle: T\nlinks:\n  - link: L1\n    status: active\n",
+        })
+        self.assertTrue(any("no closing fence" in e for e in errors), errors)
+
+    def test_sources_note_with_no_fence_is_unchanged(self):
+        """Notes stay legal and fence-free only under sources/, inbox/, and
+        the store README -- directory membership is what exempts them, the
+        same signal that condemns an unfenced topics/incidents/
+        investigations file."""
+        errors, warnings = self._lint({
+            "sources/note.md": "type: source-note\nsome content, no fence at all\n",
+        })
+        self.assertEqual(errors, [], errors)
+        self.assertFalse(any("frontmatter fence" in w for w in warnings), warnings)
+
+    def test_properly_fenced_topic_is_unaffected(self):
+        errors, _ = self._lint({"topics/t.md": TOPIC_L1_L2})
+        self.assertFalse(any("frontmatter fence" in e for e in errors), errors)
 
 
 class TestQuestionMarkRuleScope(unittest.TestCase):

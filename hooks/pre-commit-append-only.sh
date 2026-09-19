@@ -12,6 +12,18 @@
 # see install-hooks.md; scripts/repo-init.sh generates a wrapper here the
 # same way it generates one for post-commit (see post-commit-reindex.sh).
 #
+# INC-0127: this hook ALSO runs the plain schema check (`memlint.py ROOT`,
+# no --against-ref, no --code-root) and blocks on any ERROR from it
+# (warnings pass) -- thirteen records were committed with no opening
+# frontmatter fence and nothing at commit time ever said so, because this
+# hook used to run only the append-only diff, never the schema pass. This
+# reads the WORKING TREE, not the staged index (memlint.py's schema mode
+# has no staged-aware form the way --against-ref --staged does) -- a real
+# but narrow gap: a file staged-but-then-further-edited unstaged could in
+# principle diverge from what schema-lint actually reads. --code-root is
+# omitted deliberately: the store repo has no code checkout of its own at
+# commit time, and marker/concept-path checks are not this hook's job.
+#
 # Deliberately UNGUARDED (docs/INTERNALS.md "The watchdog", Unguarded:
 # list, alongside memcontinuum-detect.sh): the five write-side hooks,
 # newfile-nudge.sh, pre-edit-chain.sh, and post-commit-reindex.sh wrap
@@ -42,9 +54,11 @@
 #                     $MEMCONTINUUM_HOME/config.sh (if it sets
 #                     MEMCONTINUUM_PYTHON), then <engine>/.venv/bin/python.
 #
-# Exit codes: 1 blocks the commit (an append-only violation was found --
-# the errors on stderr, one hook.log line carrying rc=1); 0 lets it
-# through, either because the check was clean (rc=0) or because something
+# Exit codes: 1 blocks the commit (an append-only violation, OR a schema
+# ERROR such as INC-0127's missing frontmatter fence -- either way the
+# errors go to stderr, one hook.log line carrying rc=1 or schema-rc=1); 0
+# lets it through, either because both checks were clean (rc=0, warnings
+# from the schema pass do not block) or because something
 # ABOUT RUNNING THE CHECK failed (skipped=<reason>: MEMCONTINUUM_ROOT
 # unset, the invoking repo is not-the-store (Codex 1 -- this wrapper fired
 # for a commit outside MEMCONTINUUM_ROOT, e.g. a shared core.hooksPath),
@@ -127,6 +141,26 @@ if [ ! -x "$PY" ]; then
     exit 0
 fi
 
+# INC-0127: the schema check, first -- a plain `memlint.py ROOT` run (no
+# --against-ref, no --code-root). Its own exit code is unambiguous (1 iff
+# at least one ERROR was printed, 0 otherwise -- including "clean" and
+# "clean (N warning(s))"), so unlike the append-only summary line below
+# there is no separate marker to look for: RC alone decides. A crash would
+# also be a non-{0,1} exit in principle, but memlint's schema mode has no
+# documented exit other than 0/1 -- treated as fail-open all the same,
+# consistent with this hook's stance everywhere else (an infrastructure
+# problem must never read as "your commit is bad").
+SCHEMA_OUT="$(PYTHONPATH= "$PY" "$MEMLINT" "$MEMCONTINUUM_ROOT" 2>&1)"
+SCHEMA_RC=$?
+if [ "$SCHEMA_RC" -eq 1 ]; then
+    echo "$SCHEMA_OUT" >&2
+    log_line "schema-rc=1 project=$PROJECT"
+    exit 1
+fi
+if [ "$SCHEMA_RC" -ne 0 ]; then
+    log_line "skipped=schema-engine-failure schema-rc=$SCHEMA_RC project=$PROJECT"
+fi
+
 OUT="$(PYTHONPATH= "$PY" "$MEMLINT" --against-ref HEAD --staged "$MEMCONTINUUM_ROOT" 2>&1)"
 RC=$?
 
@@ -150,13 +184,31 @@ case "$CHANGED" in
     ''|*[!0-9]*) CHANGED="" ;;
 esac
 
+# Grok/Opus gate finding (MAJOR): `notes=N` is memlint's own count of
+# structural-extraction bail-outs (byte layer inconclusive for a link) --
+# parsed the same way as `changed=` above and always logged alongside it,
+# so a NOTE never again reaches nobody just because rc=0 never echoed
+# $OUT anywhere. Missing/unparseable is logged as "?" rather than dropped
+# silently, the same way a missing CHANGED falls through to the
+# engine-failure branch below instead of a bare "changed=" log line.
+NOTES=""
+case "$OUT" in
+    *"notes="*)
+        NOTES_TAIL="${OUT##*notes=}"
+        NOTES="${NOTES_TAIL%% *}"
+        ;;
+esac
+case "$NOTES" in
+    ''|*[!0-9]*) NOTES="?" ;;
+esac
+
 if [ "$RC" -eq 0 ] && [ -n "$CHANGED" ]; then
-    log_line "rc=0 changed=$CHANGED project=$PROJECT"
+    log_line "rc=0 changed=$CHANGED notes=$NOTES project=$PROJECT"
     exit 0
 fi
 if [ "$RC" -eq 1 ] && [ -n "$CHANGED" ]; then
     echo "$OUT" >&2
-    log_line "rc=1 changed=$CHANGED project=$PROJECT"
+    log_line "rc=1 changed=$CHANGED notes=$NOTES project=$PROJECT"
     exit 1
 fi
 

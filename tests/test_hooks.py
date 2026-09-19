@@ -2402,6 +2402,36 @@ class TestPreCommitAppendOnlyHook(unittest.TestCase):
         self.assertIn("changed=1", log_text)
         self.assertIn("project=reformat-proj", log_text)
 
+    def test_unfenced_topic_added_is_blocked_by_the_schema_check(self):
+        """INC-0127: the hook now ALSO runs the plain schema check
+        (`memlint.py ROOT`, no `--against-ref`) and blocks on any ERROR
+        from it. A brand-new (status `A` in the diff) unfenced topic is
+        free under the append-only diff itself (no history to protect --
+        `check_append_only` continues on status "A"), so before this fix
+        round nothing in this hook would have caught it at all."""
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-unfenced-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        store = _init_topic_store(Path(tmp) / "store")
+        (store / "topics" / "bar.md").write_text(
+            "type: topic\nid: TOP-9600\ntitle: Unfenced\nlinks:\n  - link: L1\n    status: active\n"
+        )
+        _git(["add", "-A"], cwd=store)
+        env = clean_env(
+            HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_ROOT=str(store),
+            MEMCONTINUUM_PROJECT="unfenced-proj", MEMCONTINUUM_PYTHON=VENV_PYTHON,
+        )
+        # cwd=store: see test_unborn_head_skips's comment above.
+        proc = subprocess.run(
+            [MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=15, cwd=store,
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("missing opening frontmatter fence", proc.stderr)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("pre-commit-append-only: schema-rc=1", log_text)
+        self.assertIn("project=unfenced-proj", log_text)
+
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestPreCommitAppendOnlyRealCommit(unittest.TestCase):
