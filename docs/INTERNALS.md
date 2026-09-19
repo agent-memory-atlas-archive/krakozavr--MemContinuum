@@ -1881,7 +1881,7 @@ root.
 
 ## memlint
 
-`memlint.py ROOT [--code-root DIR ...]` imports memidx's own walker, so a
+`memlint.py ROOT [--code-root DIR ...] [--strict-citations]` imports memidx's own walker, so a
 session buffer is never linted as a topic, the walker's no-symlinks rule
 applies here too, and reuses
 `memidx.fragment_declaration_status` — the same predicate `code-search` uses for
@@ -1976,6 +1976,23 @@ scan never opens a file nothing references, even to check whether it is binary.
 | a file in scope whose backend cannot run here (a missing optional grammar wheel, or a genuine chunking failure) | warning (names the reason), never an error |
 | a file in scope whose language has no chunker at all | not a failure — scanned for a `decision:` marker by plain regex alone (no chunk-derived window); silent when it holds none. When it does, checked against every marker→store rule above that needs no symbol location (topic/link exist, active, CONSTRAINT/HOLD, code_refs name the file — the code_ref's own `#symbol` fragment, if any, is stripped before this comparison, so it counts exactly like a bare path or glob); a violation there is still the matching error, and clean is ONE warning that the marker cannot be attributed to a symbol — never the old blanket per-file warning fired regardless of whether the file held a marker at all |
 | a `path#symbol` naming a container type (class/struct/enum/…) the chunker reports no definition line for | warning (uncheckable, not "no marker") |
+
+Cited-commit / file:line citation rules (`--code-root`; SCHEMA §7 "Cited
+commits and paths are verified, not merely written"). Checked in a link's
+`ruling.source`/`evidence`, or a standalone record's top-level
+`source:`/`evidence:`. `--strict-citations` (rejected together with
+`--against-ref`, same as `--code-root`) is the one flag that changes a
+severity below rather than adding a new rule:
+
+| rule | severity |
+|---|---|
+| a recognized commit citation does not resolve under any code root that is a git repository | warning by default (`unverifiable, not necessarily wrong`); error under `--strict-citations` |
+| a recognized `path:line` citation's file is not found under any code root | warning by default (`unverifiable, not necessarily wrong`); error under `--strict-citations` |
+| a `commit `/`merge `-triggered citation resolves, but a same-line quoted subject after it does not match `git log -1 --format=%s` (whitespace-normalized) | error, unconditionally — a substantiated mismatch, not affected by `--strict-citations`. `at `/`as `-triggered and backtick-wrapped citations are never subject-eligible at all — a quote following one of those is never read as a claimed subject, checked or not |
+| a `path:line` citation's file exists but has fewer lines than cited | error, unconditionally — substantiated, not affected by `--strict-citations` |
+| a `path:line` citation's path is absolute | error, unconditionally — a shape violation, not a repository question |
+| `--strict-citations` given with no `--code-root` | no effect (the whole citation check is already skipped) |
+| `--strict-citations` given together with `--against-ref` | exit 2 — same rejection as `--code-root` under `--against-ref` |
 
 Corpus-wide identity rules, applied to every record regardless of type:
 

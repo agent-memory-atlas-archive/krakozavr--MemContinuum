@@ -232,6 +232,84 @@ them) is refused as `<path>:<link>: link inserted out of order`, even
 though the old links' own bytes stay untouched. Reordering AMONG links that
 already existed at `REF` is not separately checked.
 
+### Cited commits and paths are verified, not merely written
+
+When `memlint.py` is given `--code-root DIR` (repeatable; otherwise this
+check is skipped entirely, exactly like the concept-record checks in §8.4 —
+no line is printed about citations at all), every commit citation in a
+link's `ruling.source`/`evidence` (or a standalone incident/investigation's
+top-level `source:`/`evidence:`, §9) is verified the same way `code_refs` are
+already verified against paths.
+
+**Recognizing a citation.** A hex token is read as a commit citation only
+when introduced one of two ways, and only `commit `/`merge ` are
+subject-eligible:
+- `commit `/`merge ` (case-insensitive) immediately before the hex — MAY
+  also carry a claimed subject: a double-quoted string on the SAME line,
+  separated only by spaces/tabs (`commit a1b2c3d "the exact subject"`).
+- `at `/`as ` (case-insensitive), or backtick-wrapping with no introducing
+  word at all — never subject-eligible, even when a quote happens to
+  follow: this store's owner-verbatim convention often puts a quote of the
+  owner's own words shortly after any kind of reference, unrelated to a
+  commit (`"...gate at af95af2 \"Codex is back, use it rather than
+  Opus\""` quotes the owner about something else entirely, not that
+  commit's subject — reading it as a subject claim would produce a false
+  mismatch against the real one).
+
+In every case the hex run must be **exactly 7 or 40 lowercase characters**
+— git's two canonical hash lengths — which is what keeps a 16-hex snapshot
+hash, a sha256 prefix, a session id, or a 12-hex render fingerprint from
+ever being read as a commit even sitting right next to a trigger word (a
+12-hex fingerprint after `at ` is not 7 or 40 characters and is correctly
+excluded) — **except a 40-character hex string in backticks, which is
+genuinely indistinguishable by design** from a real 40-hex commit hash;
+resolving it against the code root is the only way to tell, which is
+exactly what this check then does.
+
+A `path/to/file.ext:123` citation (a dotted extension required, so a bare
+`16:09`-shaped token is never mistaken for one) is checked for existence
+under the code roots and, if found, for having at least that many lines.
+
+**Unverifiable warns, a substantiated mismatch errors, `--strict-citations`
+promotes.** A single `--code-root` cannot tell "fabricated" apart from
+"cites a different repository" — this store's own real records include a
+topic that legitimately cites another project's installer files (it is
+literally about borrowing that project's installer) and an incident citing
+a commit in that other project's own store. So a citation that resolves to
+NOTHING under any configured root — a hash `cat-file` cannot find, or a file
+that is not found at all — is a lint WARNING by default, worded "cites X --
+not found under any configured code root; unverifiable, not necessarily
+wrong": an ERROR the checker cannot substantiate would be a false
+accusation. A citation that resolves to something CONCRETE and WRONG — the
+hash exists but its quoted subject does not match (compared after
+whitespace normalization: a hand-typed citation is expected to preserve the
+subject's words, not its exact internal spacing); the file exists but has
+fewer lines than cited — is a lint ERROR unconditionally, naming the record,
+the link (or the standalone record's id), the field, the citation, and the
+mismatch: the checker verified something and it was wrong, exactly the
+fabrication class this check exists to catch, not a style nit. An
+absolute-path citation is likewise always an ERROR, strict or not — it
+violates the citation shape itself, independent of which repository
+anything lives in. `--strict-citations` promotes every unresolved
+("unverifiable") case to an ERROR too, for a store whose records are known
+to cite only the wired repo, where "not found" really does mean wrong;
+rejected together with `--against-ref`, same as `--code-root` (append-only
+mode never uses a code root either).
+
+**Known misses**, named rather than silently accepted: a bare hash with no
+introducing word and no backticks is invisible — recognizing an arbitrary
+hex-looking word as a commit citation would be guessing, not verifying; an
+ordinary English word that happens to be exactly 7 characters, all drawn
+from a–f (`deadbee`, `acceded`), reads as a citation once it follows
+`at `/`as ` — not solvable without knowing English from hex; a `file.py:L123`
+line locator (an `L`-prefixed number) is never recognized, only bare digits
+after the colon; `file.py:123,456` or `file.py:123:45` or `file.py:123-130`
+only ever check the FIRST number; a Windows-style `hooks\file.py:3` is never
+a citation at all (a literal backslash immediately before a candidate path
+excludes it, the same as any other path/word character); a path containing
+a literal space still matches only its suffix after the space, for the same
+structural reason.
+
 ---
 
 ## 8. Extensions — typed edges, assumptions, invariants, concepts
