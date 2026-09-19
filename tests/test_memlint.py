@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
 
@@ -1585,6 +1587,231 @@ class TestMemlintAgainstRef(unittest.TestCase):
             self.assertEqual(rc, 1, out)
             self.assertIn("L1", out)
             self.assertIn("changed after being recorded", out)
+
+    # -- INC-0124 / TOP-0122 L1 rule 3 (0.3.0 plan item "the append-only
+    # guard refuses a rewrite, not only a deletion"): `_link_diff_errors`
+    # above catches a PARSED field edit; these catch the gap it left --
+    # a link whose PARSED fields survive unchanged but whose RAW BYTES
+    # were reformatted (a whole-file YAML regeneration, a re-wrap, a
+    # trailing-space edit). See `_link_raw_spans`'s docstring for the
+    # extraction design and its documented limits (TOP-0129 L1).
+
+    def test_o_regenerated_topic_via_yaml_dump_is_caught(self):
+        """Acceptance 1 / INC-0124's own repro: the base topic re-rendered
+        through `yaml.safe_dump(load(...))` with IDENTICAL parsed content
+        (PyYAML's defaults change everything ABOUT the bytes -- indentless
+        sequences, sort_keys, re-wrapped long strings, single- to
+        double-quote flips -- while every parsed field stays equal, which
+        is exactly why `_link_diff_errors` alone never sees this). Before
+        this fix, this scenario is the documented INC-0124 gap: `errors=0`,
+        `rc=0`. The guard must now go red, naming both links and the
+        stable phrase this fix pins: "reformatted, not appended"."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            fm = yaml.safe_load(TOPIC_L1_L2.split("---\n", 2)[1])
+            regenerated = "---\n" + yaml.safe_dump(fm) + "---\n\nBody.\n"
+            self.assertNotEqual(regenerated, TOPIC_L1_L2, "fixture stale: dump matches source verbatim")
+            self.assertEqual(
+                yaml.safe_load(regenerated.split("---\n", 2)[1]), fm,
+                "fixture invalid: the regenerated blob must parse to the SAME dict "
+                "as the original -- this test exists to catch a change that preserves "
+                "meaning while changing bytes, not a change that also breaks parsing",
+            )
+            (root / "topics" / "foo.md").write_text(regenerated)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("reformatted, not appended", out)
+            self.assertIn(":L1:", out)
+            self.assertIn(":L2:", out)
+
+    def test_p_title_code_refs_tags_change_with_byte_identical_links_is_clean(self):
+        """Acceptance 3 / SCHEMA section 7: `title`, `tags`, and `code_refs`
+        are explicitly free, even under the new byte rule -- they sit
+        OUTSIDE any link's span (before `links:` in file order), so
+        changing them must never trip the reformat check on links whose
+        own bytes are untouched."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = (
+                TOPIC_L1_L2.replace("title: Test topic\n", "title: Renamed test topic\n")
+                .replace("tags: []\n", "tags: [memcontinuum]\ncode_refs:\n  - memlint.py\n")
+            )
+            self.assertNotEqual(text, TOPIC_L1_L2, "fixture stale: nothing matched")
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
+    def test_q_whitespace_only_change_inside_old_link_is_caught(self):
+        """Acceptance 4: a single trailing space added inside L1's recorded
+        ruling text. Parsed YAML scalars do not carry a distinction here
+        that matters to `_link_diff_errors` -- wait, they do: a trailing
+        space INSIDE the quoted string changes the parsed string too, so
+        this specific edit is already (correctly) caught as an ordinary
+        `ruling.text` field change. The byte rule's OWN contribution is a
+        change that survives parsing losslessly -- covered by test_o and
+        test_p above; kept here, pinned separately, as the acceptance
+        list's literal (4) so a regression in either mechanism is visible
+        on its own line rather than only through the whole-file case."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace(
+                '      text: "first ruling"\n',
+                '      text: "first ruling" \n',
+            )
+            self.assertNotEqual(text, TOPIC_L1_L2, "fixture stale: nothing matched")
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn(":L1:", out)
+
+    def test_r_reordering_links_field_keys_with_same_meaning_is_caught(self):
+        """A narrower reformat than the whole-file dump above: only L1's
+        `ruling` mapping is rewritten with its keys in a different order
+        (`authority` before `text`) -- same parsed dict, different bytes,
+        every OTHER line of the file untouched byte-for-byte. This is the
+        shape closest to INC-0124's actual repro (a targeted re-render of
+        one link, not the whole file)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._base_store(td)
+            text = TOPIC_L1_L2.replace(
+                '    ruling:\n      text: "first ruling"\n      authority: agent-inference\n',
+                '    ruling:\n      authority: agent-inference\n      text: "first ruling"\n',
+            )
+            self.assertNotEqual(text, TOPIC_L1_L2, "fixture stale: nothing matched")
+            (root / "topics" / "foo.md").write_text(text)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("reformatted, not appended", out)
+            self.assertIn(":L1:", out)
+            self.assertNotIn(":L2:", out)
+
+    # -- Acceptance 5: standalone records (incidents/investigations).
+    # docs/SCHEMA.md section 9 calls a standalone record "one flat
+    # frontmatter block, one claim, closed once written" -- a DOCTRINE
+    # statement -- but `check_append_only`'s own gate (`_is_topic_like`,
+    # memlint.py ~1566: `if not _is_topic_like(old_result): continue`) and
+    # docs/INTERNALS.md's rule table (row: "a record whose recoverable kind
+    # is not topic-like... out of scope for this check entirely -- there is
+    # no recorded link history to protect, so neither an error nor a note")
+    # both say this doctrine is NOT mechanically enforced by
+    # `check_append_only` today: an incident/investigation has no `links:`,
+    # so it is skipped before any check runs at all, for EITHER an append
+    # or an edit. These two tests PIN that shipped reality rather than
+    # invent new enforcement this task never asked for -- see the session
+    # report for the brief's "edited -> red" expectation not matching
+    # shipped behavior.
+
+    def test_s_incident_body_append_is_out_of_scope_green(self):
+        base = (
+            "---\ntype: incident\nid: INC-9001\ntitle: T\narea: memory\n"
+            "status: active\nauthority: agent-inference\nsource: s\n"
+            "---\n\n# Body\n\nOriginal line.\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = _git_store(td)
+            (root / "incidents").mkdir()
+            (root / "incidents" / "i.md").write_text(base)
+            _commit_all(root, "base")
+            appended = base + "\nAppended follow-up line.\n"
+            (root / "incidents" / "i.md").write_text(appended)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
+    def test_t_incident_body_edit_is_out_of_scope_green(self):
+        """Not a design choice this fix makes -- a pin of memlint.py's own
+        `_is_topic_like`/`check_append_only` gate and
+        docs/INTERNALS.md's rule table, both unchanged by this fix."""
+        base = (
+            "---\ntype: incident\nid: INC-9002\ntitle: T\narea: memory\n"
+            "status: active\nauthority: agent-inference\nsource: s\n"
+            "---\n\n# Body\n\nOriginal line.\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = _git_store(td)
+            (root / "incidents").mkdir()
+            (root / "incidents" / "i.md").write_text(base)
+            _commit_all(root, "base")
+            edited = base.replace("Original line.\n", "EDITED line.\n")
+            (root / "incidents" / "i.md").write_text(edited)
+            rc, out = _run_memlint(["--against-ref", "HEAD", str(root)])
+            self.assertEqual(rc, 0, out)
+
+
+class TestAppendOnlyByteGuardMutation(unittest.TestCase):
+    """Acceptance 7 (TOP-0129 L1: a guard is a claim until demonstrated,
+    not a result): disable exactly the byte comparison
+    (`memlint._link_bytes_changed`, patched to always report "no change")
+    and confirm the acceptance tests that depend on it fail FOR THE RIGHT
+    REASON -- i.e. that they are not accidentally passing regardless of
+    whether the guard runs at all."""
+
+    def _assert_defeated(self, test_name):
+        test = TestMemlintAgainstRef(test_name)
+        with mock.patch.object(memlint, "_link_bytes_changed", return_value=False):
+            with self.assertRaises(
+                AssertionError,
+                msg=f"TestMemlintAgainstRef.{test_name} did not fail with the byte "
+                    "comparison disabled -- it is not exercising that comparison",
+            ):
+                test.debug()  # runs setUp/test/tearDown, raising rather than recording
+
+    def test_regenerated_topic_case_is_defeated_when_comparison_disabled(self):
+        self._assert_defeated("test_o_regenerated_topic_via_yaml_dump_is_caught")
+
+    def test_whitespace_only_case_is_defeated_when_comparison_disabled(self):
+        self._assert_defeated("test_q_whitespace_only_change_inside_old_link_is_caught")
+
+
+class TestAppendOnlyByteGuardAgainstRealStore(unittest.TestCase):
+    """Acceptance 6: the new check against the REAL engine store's last ten
+    commits, each against its own parent, read-only. Never runs against
+    the real store's own working tree directly -- a fresh clone in
+    a throwaway directory, exactly INC-0124's own precedent ("guard
+    behaviour reproduced by the orchestrator on a throwaway clone of that
+    store, never the store itself"). Machine-local by nature (the real
+    store lives at a fixed path on this machine, outside this repo's own
+    checkout) -- skips cleanly wherever that path is absent, the same
+    shape as this suite's existing MEMCONTINUUM_PYTHON-gated skips."""
+
+    REAL_STORE = Path.home() / "dev" / "memcontinuum" / "memory"
+
+    @classmethod
+    def setUpClass(cls):
+        if not (cls.REAL_STORE / ".git").exists():
+            raise unittest.SkipTest(f"real store not found at {cls.REAL_STORE} on this machine")
+
+    def test_last_ten_commits_pairwise_are_clean(self):
+        with tempfile.TemporaryDirectory() as td:
+            clone = Path(td) / "store-clone"
+            subprocess.run(
+                ["git", "clone", "-q", str(self.REAL_STORE), str(clone)],
+                check=True, capture_output=True, text=True,
+            )
+            proc = subprocess.run(
+                ["git", "-C", str(clone), "log", "--format=%H", "-11"],
+                check=True, capture_output=True, text=True,
+            )
+            commits = proc.stdout.strip().splitlines()
+            self.assertGreaterEqual(
+                len(commits), 11,
+                "real store has fewer than 11 commits -- fixture assumption stale",
+            )
+            results = []
+            for i in range(10):
+                commit, parent = commits[i], commits[i + 1]
+                subprocess.run(
+                    ["git", "-C", str(clone), "checkout", "-q", commit],
+                    check=True, capture_output=True, text=True,
+                )
+                errors, changed, notes = memlint.check_append_only(clone, parent, staged=False)
+                results.append((commit, parent, changed, errors, notes))
+            failures = [(c, p, e) for c, p, ch, e, n in results if e]
+            self.assertEqual(
+                failures, [],
+                "a real store commit failed the new byte-identity check -- per the "
+                "task brief, report the commit and diff and STOP rather than loosen "
+                "the check: " + "\n".join(f"{c} vs {p}: {e}" for c, p, e in failures),
+            )
 
 
 class TestQuestionMarkRuleScope(unittest.TestCase):

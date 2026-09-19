@@ -2362,6 +2362,46 @@ class TestPreCommitAppendOnlyHook(unittest.TestCase):
         self.assertIn("changed=1", log_text)
         self.assertIn("project=bad-proj", log_text)
 
+    def test_reformatted_history_staged_edit_exits_1_and_logs_rc1(self):
+        """Acceptance 8 / INC-0124: the hook path for a REFORMAT, not just
+        an ordinary field edit -- a whole-file `yaml.safe_dump` re-render
+        of the fixture topic with every parsed link field unchanged. Before
+        this fix this staged edit passed the hook (`rc=0`) exactly as it
+        passed the unpatched `memlint.py` in INC-0124's own repro; this
+        confirms the new check blocks the commit through the real
+        pre-commit path, not only via a direct `memlint.py` invocation."""
+        import yaml
+
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-reformat-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        store = _init_topic_store(Path(tmp) / "store")
+        original = (store / "topics" / "foo.md").read_text()
+        fm = yaml.safe_load(original.split("---\n", 2)[1])
+        regenerated = "---\n" + yaml.safe_dump(fm) + "---\n\nBody.\n"
+        self.assertNotEqual(regenerated, original, "fixture stale: dump matches source verbatim")
+        self.assertEqual(
+            yaml.safe_load(regenerated.split("---\n", 2)[1]), fm,
+            "fixture invalid: regenerated blob must parse to the same dict as the original",
+        )
+        (store / "topics" / "foo.md").write_text(regenerated)
+        _git(["add", "-A"], cwd=store)
+        env = clean_env(
+            HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_ROOT=str(store),
+            MEMCONTINUUM_PROJECT="reformat-proj", MEMCONTINUUM_PYTHON=VENV_PYTHON,
+        )
+        # cwd=store: see test_unborn_head_skips's comment above.
+        proc = subprocess.run(
+            [MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=15, cwd=store,
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reformatted, not appended", proc.stderr)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("pre-commit-append-only: rc=1", log_text)
+        self.assertIn("changed=1", log_text)
+        self.assertIn("project=reformat-proj", log_text)
+
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestPreCommitAppendOnlyRealCommit(unittest.TestCase):

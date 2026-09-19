@@ -1521,6 +1521,168 @@ def _recovered_old_links(fm: dict) -> list[dict] | None:
     return list(recovered.values()) if recovered else None
 
 
+# ---------------------------------------------------------------------------
+# INC-0124: `_link_diff_errors` above compares PARSED link fields, so a file
+# regenerated through a YAML dumper (same links, different bytes -- quoting
+# style, key order, line wrapping) sails through untouched: every field is
+# equal, so no branch above ever fires. TOP-0122 L1 rule 3 / the 0.3.0 plan
+# item ("The append-only guard refuses a rewrite, not only a deletion")
+# closes that: when a link's PARSED fields survive unchanged, its RAW BYTES
+# -- the exact text span from its `  - link: Ln` line through the last line
+# belonging to that list item -- must also survive unchanged, or the commit
+# is refused as a reformat, not an append.
+#
+# The extraction below works on the file's LINES, never on a re-serialized
+# form of the parsed dict (that would just reintroduce the same bug one
+# layer down -- confirmed empirically: `yaml.safe_dump` renders sequences
+# INDENTLESS and keys `sort_keys`-first, so a naive `  - link:`-anchored
+# regex scan returns nothing on exactly the file this check exists to
+# catch). Instead it locates each link's span STRUCTURALLY, by indentation,
+# and identifies WHICH span belongs to which link id by ZIPPING the
+# structural item order against the already-parsed `links` list in the same
+# file order -- YAML never reorders a list, so the Nth structural item is
+# the Nth parsed link, regardless of how that item's own lines are styled
+# or ordered internally. `len(items) != len(parsed_links)` is the one
+# consistency check available without re-deriving ids from a dumper of our
+# own, and it is treated as "cannot safely say", not "unchanged": see
+# `_link_raw_spans`'s docstring and check_append_only's fail-closed handling
+# of a `None` return for what happens then.
+# ---------------------------------------------------------------------------
+
+
+def _leading_spaces(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _link_raw_spans(text: str, parsed_links: list) -> dict[str, str] | None:
+    """Maps link id -> the EXACT raw text (original line endings, no
+    re-serialization) of that link's list-item span in `text`, a full
+    record file's decoded content -- from its `- link: ...`-bearing line
+    through the last line belonging to that item, i.e. every following
+    line indented no shallower than the item marker itself. `parsed_links`
+    is the SAME file's already-parsed `links` list (file order); spans are
+    assigned to ids POSITIONALLY (see module comment above), never by
+    regexing an id back out of the raw text -- immune to quoting, key
+    order, and (YAML always preserves list order) reordering.
+
+    Returns None -- "cannot safely say", never "unchanged" -- whenever the
+    structure will not support that positional zip with confidence:
+      * no top-level `links:` key on its own line (frontmatter missing,
+        or `links` written as an inline flow list -- no real store file
+        does this, but this function must not guess if one someday does)
+      * the first line under it is not a list-item marker (`- `) at some
+        consistent indent
+      * the number of structurally-found items does not exactly match
+        `len(parsed_links)` -- e.g. a REF-side duplicate id that
+        `_recovered_old_links` already resolved to one entry still shows
+        up as two structural items; rather than guess which structural
+        item the surviving parsed entry corresponds to, this bails and
+        the caller falls back to parsed-field comparison alone for that
+        file (append-only is still enforced, just not the byte layer)
+      * any parsed link's own `link` id is missing/unhashable, or two
+        parsed links resolve to the same id string (would silently drop
+        a span otherwise)
+
+    Known limits (TOP-0129 L1 -- a guard is a claim until demonstrated,
+    not a result): a YAML block scalar (`|`/`>`) whose continuation lines
+    happen to dedent to the item marker's own column would be mis-split
+    (no store file uses block scalars today -- confirmed by a corpus
+    grep, not assumed); a blank line immediately after an item attaches
+    to that item's OWN span, not to whatever follows it, so inserting a
+    blank line inside recorded history (with nothing else touched) is
+    correctly flagged as a reformat, not silently ignored.
+    """
+    if not text.startswith("---"):
+        return None
+    lines = text.splitlines(keepends=True)
+    if not lines or not lines[0].startswith("---"):
+        return None
+    end_idx = None
+    for i in range(1, len(lines)):
+        if lines[i].rstrip("\n") == "---":
+            end_idx = i
+            break
+    if end_idx is None:
+        return None
+    fm_lines = lines[1:end_idx]
+
+    links_idx = None
+    for i, line in enumerate(fm_lines):
+        if line.rstrip("\n") == "links:":
+            links_idx = i
+            break
+    if links_idx is None:
+        return None
+
+    # Indent of the item marker itself: PyYAML's default dump renders
+    # sequences indentless (marker at the SAME column as `links:`, column
+    # 0); the store's own hand/agent-written style indents by 2. Detect it
+    # from whatever the first non-blank line under `links:` actually is,
+    # rather than assuming either convention.
+    first = None
+    for i in range(links_idx + 1, len(fm_lines)):
+        if fm_lines[i].strip("\n") != "":
+            first = i
+            break
+    if first is None:
+        return None
+    indent = _leading_spaces(fm_lines[first])
+    marker = fm_lines[first][indent:indent + 2]
+    if marker != "- ":
+        return None
+
+    item_starts: list[int] = []
+    block_end = len(fm_lines)
+    for i in range(links_idx + 1, len(fm_lines)):
+        line = fm_lines[i]
+        if line.strip("\n") == "":
+            continue
+        ls = _leading_spaces(line)
+        if ls < indent:
+            block_end = i
+            break
+        if ls == indent:
+            if line[indent:indent + 2] == "- ":
+                item_starts.append(i)
+                continue
+            block_end = i
+            break
+        # ls > indent: a nested field (or a nested list's own "- ") that
+        # belongs to whichever item is currently open -- never a boundary.
+
+    if not item_starts:
+        return None
+
+    spans_by_index = []
+    for idx, start in enumerate(item_starts):
+        stop = item_starts[idx + 1] if idx + 1 < len(item_starts) else block_end
+        spans_by_index.append("".join(fm_lines[start:stop]))
+
+    if len(spans_by_index) != len(parsed_links):
+        return None
+
+    spans: dict[str, str] = {}
+    for link, span in zip(parsed_links, spans_by_index):
+        if not isinstance(link, dict):
+            return None
+        lid = link.get("link")
+        if lid is None or isinstance(lid, (dict, list)):
+            return None
+        lid_key = str(lid)
+        if lid_key in spans:
+            return None
+        spans[lid_key] = span
+    return spans
+
+
+def _link_bytes_changed(old_span: str, new_span: str) -> bool:
+    """The one comparison INC-0124 found missing -- isolated in its own
+    function so a mutation test (TOP-0129 L1: prove the guard, don't just
+    assert it) can disable exactly this and nothing else, then confirm the
+    tests that depend on it fail for the right reason."""
+    return old_span != new_span
+
+
 def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], int, list[str]]:
     """Returns (errors, changed, notes) -- `changed` is the number of
     topic files the diff actually concerned (topic-relevant at REF),
@@ -1641,6 +1803,30 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         if repair_note is not None:
             notes.append(repair_note)
 
+        # INC-0124 / TOP-0122 L1 rule 3: locate each surviving link's raw
+        # text span on both sides so a parsed-field-identical link can
+        # still be caught if it was reformatted rather than left alone.
+        # Decode is expected to succeed here -- both blobs already passed
+        # through _parse_git_blob successfully to reach this point -- but
+        # stays defensive rather than assuming that invariant forever.
+        try:
+            old_text = old_blob.decode("utf-8")
+        except UnicodeDecodeError:
+            old_text = None
+        try:
+            new_text = new_blob.decode("utf-8")
+        except UnicodeDecodeError:
+            new_text = None
+        new_links_full = new_result.frontmatter.get("links") or []
+        old_spans = _link_raw_spans(old_text, old_links) if old_text is not None else None
+        new_spans = _link_raw_spans(new_text, new_links_full) if new_text is not None else None
+        if old_links and old_spans is None:
+            notes.append(
+                f"{full_path}: could not verify recorded links' raw text at {ref} "
+                "(structural extraction inconclusive -- see _link_raw_spans); "
+                "append-only still enforced via parsed-field comparison only"
+            )
+
         # Codex 2 (BLOCKING): a duplicate link id on the NEW side already
         # made new_result invalid above (memidx.validate_record_shape's
         # own diagnostic -- the one typed-parse gate new_result.valid
@@ -1673,6 +1859,26 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                 )
             elif new_link != old_link:
                 errors.extend(_link_diff_errors(full_path, lid, old_link, new_link))
+            elif old_spans is not None and lid in old_spans:
+                # Parsed fields are IDENTICAL -- the branch above never
+                # fired -- but the raw bytes may still differ (INC-0124:
+                # a whole-file YAML regeneration preserves every parsed
+                # field while changing quoting/wrapping/key order). A
+                # missing new-side span (structural extraction failed on
+                # the new blob, or this id somehow has none) is treated
+                # the SAME as a proven byte change -- fail closed, per
+                # the plan item's own framing ("a legitimate reformat of
+                # history is refused too -- that is the point") -- rather
+                # than silently trusting a blob our own extractor could
+                # not account for.
+                new_span = new_spans.get(lid) if new_spans is not None else None
+                if new_span is None or _link_bytes_changed(old_spans[lid], new_span):
+                    errors.append(
+                        f"{full_path}:{lid}: link reformatted, not appended "
+                        "(append-only; raw text changed after being recorded "
+                        "while its parsed fields did not -- add a new link "
+                        "instead of regenerating the file)"
+                    )
 
     return errors, changed, notes
 
