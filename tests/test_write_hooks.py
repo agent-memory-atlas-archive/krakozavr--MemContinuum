@@ -5067,6 +5067,201 @@ class TestMcRotateHookLog(unittest.TestCase):
         for p in (self.home / "hook.log.1", self.home / "hook.log.2", self.home / "hook.log.3"):
             self.assertNotIn("marker-A", p.read_text())
 
+    def test_keep_out_of_range_or_malformed_falls_back_to_default_cleanly(self):
+        """Round-2 review MAJOR: bash's own arithmetic expansion treats a
+        leading-zero KEEP as octal -- KEEP=08 is an invalid octal digit and
+        would abort mid-shift with the claim already made (stranding the
+        just-claimed content as a permanent hook.log.rotating.<pid> orphan,
+        since the arithmetic error aborts the enclosing script before the
+        landing step ever runs) -- and an unbounded KEEP (e.g. 999999999)
+        would spin the shift loop toward a de-facto-infinite SessionStart
+        hang. Every one of these must instead fall back to the documented
+        default (12) and complete the rotation cleanly: RC=0, content
+        landed at .1, and -- the specific regression this guards -- no
+        hook.log.rotating.<pid> orphan left behind."""
+        for bad_keep in ("0", "08", "012", "abc", "999999999", "-1", "1001"):
+            with self.subTest(keep=bad_keep):
+                hook_log = self.home / "hook.log"
+                hook_log.write_text("first\n" * 100)
+                proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10", MEMCONTINUUM_LOG_KEEP=bad_keep)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("RC=0", proc.stdout, proc.stdout)
+                self.assertEqual((self.home / "hook.log.1").read_text(), "first\n" * 100)
+                self.assertEqual(
+                    list(self.home.glob("hook.log.rotating.*")), [],
+                    f"KEEP={bad_keep!r} must not strand a .rotating.<pid> orphan",
+                )
+                for p in self.home.iterdir():
+                    p.unlink()
+
+    def test_keep_leading_zero_falls_back_to_twelve_not_its_octal_value(self):
+        """KEEP=012 is the specific silent-wrong-number case (round-2
+        review MAJOR): bash's arithmetic expansion reads it as octal 12,
+        i.e. decimal 10, NOT the documented default of 12 -- a bug that
+        only a two-digit-suffix, many-rotations probe can actually
+        distinguish from a correctly-defaulting 12 (fewer rotations look
+        identical either way). 11 rotations with KEEP="012": if the octal
+        bug were still present (effective KEEP=10), the 11th rotation's
+        shift would drop marker-1 (the oldest) one rotation early; with
+        the fix (falls back to 12), nothing is dropped yet and marker-1
+        must still be present at .11."""
+        hook_log = self.home / "hook.log"
+        for i in range(1, 12):
+            hook_log.write_text(f"marker-{i}\n" + ("x" * 100 + "\n") * 5)
+            proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10", MEMCONTINUUM_LOG_KEEP="012")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        self.assertIn("marker-11\n", (self.home / "hook.log.1").read_text())
+        self.assertIn(
+            "marker-1\n", (self.home / "hook.log.11").read_text(),
+            "KEEP=\"012\" must fall back to the default of 12, not octal 10 -- "
+            "marker-1 must survive 11 rotations either way",
+        )
+
+    def test_lowering_keep_prunes_files_beyond_the_new_bound(self):
+        """Round-2 review MINOR (both reviewers): lowering
+        MEMCONTINUUM_LOG_KEEP after files beyond the new bound already
+        exist must actually enforce the smaller bound, not just stop
+        adding to the old one. KEEP=4 across four rotations fills
+        .1 .. .4; a fifth rotation with KEEP=2 must land exactly .1 .2 and
+        remove .3 and .4 outright."""
+        hook_log = self.home / "hook.log"
+        for marker in ("marker-1", "marker-2", "marker-3", "marker-4"):
+            hook_log.write_text(f"{marker}\n" + ("x" * 100 + "\n") * 5)
+            proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10", MEMCONTINUUM_LOG_KEEP="4")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue((self.home / "hook.log.4").exists(), "setup: KEEP=4 must have filled .1..4")
+
+        hook_log.write_text("marker-5\n" + ("x" * 100 + "\n") * 5)
+        proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10", MEMCONTINUUM_LOG_KEEP="2")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        self.assertIn("marker-5\n", (self.home / "hook.log.1").read_text())
+        self.assertIn("marker-4\n", (self.home / "hook.log.2").read_text())
+        self.assertFalse((self.home / "hook.log.3").exists(), "KEEP=2 must prune the old .3")
+        self.assertFalse((self.home / "hook.log.4").exists(), "KEEP=2 must prune the old .4")
+
+    def test_interrupted_shift_recovers_orphan_without_dropping_an_in_window_file(self):
+        """Round-2 review MINOR (both reviewers, Grok's worked sequence):
+        sessionstart-remind.sh's 2s watchdog can kill mc_rotate_hook_log
+        AFTER a shift has fully completed but BEFORE that shift's own
+        claimed content lands at .1 -- this constructs exactly that on-disk
+        state directly (rather than racing a real SIGKILL against two
+        specific mv calls, which the primitive's own comment already
+        proves is not timing-sensitive: the .1-missing check makes the
+        shift idempotent regardless of how many of its steps already ran).
+        KEEP=5 here gives plenty of headroom for all four real windows
+        (the new claim, the recovered orphan, and the two already-shifted
+        files) so NOTHING here is mathematically forced to be dropped --
+        unlike this method's KEEP=3 sibling below, any loss here is purely
+        the bug, not arithmetic. The pre-fix bug drops marker-B anyway (a
+        naive re-shift, confused by the .1 hole, moves marker-A on top of
+        it) and leaves marker-D a permanent, invisible orphan; the fix
+        recovers marker-D into the chain ahead of marker-A and marker-B,
+        with the orphan file gone and nothing lost."""
+        # KEEP=5 was already home to marker-A/marker-B at .2/.3 (.1 empty).
+        # A rotation claiming marker-D ran its shift to full completion
+        # (marker-B -> .3, marker-A -> .2, nothing dropped -- five slots was
+        # room enough) and was killed before landing marker-D itself.
+        (self.home / "hook.log.2").write_text("marker-A\n")
+        (self.home / "hook.log.3").write_text("marker-B\n")
+        dead_pid = "999999999"  # far past any real pid_max -- kill -0 always fails
+        orphan = self.home / f"hook.log.rotating.{dead_pid}"
+        orphan.write_text("marker-D\n")
+        # hook.log itself is absent, matching the real post-claim state.
+
+        hook_log = self.home / "hook.log"
+        hook_log.write_text("marker-E\n" + ("x" * 100 + "\n") * 5)
+        proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10", MEMCONTINUUM_LOG_KEEP="5")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        self.assertIn("marker-E\n", (self.home / "hook.log.1").read_text())
+        self.assertIn(
+            "marker-D\n", (self.home / "hook.log.2").read_text(),
+            "the recovered orphan (marker-D) must land ahead of marker-A and marker-B",
+        )
+        self.assertIn("marker-A\n", (self.home / "hook.log.3").read_text())
+        self.assertIn(
+            "marker-B\n", (self.home / "hook.log.4").read_text(),
+            "marker-B must survive: with KEEP=5 and only 4 real windows "
+            "(E, D, A, B) nothing needs to be dropped at all",
+        )
+        self.assertFalse((self.home / "hook.log.5").exists())
+        self.assertEqual(
+            list(self.home.glob("hook.log.rotating.*")), [],
+            "the recovered orphan must not remain on disk under its old name",
+        )
+
+    def test_interrupted_shift_recovery_matches_two_sequential_uninterrupted_rotations(self):
+        """The same fixture as above, but at KEEP=3 -- the reviewers' own
+        worked example. Here there genuinely are more real windows (E, D,
+        A, B) than slots (3), so marker-B (the oldest of the four) is
+        correctly dropped -- but it must be dropped as the RIGHT victim,
+        not an arbitrary one a hole-confused naive re-shift would pick.
+        The fixed result must be byte-for-byte what two separate,
+        uninterrupted rotations (one landing marker-D, then one landing
+        marker-E) would have produced -- proving recovery doesn't merely
+        avoid a crash, it reproduces the correct history."""
+        (self.home / "hook.log.2").write_text("marker-A\n")
+        (self.home / "hook.log.3").write_text("marker-B\n")
+        dead_pid = "999999998"
+        padded_marker_d = "marker-D\n" + ("x" * 100 + "\n") * 5
+        (self.home / f"hook.log.rotating.{dead_pid}").write_text(padded_marker_d)
+
+        hook_log = self.home / "hook.log"
+        hook_log.write_text("marker-E\n" + ("x" * 100 + "\n") * 5)
+        proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10", MEMCONTINUUM_LOG_KEEP="3")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        # Reference: what an uninterrupted "land D, then land E" sequence
+        # produces from the same starting .2=A/.3=B, computed independently
+        # via two direct rotation cycles against a fresh sibling home dir
+        # (MEMCONTINUUM_HOME overridden per-call, same as _call_rotate's
+        # own env_overrides mechanism -- self.home stays the recovery run
+        # above, untouched by this reference computation).
+        ref_home = Path(self.td) / "reference-home"
+        ref_home.mkdir()
+        (ref_home / "hook.log.2").write_text("marker-A\n")
+        (ref_home / "hook.log.3").write_text("marker-B\n")
+        ref_hook_log = ref_home / "hook.log"
+        ref_hook_log.write_text("marker-D\n" + ("x" * 100 + "\n") * 5)
+        ref_proc1 = self._call_rotate(
+            MEMCONTINUUM_HOME=str(ref_home), MEMCONTINUUM_LOG_MAX_BYTES="10", MEMCONTINUUM_LOG_KEEP="3",
+        )
+        self.assertEqual(ref_proc1.returncode, 0, ref_proc1.stderr)
+        ref_hook_log.write_text("marker-E\n" + ("x" * 100 + "\n") * 5)
+        ref_proc2 = self._call_rotate(
+            MEMCONTINUUM_HOME=str(ref_home), MEMCONTINUUM_LOG_MAX_BYTES="10", MEMCONTINUUM_LOG_KEEP="3",
+        )
+        self.assertEqual(ref_proc2.returncode, 0, ref_proc2.stderr)
+
+        for n in (1, 2, 3):
+            self.assertEqual(
+                (self.home / f"hook.log.{n}").read_text(),
+                (ref_home / f"hook.log.{n}").read_text(),
+                f".{n} must match the uninterrupted two-rotation reference exactly",
+            )
+        self.assertFalse((self.home / "hook.log.4").exists())
+        self.assertEqual(list(self.home.glob("hook.log.rotating.*")), [])
+
+    def test_interrupted_shift_recovery_never_touches_a_live_pid_orphan(self):
+        """The other half of the same fix: a `.rotating.<pid>` file whose
+        pid is genuinely still running (another session's claim truly in
+        flight right now) must be left completely alone -- only a DEAD
+        pid's leftover is a real orphan."""
+        live_pid = str(os.getpid())  # this test process itself -- certainly alive
+        live_orphan = self.home / f"hook.log.rotating.{live_pid}"
+        live_orphan.write_text("still-claiming\n")
+
+        hook_log = self.home / "hook.log"
+        hook_log.write_text("marker-1\n" + ("x" * 100 + "\n") * 5)
+        proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10", MEMCONTINUUM_LOG_KEEP="3")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        self.assertTrue(live_orphan.exists(), "a live-pid orphan must never be touched")
+        self.assertEqual(live_orphan.read_text(), "still-claiming\n")
+        self.assertIn("marker-1\n", (self.home / "hook.log.1").read_text())
+
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores permission bits")
     def test_unwritable_home_dir_fails_open_leaves_log_alone(self):
         hook_log = self.home / "hook.log"

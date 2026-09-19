@@ -7464,8 +7464,19 @@ def _rotated_hook_log_paths(log_path: Path) -> list:
     KEEP value change. Only a pure-digit suffix counts: mc_rotate_hook_log's
     own atomic-claim temp file (`hook.log.rotating.<pid>`), never meant to
     survive a rotation, and any other stray suffix are ignored, never swept
-    in as a data file. Fail-open like every other hook.log reader here: an
-    unlistable directory yields an empty list, never a raised error."""
+    in as a data file. `isascii() and isdigit()`, not `isdigit()` alone
+    (round-2 review NIT): plain `str.isdigit()` also returns True for
+    non-ASCII digit characters (e.g. superscript '²'), which `int()`
+    then happily parses too -- but a suffix built from one would never
+    have come from mc_rotate_hook_log's own `$((n + 1))` (pure ASCII shell
+    arithmetic), so accepting it here would only ever be accepting some
+    unrelated file that happens to look numbered, and `int()` on certain
+    such strings can raise in ways this fail-open reader must never
+    surface as `stats: internal error`. Sorted purely numerically (`.10`
+    sorts after `.9`, never before it lexically) so retention beyond a
+    single digit is ordered correctly. Fail-open like every other
+    hook.log reader here: an unlistable directory yields an empty list,
+    never a raised error."""
     prefix = log_path.name + "."
     numbered: list = []
     try:
@@ -7473,7 +7484,7 @@ def _rotated_hook_log_paths(log_path: Path) -> list:
             if not p.name.startswith(prefix):
                 continue
             suffix = p.name[len(prefix):]
-            if suffix.isdigit():
+            if suffix.isascii() and suffix.isdigit():
                 numbered.append((int(suffix), p))
     except OSError:
         return []
@@ -7541,7 +7552,22 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
             pass
 
     try:
-        raw_lines = rotated_lines + log_path.read_text(errors="replace").splitlines()
+        primary_lines = log_path.read_text(errors="replace").splitlines()
+    except FileNotFoundError:
+        # Round-2 review NIT: a missing PRIMARY hook.log must not discard
+        # the rotated lines already collected above -- it is the ordinary,
+        # expected state right after a rotation (or, with bounded
+        # retention, whenever hook.log.<N> files still hold real data but
+        # the current hook.log genuinely has nothing to report yet). This
+        # is deliberately NOT the same as "exists but unreadable" below:
+        # cmd_stats' own open+close probe already reports THAT case with
+        # its own distinct message before ever reaching this function, so
+        # by the time a caller gets here with a plain FileNotFoundError,
+        # it is either the everyday missing-primary case above or a
+        # narrow TOCTOU race (probed-then-deleted) -- both are "primary
+        # contributes zero lines", never a reason to drop the rotated
+        # lines already in hand.
+        primary_lines = []
     except OSError:
         # Fix round 1 (review finding, IMPORTANT; historical -- at the
         # time, this function returned a 4-tuple): this branch used to
@@ -7559,6 +7585,7 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
         # trip-wire for the next person editing either branch alone.
         return buckets, unknown_lines, projects_seen, unparseable_lines, untimestamped_lines
 
+    raw_lines = rotated_lines + primary_lines
     for line in raw_lines:
         if not line.strip():
             continue
@@ -7942,7 +7969,16 @@ def cmd_stats(args) -> int:
             now = datetime.now(timezone.utc)
         cutoff = now - timedelta(days=args.days)
 
-        if not log_path.exists():
+        # Round-2 review NIT: "no hook.log" must mean there is truly
+        # nothing to report, not merely that the CURRENT hook.log happens
+        # to be missing -- with bounded rotation, a real store can easily
+        # have every one of its actual rows sitting in hook.log.1..N while
+        # the live hook.log is momentarily absent (right after a rotation,
+        # before the next append recreates it via mc_log's own `>>`).
+        # Printing "no hook.log" and returning here in that case used to
+        # silently discard every rotated row too (see _scan_hook_log's own
+        # FileNotFoundError branch, added alongside this fix).
+        if not log_path.exists() and not _rotated_hook_log_paths(log_path):
             print(f"no hook.log at {log_path}")
             return 0
 
@@ -7955,12 +7991,17 @@ def cmd_stats(args) -> int:
         # exists specifically to avoid. _scan_hook_log's own OSError
         # branch (see its comment) is a defensive fallback for the TOCTOU
         # gap between this check and the real read, not the primary path.
-        try:
-            with open(log_path, "r"):
-                pass
-        except OSError as e:
-            print(f"hook.log exists but is unreadable at {log_path} ({e})")
-            return 0
+        # Only probed when the primary actually exists -- a missing
+        # primary alongside present rotated files (the case just carved
+        # out above) has nothing to probe and falls straight through to
+        # _scan_hook_log, which handles a missing primary on its own.
+        if log_path.exists():
+            try:
+                with open(log_path, "r"):
+                    pass
+            except OSError as e:
+                print(f"hook.log exists but is unreadable at {log_path} ({e})")
+                return 0
 
         buckets, unknown_lines, projects_seen, unparseable_lines, untimestamped_lines = _scan_hook_log(
             log_path, cutoff, now
