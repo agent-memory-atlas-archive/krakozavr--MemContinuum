@@ -3414,6 +3414,27 @@ def assumptions_for_topic(conn, topic_path: str) -> dict[str, list]:
     return grouped
 
 
+def _chain_link_ruling_head(lr) -> str:
+    """The link's own ruling/reverses head line -- WITHOUT its optional
+    rationale suffix and WITHOUT any ↳ edge lines. The minimum a chain
+    render ever shows for a link. Shared by _chain_link_lines (which
+    appends the rationale suffix when present, below) and
+    topic_chain_lines_capped's own degrade-when-oversized path (MAJOR
+    fix-round item c, re-gate round 3: the current link must fit the hard
+    cap too, dropping its rationale/evidence before its ruling)."""
+    head = f"  {lr['link']} {lr['date']} {lr['kind']}"
+    if lr["reverses"]:
+        reason = lr["reason_for_change"] or ""
+        why = lr["rationale_text"] or lr["ruling_text"] or ""
+        head += f"  ← reverses {lr['reverses']} ({reason}: {why})"
+    elif lr["ruling_text"]:
+        quote = lr["ruling_text"]
+        if lr["ruling_authority"] in ("owner-verbatim", "owner-ratified"):
+            quote = f'"{quote}"'
+        head += f"   {quote} ({lr['ruling_authority']})"
+    return head
+
+
 def _chain_link_lines(topic_row, lr, edges_by_from) -> list[str]:
     """One link's own rendered lines (its head line plus any ↳ edge
     lines) -- extracted out of chain_lines' per-link loop body (MAJOR
@@ -3422,24 +3443,38 @@ def _chain_link_lines(topic_row, lr, edges_by_from) -> list[str]:
     driftable implementation. Never includes the shared header line (one
     per topic, not per link) or the aggregate "broken assumptions:" block
     (spans every link, not just this one) -- both stay the caller's own job."""
-    head = f"  {lr['link']} {lr['date']} {lr['kind']}"
-    if lr["reverses"]:
-        reason = lr["reason_for_change"] or ""
-        why = lr["rationale_text"] or lr["ruling_text"] or ""
-        head += f"  ← reverses {lr['reverses']} ({reason}: {why})"
-    else:
-        if lr["ruling_text"]:
-            quote = lr["ruling_text"]
-            if lr["ruling_authority"] in ("owner-verbatim", "owner-ratified"):
-                quote = f'"{quote}"'
-            head += f"   {quote} ({lr['ruling_authority']})"
-        if lr["rationale_text"]:
-            head += f" because {lr['rationale_text']} ({lr['rationale_authority']})"
+    head = _chain_link_ruling_head(lr)
+    if not lr["reverses"] and lr["rationale_text"]:
+        head += f" because {lr['rationale_text']} ({lr['rationale_authority']})"
     lines = [head]
     from_ref = f"{topic_row['id']}/{lr['link']}"
     for edge in edges_by_from.get(from_ref, []):
         lines.append(f"    ↳ {edge['rel']} → {edge['to_ref']}")
     return lines
+
+
+def _utf8_safe_truncate(s: str, max_bytes: int) -> str:
+    """The largest PREFIX of `s` whose UTF-8 encoding is at most
+    `max_bytes` -- never splits a multi-byte codepoint (a plain
+    `s.encode()[:n]` can, silently producing invalid UTF-8 or dropping a
+    trailing partial character in a way `bytes.decode()` would then have
+    to paper over). Binary search on CHARACTER count (python string
+    indexing is already codepoint-safe) rather than byte count, since a
+    codepoint's own byte width varies with the character (re-gate round
+    3, MAJOR 3: exercised directly by a Cyrillic fixture, where every
+    character costs 2 UTF-8 bytes). `max_bytes <= 0` returns ""."""
+    if max_bytes <= 0:
+        return ""
+    if len(s.encode("utf-8")) <= max_bytes:
+        return s
+    lo, hi = 0, len(s)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(s[:mid].encode("utf-8")) <= max_bytes:
+            lo = mid
+        else:
+            hi = mid - 1
+    return s[:lo]
 
 
 def _chain_header_line(topic_row, current_link) -> str:
@@ -3880,21 +3915,42 @@ def topic_chain_lines(conn, topic_row) -> list:
     )
 
 
+def _lines_cost(lines) -> int:
+    """UTF-8 byte cost of appending `lines` to an already-started "\\n"-
+    joined render -- one leading "\\n" (1 byte) plus each line's own
+    encoding, per line. Matches exactly how "\\n".join eventually spends
+    these same bytes; used by topic_chain_lines_capped to budget every
+    piece of the render, not just whole links (re-gate round 3, MAJOR 3)."""
+    return sum(len(line.encode("utf-8")) + 1 for line in lines)
+
+
 def topic_chain_lines_capped(conn, topic_row, max_bytes: int) -> list:
     """Byte-capped counterpart to topic_chain_lines -- MAJOR fix-round item
     c (measured: two `--hydrate` hits off a 16-link topic exceeded 10KB
-    with no cap). Selection is by PRIORITY: the active/current link is
-    always kept in full, then remaining links newest-first (seq DESC)
-    until `max_bytes` is spent. The KEPT links are then rendered back in
-    chain_lines' own canonical seq-ASC order via the shared
-    _chain_link_lines/_chain_header_line helpers -- so a topic that fits
-    under the cap (nothing omitted) renders BYTE-IDENTICAL output to the
-    uncapped topic_chain_lines (pinned in tests/test_memidx.py with a
-    2-link fixture). A topic that does not fit gets exactly one explicit
-    marker line ahead of the oldest KEPT link naming how many older links
-    were left out -- never a silent truncation. `max_bytes` counts the
-    UTF-8 encoding of the final "\\n"-joined text (the same bytes a
-    caller embeds into additionalContext/chain_text), not character count."""
+    with no cap). This is a HARD cap (re-gate round 3): the header, the
+    omission marker, and the "broken assumptions:" block all count
+    against `max_bytes` too -- the round-2 version budgeted only whole
+    OTHER links and appended the marker/current-link/broken-assumptions
+    text AFTER budgeting, which could exceed the cap by however much
+    those pieces cost (measured: a cap of 1660 rendered 1691 bytes, and
+    caps of 500/100/10 all rendered the SAME 665 bytes -- the current
+    link's own full render, never itself checked against the budget).
+
+    Selection is by PRIORITY: the active/current link is always kept --
+    in full when it fits, degraded (ruling kept, rationale/evidence
+    dropped, itself marked, or as a last resort UTF-8-safely truncated)
+    when even alone it does not -- then remaining links newest-first
+    (seq DESC) until the budget left after the current link (and, if one
+    is needed, the omission marker) is spent. The KEPT links are then
+    rendered back in chain_lines' own canonical seq-ASC order via the
+    shared _chain_link_lines/_chain_header_line helpers -- so a topic
+    that fits under the cap (nothing omitted, current link unmodified)
+    renders BYTE-IDENTICAL output to the uncapped topic_chain_lines
+    (pinned in tests/test_memidx.py with a 2-link fixture). `max_bytes`
+    counts the UTF-8 encoding of the final "\\n"-joined text (the same
+    bytes a caller embeds into additionalContext/chain_text), not
+    character count -- verified directly against a Cyrillic fixture,
+    where every character costs 2 bytes, not 1."""
     link_rows = conn.execute(
         "SELECT * FROM links WHERE topic_path=? ORDER BY seq ASC", (topic_row["path"],)
     ).fetchall()
@@ -3903,45 +3959,115 @@ def topic_chain_lines_capped(conn, topic_row, max_bytes: int) -> list:
 
     current_link = _chain_current_link(link_rows)
     header = _chain_header_line(topic_row, current_link)
-    budget = max_bytes - len(header.encode("utf-8"))
+    header_bytes = len(header.encode("utf-8"))
+    if header_bytes >= max_bytes:
+        # The header alone does not fit -- the absolute last resort:
+        # truncate IT, on a UTF-8-safe boundary, and render nothing else.
+        return [_utf8_safe_truncate(header, max_bytes)]
+    budget = max_bytes - header_bytes
 
     keep_ids = set()
+    current_lines: list = []
     if current_link is not None:
         keep_ids.add(id(current_link))
-        current_block = "\n".join(_chain_link_lines(topic_row, current_link, edges_by_from))
-        budget -= len(current_block.encode("utf-8")) + 1   # +1 for the joining "\n"
+        full = _chain_link_lines(topic_row, current_link, edges_by_from)
+        full_cost = _lines_cost(full)
+        if full_cost <= budget:
+            current_lines = full
+        else:
+            ruling_only = [_chain_link_ruling_head(current_link)]
+            ruling_marker = "  [... rationale/evidence omitted]"
+            with_marker_cost = _lines_cost(ruling_only + [ruling_marker])
+            ruling_only_cost = _lines_cost(ruling_only)
+            if with_marker_cost <= budget:
+                current_lines = ruling_only + [ruling_marker]
+            elif ruling_only_cost <= budget:
+                current_lines = ruling_only
+            elif budget >= 1:
+                # Even the bare ruling head does not fit -- truncate ITS
+                # text (never exceed the cap by even one byte: 1 byte for
+                # the joining "\n", the rest for the truncated text).
+                current_lines = [_utf8_safe_truncate(ruling_only[0], budget - 1)]
+            # else: budget < 1 -- nothing more fits after the header at
+            # all; current_lines stays [] (still counted as "kept", just
+            # rendered as nothing -- the header alone still names the
+            # topic and its current link's own id/title).
+        budget -= _lines_cost(current_lines)
 
+    # Priority-order candidates for the remaining budget: newest-first,
+    # tracked in THAT add order so freeing budget for the marker below
+    # (if it doesn't fit either) pops the OLDEST kept "other" link first
+    # -- the one least recently prioritized, without a second seq scan.
     others_newest_first = [lr for lr in reversed(link_rows) if lr is not current_link]
+    kept_other_order: list = []   # ids, newest-kept-first
+    kept_other_blocks: dict = {}
     for lr in others_newest_first:
-        block = "\n".join(_chain_link_lines(topic_row, lr, edges_by_from))
-        cost = len(block.encode("utf-8")) + 1
+        block = _chain_link_lines(topic_row, lr, edges_by_from)
+        cost = _lines_cost(block)
         if cost > budget:
-            # Older entries are no more likely to fit than this one, and
-            # skipping ahead of a not-fitting entry would break the
-            # newest-first priority order -- stop here rather than probe
-            # every remaining (older) link individually.
             break
         keep_ids.add(id(lr))
+        kept_other_order.append(id(lr))
+        kept_other_blocks[id(lr)] = block
         budget -= cost
 
     omitted = len(link_rows) - len(keep_ids)
-
-    lines = [header]
+    marker_line = None
     if omitted:
-        lines.append(f"  [... {omitted} older link(s) omitted]")
-    broken = []
+        marker_line = f"  [... {omitted} older link(s) omitted]"
+        marker_cost = _lines_cost([marker_line])
+        while marker_cost > budget and kept_other_order:
+            # The marker itself must fit inside the cap too (hard cap) --
+            # sacrifice the oldest KEPT "other" link (never the current
+            # one) to free room for it, re-measuring as the omitted count
+            # (and so the marker's own text) grows.
+            freed_id = kept_other_order.pop()
+            budget += _lines_cost(kept_other_blocks.pop(freed_id))
+            keep_ids.discard(freed_id)
+            omitted += 1
+            marker_line = f"  [... {omitted} older link(s) omitted]"
+            marker_cost = _lines_cost([marker_line])
+        if marker_cost <= budget:
+            budget -= marker_cost
+        else:
+            # Even a single-link marker does not fit (a pathologically
+            # tiny cap) -- omit the marker text itself rather than break
+            # the hard cap; the omission is still real, just unnamed.
+            marker_line = None
+
+    broken_candidates = []
     for lr in link_rows:   # canonical seq-ASC order
         if id(lr) not in keep_ids:
             continue
-        lines.extend(_chain_link_lines(topic_row, lr, edges_by_from))
         for a in assumptions_by_link.get(lr["link"], []):
             if a["status"] == "broken":
-                broken.append(a)
-    if broken:
-        lines.append("broken assumptions:")
-        for a in broken:
-            since = f" (since {a['since']})" if a["since"] else ""
-            lines.append(f"  {a['aid']}{since}: {a['text']}")
+                broken_candidates.append(a)
+
+    broken_lines: list = []
+    if broken_candidates:
+        heading = "broken assumptions:"
+        heading_cost = _lines_cost([heading])
+        if heading_cost <= budget:
+            budget -= heading_cost
+            broken_lines.append(heading)
+            for a in broken_candidates:
+                since = f" (since {a['since']})" if a["since"] else ""
+                line = f"  {a['aid']}{since}: {a['text']}"
+                cost = _lines_cost([line])
+                if cost > budget:
+                    break
+                broken_lines.append(line)
+                budget -= cost
+
+    lines = [header]
+    if marker_line is not None:
+        lines.append(marker_line)
+    for lr in link_rows:   # canonical seq-ASC order
+        if lr is current_link:
+            lines.extend(current_lines)
+        elif id(lr) in keep_ids:
+            lines.extend(kept_other_blocks[id(lr)])
+    lines.extend(broken_lines)
     return lines
 
 

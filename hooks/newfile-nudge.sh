@@ -731,9 +731,14 @@ print(d.get("cwd", "") or "")
             # identical comment -- millisecond timing of this subprocess
             # call only, via mc_now_ms (hooks/mc-query-lib.sh); never set
             # (and never logged) when the call above is skipped entirely.
+            # MINOR fix-round item: see pre-edit-chain.sh's identical
+            # fb-started marker comment -- same mechanism here.
+            FB_STARTED_MARKER="$MEMCONTINUUM_HOME/.fb-started.$$"
+            : >"$FB_STARTED_MARKER" 2>/dev/null || true
             FB_MS_T0="$(mc_now_ms "$PY")"
             FB_JSON_RAW="$(PYTHONPATH= "$PY" "$FB_MEMIDX" "${FB_ARGS[@]}" 2>/dev/null)"
             FB_RC=$?
+            rm -f "$FB_STARTED_MARKER" 2>/dev/null || true
             FB_RAN=1
             FB_MS_T1="$(mc_now_ms "$PY")"
             case "$FB_MS_T0$FB_MS_T1" in
@@ -743,90 +748,26 @@ print(d.get("cwd", "") or "")
         fi
         FB_HITS=""
         FB_IDS=""
-        FB_LABEL_AND_CHAINS=""
+        FB_TEXT=""
         FB_HITS_FOR_STATE=""
         FB_REASON=""
-        # MAJOR fix-round item b: see pre-edit-chain.sh's identical parser
-        # for the full reason-vocabulary rationale -- runs whenever EITHER
-        # something reached stdout OR the subprocess ACTUALLY RAN and
-        # exited non-zero (FB_RAN, not FB_RC alone: this hook's own
-        # db-missing skip above never runs the subprocess at all and
-        # must NOT be reported as "search-failed rc=1" -- it degrades to
-        # the ordinary "no-hits" default below, same as before this fix).
+        # Re-gate round 3, MINOR duplication: shared with hooks/pre-edit-
+        # chain.sh via mc_fallback_parse, hooks/mc-fallback-lib.sh -- see
+        # that file's own header for the full reason-vocabulary rationale.
+        # Runs whenever EITHER something reached stdout OR the subprocess
+        # ACTUALLY RAN and exited non-zero (FB_RAN, not FB_RC alone: this
+        # hook's own db-missing skip above never runs the subprocess at
+        # all and must NOT be reported as "search-failed rc=1" -- it
+        # degrades to the ordinary "no-hits" default below).
         FB_SHOULD_PARSE=0
         [ -n "$FB_JSON_RAW" ] && FB_SHOULD_PARSE=1
         [ "$FB_RAN" = "1" ] && [ "$FB_RC" -ne 0 ] && FB_SHOULD_PARSE=1
         if [ "$FB_SHOULD_PARSE" = "1" ]; then
-            export HOOK_FB_LABEL='No recorded decision binds this file. Nearest by search -- may be unrelated:'
-            export MC_FB_RC="$FB_RC"
-            {
-                IFS= read -r -d '' FB_HITS
-                IFS= read -r -d '' FB_IDS
-                IFS= read -r -d '' FB_LABEL_AND_CHAINS
-                IFS= read -r -d '' FB_HITS_FOR_STATE
-                IFS= read -r -d '' FB_REASON
-            } < <(printf '%s' "$FB_JSON_RAW" | PYTHONPATH= "$PY" -c '
-import json, os, sys
-
-rc = int(os.environ.get("MC_FB_RC", "1") or "1")
-raw = sys.stdin.read()
-
-d = None
-if raw:
-    try:
-        d = json.loads(raw)
-    except Exception:
-        d = None
-
-hits = []
-state = None
-reason = ""
-if rc != 0:
-    if isinstance(d, dict):
-        reason = d.get("reason") or d.get("state") or ""
-    if not reason:
-        reason = f"search-failed rc={rc}"
-elif d is None:
-    reason = "bad-json"
-else:
-    if isinstance(d, dict):
-        state = d.get("state")
-        hits = d.get("results", [])
-    elif isinstance(d, list):
-        hits = d
-    if not isinstance(hits, list):
-        hits = []
-
-label = os.environ.get("HOOK_FB_LABEL", "")
-chain_texts = []
-ids = []
-for_state = []
-for h in hits:
-    if not isinstance(h, dict):
-        continue
-    ct = h.get("chain_text", "") or ""
-    if not ct:
-        continue
-    hid = str(h.get("id", ""))
-    ids.append(hid)
-    chain_texts.append(ct)
-    for_state.append({"id": hid, "title": str(h.get("title", "") or "")})
-
-if not chain_texts and not reason:
-    reason = state if state in ("quarantined", "stale") else "no-hits"
-
-if not chain_texts:
-    fields = ("0", "", "", "", reason)
-else:
-    fields = (
-        str(len(chain_texts)), ",".join(ids),
-        label + "\n\n" + "\n\n".join(chain_texts), json.dumps(for_state), "",
-    )
-
-for field in fields:
-    sys.stdout.write(field.replace(chr(0), ""))
-    sys.stdout.write(chr(0))
-' 2>/dev/null)
+            # shellcheck source=mc-fallback-lib.sh
+            source "$SCRIPT_DIR/mc-fallback-lib.sh"
+            mc_fallback_parse "$PY" "$FB_RC" \
+                'No recorded decision binds this file. Nearest by search -- may be unrelated:' \
+                0 "$FB_JSON_RAW"
         fi
         FB_MS_PART=""
         [ -n "$FB_MS" ] && FB_MS_PART=" fb_ms=$FB_MS"
@@ -841,16 +782,18 @@ for field in fields:
             # throughout (label to chain_text, chain_text to chain_text) --
             # the old single-newline join here was the one place this
             # feature glued two blocks together differently.
-            MESSAGE="${MESSAGE}"$'\n\n'"${FB_LABEL_AND_CHAINS}"
-            FB_EXTRA="fb_outcome=search-fallback fb_hits=$FB_HITS fb_ids=$FB_IDS fb_mode=$FB_MODE fb_q=$FB_QUERY_LOGGED$FB_MS_PART"
+            MESSAGE="${MESSAGE}"$'\n\n'"${FB_TEXT}"
 
             # Session-state title storage (docs/INTERNALS.md "search
             # fallback"): same mechanism, same `search_fallbacks` state key
-            # pre-edit-chain.sh's own fallback already writes to -- see
-            # that file's own comment for the full rationale. Lazy
-            # session_id parse + memlib.sh source, paid ONLY on this
-            # already-rare (new file, wired, at least one search hit)
-            # branch.
+            # pre-edit-chain.sh's own fallback already writes to. Re-gate
+            # round 3, MAJOR 1: the SAME short-deadline reasoning applies
+            # here too -- this hook's own final additionalContext print
+            # (OUTPUT_JSON, below) happens AFTER this state write, so a
+            # lock held for the whole run must not be allowed to eat the
+            # 2s watchdog budget this hook shares -- see hooks/pre-edit-
+            # chain.sh's own identical comment for the full rationale.
+            FB_STATE_PART=""
             FB_SESSION_ID=""
             if [ -n "$PAYLOAD" ]; then
                 if command -v jq >/dev/null 2>&1; then
@@ -870,51 +813,11 @@ print(d.get("session_id", "") or "")
                 # shellcheck source=memlib.sh
                 source "$SCRIPT_DIR/memlib.sh"
                 FB_STATE_FILE="$(mc_state_file_for "$PROJECT" "$FB_SESSION_ID")"
-                export MC_FB_FILE="$FILE_PATH"
-                export MC_FB_HITS_JSON="$FB_HITS_FOR_STATE"
-                mc_update_state_json "$FB_STATE_FILE" '
-import json, os
-
-try:
-    new_hits = json.loads(os.environ.get("MC_FB_HITS_JSON") or "[]")
-except Exception:
-    new_hits = []
-if not isinstance(new_hits, list):
-    new_hits = []
-
-existing = state.get("search_fallbacks")
-if not isinstance(existing, list):
-    existing = []
-
-fb_file = os.environ.get("MC_FB_FILE", "")
-
-# MAJOR fix-round item e: same dedup-by-(file, id) as pre-edit-chain.sh
-# own identical state write -- see that file own comment for the full
-# rationale. Both hooks share this one `search_fallbacks` state key, so
-# both need the same dedup rule or a mix of the two hooks firing on the
-# same file/id would still double up.
-new_keys = set()
-for h in new_hits:
-    if isinstance(h, dict):
-        new_keys.add((fb_file, str(h.get("id", ""))))
-existing = [
-    e for e in existing
-    if not (isinstance(e, dict) and (e.get("file"), e.get("id")) in new_keys)
-]
-for h in new_hits:
-    if not isinstance(h, dict):
-        continue
-    title = str(h.get("title", "") or "")[:120]
-    existing.append({
-        "file": fb_file,
-        "id": str(h.get("id", "")),
-        "title": title,
-        "hook": "newfile-nudge",
-    })
-state["search_fallbacks"] = existing[-20:]
-print(json.dumps(state))
-' >>"$MC_LOG" 2>&1 || true
+                if ! mc_fallback_write_state "$FB_STATE_FILE" "$FILE_PATH" "$FB_HITS_FOR_STATE" "newfile-nudge" 0.25; then
+                    FB_STATE_PART=" fb_state=skipped-lock"
+                fi
             fi
+            FB_EXTRA="fb_outcome=search-fallback fb_hits=$FB_HITS fb_ids=$FB_IDS fb_mode=$FB_MODE fb_q=$FB_QUERY_LOGGED$FB_MS_PART$FB_STATE_PART"
         fi
     fi
 fi

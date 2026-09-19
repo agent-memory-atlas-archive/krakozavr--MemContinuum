@@ -164,11 +164,18 @@ other timeout. The fallback subprocess's own stderr is routed to
 `/dev/null`, never appended to hook.log (a stray, untimestamped line would
 otherwise break the "exactly one line per invocation" contract).
 
-**No write path.** The fallback never touches the store or the index
-beyond reading it — `git status --short` on a fixture store stays clean and
-the index file's sha256 is unchanged across repeated fallback runs (proven
-even against a schema behind the current generation, which the ordinary rw path WOULD
-migrate on open — see `--read-only` above). The one state write EITHER
+**No write path (scope: the fallback search itself).** The fallback's own
+`search --read-only` call never touches the store or the index beyond
+reading it — `git status --short` on a fixture store stays clean and the
+index file's sha256 is unchanged across repeated fallback-only runs (proven
+even against a schema behind the current generation, which the ordinary rw
+path WOULD migrate on open — see `--read-only` above). This is narrower
+than "the whole hook run never writes the index" — on a MISS, the same
+hook run's own EARLIER `for-path` lookup (unchanged
+by this feature, and correctly so: a match must keep seeing a migrated,
+current schema) still opens the index the ordinary rw way and can migrate/
+stamp it exactly as it always has, before the fallback ever gets a turn.
+The one state write EITHER
 hook makes is titling: on a hit, each surfaced (id, title) pair is
 appended to the current session's own state file (the same
 `sessions/<project>/<session>.json`, `mc_update_state_json`, every

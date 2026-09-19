@@ -1363,6 +1363,66 @@ class TestF1DecisionIndexState(unittest.TestCase):
             self.assertNotIn("omitted", chain_text)
             self.assertEqual(chain_text, uncapped)
 
+    def _build_single_oversized_link_fixture(self, db: Path, project: str = memidx.DEFAULT_PROJECT):
+        """ONE link, deliberately larger than any cap this test exercises
+        (a 5000-char ruling AND a 5000-char rationale) -- the round-2
+        fixture's own ~240-byte links could never expose the "current
+        link kept whole regardless of budget" bug (MAJOR fix-round item
+        c, re-gate round 3): a single link smaller than every cap under
+        test never needs the degrade path at all."""
+        conn = memidx.open_db(db, project=project)
+        now = time.time()
+        conn.execute(
+            "INSERT INTO records (path, sha256, mtime, size, project, id, title, type, status, "
+            "area, topic, body, source_path) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("single.md", "deadbeef", now, 100, project, "TOP-8888", "Single link topic",
+             "topic", "active", "a", "t", "body text", "single.md"),
+        )
+        conn.execute(
+            "INSERT INTO fts (path, project, title, body, ruling_text) VALUES (?,?,?,?,?)",
+            ("single.md", project, "Single link topic", "body text", "x" * 5000),
+        )
+        conn.execute(
+            "INSERT INTO links (topic_path, project, link, seq, date, kind, status, "
+            "ruling_text, ruling_authority, rationale_text, rationale_authority) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            ("single.md", project, "L1", 1, "2020-01-01", "ruling", "active",
+             "x" * 5000, "owner-ratified", "y" * 5000, "agent-inference"),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_hydrate_max_bytes_hard_cap_never_exceeded_single_oversized_link(self):
+        """Re-gate round 3, MAJOR 3, pinning: the round-2 cap was SOFT --
+        the current link was rendered in full regardless of budget, and
+        the marker/broken-assumptions lines were appended AFTER budgeting
+        (measured on the real bug: cap 1660 rendered 1691, caps 500/100/10
+        all rendered the same 665 bytes). A single link far larger than
+        any cap under test must never let `chain_text` exceed that cap,
+        for every cap from a generous 2000 bytes down to a pathological
+        10 -- the hard-cap property this function's own docstring now
+        promises ("never exceed the cap by even one byte")."""
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            self._build_single_oversized_link_fixture(db)
+            for cap in (10, 100, 500, 1660, 2000):
+                with self.subTest(cap=cap):
+                    buf_out, buf_err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                        rc = memidx.cmd_search(ns(
+                            project=memidx.DEFAULT_PROJECT, db=str(db), query="single",
+                            mode="fts", status=[], type=[], area=None, topic=None, authority=None,
+                            limit=10, json=True, hydrate=True, hydrate_max_bytes=cap,
+                        ))
+                    self.assertEqual(rc, 0)
+                    results = json.loads(buf_out.getvalue())
+                    self.assertTrue(results)
+                    chain_text = results[0]["chain_text"]
+                    self.assertLessEqual(
+                        len(chain_text.encode("utf-8")), cap,
+                        f"cap={cap} exceeded: {len(chain_text.encode('utf-8'))} bytes",
+                    )
+
     def test_for_path_missing_or_uninitialized_exits_3_with_named_state(self):
         # Final-fix-wave item 3: a bare `[]` under --json no longer tells a
         # direct caller WHICH non-current state it got (missing vs.

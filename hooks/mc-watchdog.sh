@@ -148,8 +148,32 @@ def _log_watchdog_kill():
         # rather than ever emitting a bare line with none at all.
         project = os.environ.get("MEMCONTINUUM_PROJECT") or "(pre-resolution)"
         os.makedirs(home, exist_ok=True)
+        # MINOR fix-round item (search fallback, TOP-0133 L1): the p50/p95
+        # timing pool (memidx.py stats) is blind to the slow tail -- a
+        # watchdog-killed run logs no `search-fallback`/`-empty` line at
+        # all, so a query that was ABOUT to answer (or already had) never
+        # shows up anywhere. The guarded child writes a marker file
+        # (`.fb-started.<its own pid>`, same pid Popen sees below since
+        # start_new_session=True execs it directly, no intermediate
+        # shell) the instant it starts the search subprocess, and removes
+        # it the instant that call returns -- so the marker's mere
+        # EXISTENCE at kill time means the fallback search was in flight
+        # when this launcher killed the group. Best-effort like everything
+        # else here: a missing/unwritable marker just means `fb_started=1`
+        # is omitted, never a crash.
+        try:
+            marker = os.path.join(home, f".fb-started.{proc.pid}") if proc is not None else None
+        except Exception:
+            marker = None
+        fb_started = ""
+        if marker and os.path.exists(marker):
+            fb_started = " fb_started=1"
+            try:
+                os.unlink(marker)
+            except Exception:
+                pass
         with open(os.path.join(home, "hook.log"), "a") as f:
-            f.write(f"{ts} outcome=watchdog-killed hook={hook_name} project={project}\n")
+            f.write(f"{ts} outcome=watchdog-killed hook={hook_name} project={project}{fb_started}\n")
     except Exception:
         pass
 

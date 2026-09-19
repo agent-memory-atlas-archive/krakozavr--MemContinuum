@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -1456,12 +1457,23 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         self.assertEqual(search_calls, [], "a match must never invoke `search`")
 
     def test_no_write_path_store_and_index_untouched(self):
-        """Item 7: 50 fallback runs against a fixture store that is a git
-        repo -- `git status --short` stays empty and the index file's
-        sha256 is unchanged. The one write this hook makes (session
-        state, see test_miss_with_hit_label_and_chain_never_snippet) lives
-        under MEMCONTINUUM_HOME/sessions/, never under the store or the
-        index."""
+        """Item 7, scope corrected (re-gate round 3, MAJOR 2): the fixture
+        index here is ALREADY current/stamped (setUp's own cmd_reindex),
+        so the sha staying unchanged across 50 runs proves the FALLBACK
+        SEARCH itself adds no write -- it does NOT prove the whole hook
+        run never writes the index. The same hook's own earlier `for-path`
+        lookup (unchanged by this feature) still opens the index the
+        ordinary rw way and CAN migrate/stamp a schema behind the current
+        generation before the fallback ever runs -- see
+        test_search_read_only_refuses_legacy_schema_without_writing in
+        tests/test_memidx.py for that direct, isolated proof, and
+        test_for_path_miss_still_migrates_before_the_fallback_runs below
+        for the same claim exercised through this actual hook. 50 fallback
+        runs against a fixture store that is a git repo -- `git status
+        --short` stays empty and the index file's sha256 is unchanged.
+        The one write this hook makes (session state, see
+        test_miss_with_hit_label_and_chain_never_snippet) lives under
+        MEMCONTINUUM_HOME/sessions/, never under the store or the index."""
         for cmd in (
             ["git", "init", "-q"],
             ["git", "config", "user.email", "t@t.local"],
@@ -1488,6 +1500,45 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         )
         self.assertEqual(status.stdout.strip(), "", "the store must never be written by the fallback")
 
+    def test_for_path_miss_still_migrates_before_the_fallback_runs(self):
+        """Re-gate round 3, MAJOR 2, exercised end to end through the real
+        hook (not just memidx.py directly): a schema behind the current
+        generation, ALSO missing its db_meta project stamp, gets that
+        stamp written by this SAME hook run's own earlier `for-path`
+        lookup (unchanged, pre-existing, correct behavior -- a match must
+        keep seeing a migrated schema) -- the sha genuinely changes --
+        while the fallback's own `--read-only` search, reached moments
+        later in the SAME run, still correctly refuses with reason=
+        index-needs-migration (the project-stamp guard and the
+        generation-number stamp are different db_meta keys; only a real
+        `reindex` bumps the latter, so for-path's own migration guards
+        never silently paper over a stale generation number)."""
+        db_path = Path(self.memtool_home) / f"{self.project}.sqlite"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE db_meta SET value='1' WHERE key='index_generation'")
+        conn.execute("DELETE FROM db_meta WHERE key='project'")
+        conn.commit()
+        conn.close()
+        sha_before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+        target = str(self.repo / "src" / "needle.py")
+        proc, _ = run_hook(self._payload(target), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+        sha_after = hashlib.sha256(db_path.read_bytes()).hexdigest()
+        self.assertNotEqual(sha_before, sha_after, "for-path's own rw open must still stamp the project row")
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute("SELECT value FROM db_meta WHERE key='project'").fetchone()
+        conn.close()
+        self.assertEqual(row[0], self.project)
+
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback-empty", line)
+        self.assertIn("reason=index-needs-migration", line)
+
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_search_crash_names_search_failed_rc_not_no_hits(self):
         """MAJOR fix-round item b, pinning: a `search` subprocess that
@@ -1511,14 +1562,27 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         self.assertNotIn("reason=no-hits", line)
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
-    def test_flock_held_state_write_still_emits_exactly_one_json_document(self):
-        """BLOCKER, pinning: hold the session-state file's own flock in
-        THIS test process (mc_update_state_json's own lock, hooks/
-        memlib.sh) so the hook's locked state write blocks -- stdout
-        must still carry EXACTLY ONE JSON document (the additionalContext
-        envelope, printed LAST, after the state write gives up per its
-        own non-blocking-retry deadline) never two (an interleaved
-        partial write) and never zero."""
+    def test_flock_held_whole_run_still_emits_the_fallbacks_own_document_fast(self):
+        """BLOCKER + re-gate round 3, MAJOR 1, pinning (docstring corrected
+        to state what THIS code actually does -- the round-2 version's own
+        claim, "printed LAST after the state write gives up per its own
+        [2.0s] deadline", was true of the SYMPTOM (one document) but false
+        about WHICH document: with a 2.0s state-write deadline racing the
+        SAME 2s watchdog budget, the watchdog usually wins, killing the
+        run and replacing stdout with ITS OWN generic timeout envelope --
+        the already-computed guess is silently discarded and the model is
+        told something false ("absence... not established") about a
+        decision that was in fact found).
+        Fixed by giving the state write a SHORT deadline (0.25s,
+        mc_fallback_write_state) instead of the default 2.0s: hold the
+        session-state file's own flock in THIS test process for the WHOLE
+        run -- the hook must still finish well under the 2s watchdog
+        budget, stdout must be exactly one document, and it must be the
+        FALLBACK's OWN additionalContext (the label text is asserted
+        present, not merely "some JSON with hookSpecificOutput" -- the
+        watchdog's own fallback envelope has neither), with `outcome=
+        search-fallback` (not `watchdog-killed`) and `fb_state=
+        skipped-lock` naming the skipped titling write."""
         session_id = "sess-flock-1"
         state_dir = Path(self.memtool_home) / "sessions" / self.project
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -1536,23 +1600,79 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        # 4.0s, not a tight bound on the 2s watchdog budget itself
+        # (matches this file's own other watchdog-adjacent timing checks,
+        # e.g. TestPostCommitReindexEmbedWorker's own `< 4.0`): a shared/
+        # loaded CI machine can add real, unrelated wall-clock noise
+        # (subprocess spin-up under contention) on top of the SHORT
+        # 0.25s state-write deadline this fix actually bounds -- the
+        # deterministic, load-independent proof that the fix landed is
+        # `outcome=search-fallback` (not `watchdog-killed`) below, not
+        # this elapsed number; isolated measurement (no other load): ~0.6-
+        # 0.9s including setUp's own reindex.
+        self.assertLess(elapsed, 4.0, f"took {elapsed:.2f}s -- the short state-write deadline must bound this")
         stdout = proc.stdout.strip()
         self.assertTrue(stdout, "expected an additionalContext envelope even under a held lock")
         # Exactly one JSON document: json.loads succeeds on the WHOLE
-        # stdout, and there is exactly one line (a second, interleaved
-        # document would either fail to parse as one object or leave a
-        # second `{` on a later line).
+        # stdout, and there is exactly one line.
         parsed = json.loads(stdout)
-        self.assertIn("hookSpecificOutput", parsed)
+        ctx = parsed["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(
+            ctx.startswith("No recorded decision binds this file. Nearest by search -- may be unrelated:"),
+            "stdout must be the FALLBACK's own document, not the watchdog's generic timeout envelope",
+        )
+        self.assertIn("TOP-7001", ctx)
         self.assertEqual(len(stdout.splitlines()), 1, stdout)
-        # Accepted: mc_update_state_json's own 2.0s non-blocking-retry
-        # deadline may lose the race against a lock held for the whole
-        # hook run -- the state write itself then logs its own
-        # lock-timeout/lock-open-failed diagnostic (hooks/memlib.sh,
-        # exit 97/98) separately, or is silently skipped by this hook's
-        # own `|| true` -- either way, nobody should "fix" that by
-        # reordering stdout again; the property this test pins is ONE
-        # document on stdout, not that the state write always succeeds.
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback ", line)
+        self.assertIn("fb_state=skipped-lock", line)
+        self.assertNotIn("watchdog-killed", line)
+        # The state file itself is genuinely untouched (the short-deadline
+        # write really did skip, not silently succeed under a race).
+        self.assertEqual(json.loads(state_file.read_text()), {})
+
+    def test_flock_held_one_second_titling_still_written_normally(self):
+        """Companion to the whole-run-held case above: a lock released
+        well before the short 0.25s deadline's own retry window closes
+        (held only 0.3s here, comfortably past that deadline but a small
+        fraction of the 2s watchdog budget) lets a LATER retry within
+        mc_update_state_json's own loop succeed almost every time in
+        practice -- but the guaranteed, deterministic case is a lock
+        released quickly: this pins that the titling write still lands
+        normally (no fb_state=skipped-lock, state file populated) when
+        contention is brief, so the short deadline is a real bound on the
+        WORST case, not a universal skip."""
+        session_id = "sess-flock-2"
+        state_dir = Path(self.memtool_home) / "sessions" / self.project
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_file = state_dir / f"{session_id}.json"
+        state_file.write_text("{}")
+        lock_file = state_dir / f"{session_id}.json.lock"
+        lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+        def _release_soon():
+            time.sleep(0.05)
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+        releaser = threading.Thread(target=_release_soon)
+        releaser.start()
+        try:
+            target = str(self.repo / "src" / "needle.py")
+            proc, elapsed = run_hook(
+                self._payload(target, session_id=session_id), self._env(), timeout=8.0,
+            )
+        finally:
+            releaser.join()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback ", line)
+        self.assertNotIn("fb_state=skipped-lock", line)
+        state = json.loads(state_file.read_text())
+        self.assertTrue(state.get("search_fallbacks"))
 
     @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
     def test_ten_identical_misses_dedup_to_two_state_entries(self):

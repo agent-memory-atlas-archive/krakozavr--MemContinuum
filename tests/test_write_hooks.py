@@ -5589,10 +5589,21 @@ class TestMacOSPortMechanics(unittest.TestCase):
         assertion above (`elapsed < 4.0`) actually goes red without a
         working deadline -- not vacuously true regardless of the
         mechanism."""
+        # Re-gate round 3 (MAJOR 1): the literal `+ 2.0` moved into a
+        # DEFAULT for the optional DEADLINE_SECONDS argument
+        # mc_fallback_write_state's own short-deadline callers now pass
+        # explicitly -- the line under test is `_deadline = time.time() +
+        # _deadline_s` (a variable) for every caller, defaulted to 2.0
+        # only via `_deadline_s`'s own resolution a few lines above. This
+        # control still targets the SAME mechanism every default-2.0s
+        # caller (including this test's own _run_lock_contention_scenario,
+        # which calls mc_update_state_json with no 3rd argument) goes
+        # through -- hardcoding 30.0 here breaks the deadline for that
+        # caller exactly as the old literal-2.0 replacement did.
         original = MEMLIB.read_text()
-        self.assertIn("_deadline = time.time() + 2.0", original)
+        self.assertIn("_deadline = time.time() + _deadline_s", original)
         broken = original.replace(
-            "_deadline = time.time() + 2.0", "_deadline = time.time() + 30.0", 1
+            "_deadline = time.time() + _deadline_s", "_deadline = time.time() + 30.0", 1
         )
         self.assertNotEqual(broken, original)
         broken_memlib = Path(self.td) / "memlib-broken-control.sh"

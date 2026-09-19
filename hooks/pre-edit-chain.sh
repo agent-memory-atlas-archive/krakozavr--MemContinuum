@@ -731,9 +731,19 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     # `no-query`/`store-root` early-exit above (finish already called)
     # never contributes an fb_ms sample -- stats' own p50/p95 pool is
     # this-subprocess-ran-only by construction, not by a later filter.
+    # MINOR fix-round item: a marker naming THIS PROCESS's own pid (the
+    # watchdog launcher's `proc.pid` sees the identical value -- see
+    # hooks/mc-watchdog.sh's own comment) exists ONLY for the duration of
+    # the search subprocess call below. A watchdog kill mid-call finds it
+    # still there and logs `fb_started=1` on its own `watchdog-killed`
+    # line, closing the stats blind spot where a kill on this branch left
+    # no trace of the search having even started.
+    FB_STARTED_MARKER="$MEMCONTINUUM_HOME/.fb-started.$$"
+    : >"$FB_STARTED_MARKER" 2>/dev/null || true
     FB_MS_T0="$(mc_now_ms "$PY")"
     FALLBACK_JSON="$(PYTHONPATH= "$PY" "$MEMIDX" "${FB_ARGS[@]}" 2>/dev/null)"
     FALLBACK_RC=$?
+    rm -f "$FB_STARTED_MARKER" 2>/dev/null || true
     FB_MS_T1="$(mc_now_ms "$PY")"
     FB_MS=""
     case "$FB_MS_T0$FB_MS_T1" in
@@ -747,99 +757,24 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     # the rest as bogus bare tokens. `+`-joined survives untouched.
     FALLBACK_QUERY_LOGGED="${FALLBACK_QUERY// /+}"
 
-    # MAJOR fix-round item b: every non-zero/bad outcome used to collapse
-    # into the same `reason=no-hits` -- this parser now runs regardless of
-    # FALLBACK_RC (as long as SOMETHING reached stdout: `--json` refusal
-    # envelopes from `_decision_reply`/the new `--read-only` early-refusal
-    # branch print on stdout even at rc=1), and computes ITS OWN reason:
-    # `search-failed rc=N` (a crash, or output the refusal shape doesn't
-    # recognize), `bad-json` (rc=0 but stdout didn't parse), or a state
-    # name lifted straight off the envelope (`missing`/`uninitialized`/
-    # `index-needs-migration`/`quarantined`/`stale`) -- one place decides
-    # the reason vocabulary, not a second bash-side re-derivation of it.
+    # MAJOR fix-round item b (re-gate round 3, MINOR duplication: shared
+    # with hooks/newfile-nudge.sh via mc_fallback_parse, hooks/mc-fallback-
+    # lib.sh -- see that file's own header for the full reason-vocabulary
+    # rationale). Runs whenever EITHER something reached stdout OR the
+    # subprocess exited non-zero -- a genuine crash (rc != 0, nothing on
+    # stdout at all) still needs `reason=search-failed rc=N` named, not
+    # silently defaulting to "no-hits" the way gating on stdout alone would.
     FB_HITS=""
     FB_IDS=""
-    FB_JSON=""
+    FB_TEXT=""
+    FB_HITS_FOR_STATE=""
     FB_REASON=""
-    export HOOK_FB_LABEL='No recorded decision binds this file. Nearest by search -- may be unrelated:'
-    export MC_FB_RC="$FALLBACK_RC"
-    # Runs whenever EITHER something reached stdout OR the subprocess
-    # exited non-zero -- a genuine crash (rc != 0, nothing on stdout at
-    # all) still needs `reason=search-failed rc=N` named, not silently
-    # defaulting to "no-hits" the way gating on stdout alone would.
     if [ -n "$FALLBACK_JSON" ] || [ "$FALLBACK_RC" -ne 0 ]; then
-        {
-            IFS= read -r -d '' FB_HITS
-            IFS= read -r -d '' FB_IDS
-            IFS= read -r -d '' FB_JSON
-            IFS= read -r -d '' FB_HITS_FOR_STATE
-            IFS= read -r -d '' FB_REASON
-        } < <(printf '%s' "$FALLBACK_JSON" | PYTHONPATH= "$PY" -c '
-import json, os, sys
-
-rc = int(os.environ.get("MC_FB_RC", "1") or "1")
-raw = sys.stdin.read()
-
-d = None
-if raw:
-    try:
-        d = json.loads(raw)
-    except Exception:
-        d = None
-
-hits = []
-state = None
-reason = ""
-if rc != 0:
-    if isinstance(d, dict):
-        reason = d.get("reason") or d.get("state") or ""
-    if not reason:
-        reason = f"search-failed rc={rc}"
-elif d is None:
-    reason = "bad-json"
-else:
-    if isinstance(d, dict):
-        state = d.get("state")
-        hits = d.get("results", [])
-    elif isinstance(d, list):
-        hits = d
-    if not isinstance(hits, list):
-        hits = []
-
-label = os.environ.get("HOOK_FB_LABEL", "")
-chain_texts = []
-ids = []
-for_state = []
-for h in hits:
-    if not isinstance(h, dict):
-        continue
-    ct = h.get("chain_text", "") or ""
-    if not ct:
-        continue
-    hid = str(h.get("id", ""))
-    ids.append(hid)
-    chain_texts.append(ct)
-    for_state.append({"id": hid, "title": str(h.get("title", "") or "")})
-
-if not chain_texts and not reason:
-    reason = state if state in ("quarantined", "stale") else "no-hits"
-
-if not chain_texts:
-    fields = ("0", "", "", "", reason)
-else:
-    ctx = label + "\n\n" + "\n\n".join(chain_texts)
-    envelope = json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "additionalContext": ctx,
-        }
-    })
-    fields = (str(len(chain_texts)), ",".join(ids), envelope, json.dumps(for_state), "")
-
-for field in fields:
-    sys.stdout.write(field.replace(chr(0), ""))
-    sys.stdout.write(chr(0))
-' 2>/dev/null)
+        # shellcheck source=mc-fallback-lib.sh
+        source "$SCRIPT_DIR/mc-fallback-lib.sh"
+        mc_fallback_parse "$PY" "$FALLBACK_RC" \
+            'No recorded decision binds this file. Nearest by search -- may be unrelated:' \
+            1 "$FALLBACK_JSON"
     fi
 
     FB_MS_PART=""
@@ -850,20 +785,25 @@ for field in fields:
         finish "search-fallback-empty" "reason=$FB_REASON mode=$FALLBACK_MODE q=$FALLBACK_QUERY_LOGGED$FB_MS_PART"
     fi
 
-    # BLOCKER fix-round item: stdout (the additionalContext envelope) used
-    # to print HERE, before the locked session-state write below --
-    # mc_update_state_json's own flock has up to a 2.0s non-blocking-retry
-    # deadline (hooks/memlib.sh), which the SAME 2s MC_WATCHDOG_TIMEOUT_
-    # FALLBACK budget this hook runs under can lose the race against. A
-    # watchdog kill mid-write left TWO documents on stdout (this one,
-    # already flushed, plus the watchdog's own timeout envelope) or lost
-    # this one entirely depending on exactly where the kill landed --
-    # either way, not the "one JSON document on stdout" contract this
-    # script's own header promises. Emitting stdout LAST, after every
-    # potentially-blocking write below, mirrors hooks/newfile-nudge.sh's
-    # own pre-existing order (that hook's reminder text was always
-    # assembled before ITS OWN state write, for the same reason) -- see
-    # the flock-holding fixture test in tests/test_hooks.py pinning this.
+    # Re-gate round 3, MAJOR 1: stdout is ALWAYS emitted -- the round-2
+    # "print last, after the state write" reorder traded the two-document
+    # bug for a WORSE one: under full lock contention, mc_update_state_
+    # json's own 2.0s deadline (hooks/memlib.sh) outlives the SAME 2s
+    # watchdog budget, so the watchdog kills the whole process group
+    # before the (already-fully-computed, already-sitting-in-$FB_TEXT)
+    # guess is ever printed -- the model then reads the WATCHDOG's own
+    # generic timeout envelope ("absence of a matching decision was not
+    # established"), which is actively FALSE (a decision WAS found; it
+    # was simply never shown). The guess is the feature; the state write
+    # is garnish. Fix: the state write below now runs with a SHORT
+    # deadline (0.25s, mc_fallback_write_state's own DEADLINE_SECONDS --
+    # hooks/mc-fallback-lib.sh) instead of the default 2.0s, and $FB_TEXT
+    # is printed UNCONDITIONALLY right after, regardless of whether that
+    # write succeeded, timed out, or never ran at all (no session_id, no
+    # memlib.sh). A lock timeout here degrades to `fb_state=skipped-lock`
+    # on the outcome line -- the look-back mention of THIS hit is lost,
+    # never the hit itself. See the flock-holding fixture test in tests/
+    # test_hooks.py pinning this exact property.
     #
     # Session-state title storage (docs/INTERNALS.md "search fallback"):
     # hook.log's own `ids=` field carries no title (item 5's field list is
@@ -872,18 +812,14 @@ for field in fields:
     # (<id>) for <file>", so each hit is ALSO appended to this session's
     # own state file (mc_state_file_for, the SAME per-session JSON state
     # every write-side hook already shares -- WRITE-LOCK ruling E,
-    # hooks/memlib.sh) under `search_fallbacks`, capped at the last 20
-    # (mirrors newfile-nudge.sh's own `nudged_commits[-20:]`). This is the
-    # ONE state write this hook ever makes, sourced and paid for ONLY on
-    # this already-rare (a genuine miss AND at least one search hit)
-    # branch -- the store and the index stay read-only either way (item
-    # 7's own no-write property is about THOSE two, not this hook's
-    # existing sessions/*.json + hook.log writable surface; see
-    # docs/INTERNALS.md). A session_id this hook cannot resolve (missing
-    # from the payload, or memlib.sh unreachable) just skips the state
-    # write -- the additionalContext above has already been printed
-    # either way, so a human never loses the guess itself, only its later
-    # look-back mention.
+    # hooks/memlib.sh) under `search_fallbacks`, capped at the last 20.
+    # This is the ONE state write this hook ever makes, sourced and paid
+    # for ONLY on this already-rare (a genuine miss AND at least one
+    # search hit) branch -- the store and the index stay read-only either
+    # way (see docs/INTERNALS.md's own no-write-path paragraph for the
+    # exact scope of that claim). A session_id this hook cannot resolve
+    # (missing from the payload, or memlib.sh unreachable) just skips the
+    # state write -- $FB_TEXT is printed either way.
     SESSION_ID=""
     if [ -n "$PAYLOAD" ]; then
         if command -v jq >/dev/null 2>&1; then
@@ -899,65 +835,21 @@ print(d.get("session_id", "") or "")
 ' 2>/dev/null)"
         fi
     fi
+    FB_STATE_PART=""
     if [ -n "$SESSION_ID" ] && [ -n "${FB_HITS_FOR_STATE:-}" ]; then
         # shellcheck source=memlib.sh
         source "$SCRIPT_DIR/memlib.sh"
+        # shellcheck source=mc-fallback-lib.sh
+        source "$SCRIPT_DIR/mc-fallback-lib.sh"
         STATE_FILE="$(mc_state_file_for "$PROJECT" "$SESSION_ID")"
-        export MC_FB_FILE="$FILE_PATH"
-        export MC_FB_HITS_JSON="$FB_HITS_FOR_STATE"
-        mc_update_state_json "$STATE_FILE" '
-import json, os
-
-try:
-    new_hits = json.loads(os.environ.get("MC_FB_HITS_JSON") or "[]")
-except Exception:
-    new_hits = []
-if not isinstance(new_hits, list):
-    new_hits = []
-
-existing = state.get("search_fallbacks")
-if not isinstance(existing, list):
-    existing = []
-
-fb_file = os.environ.get("MC_FB_FILE", "")
-
-# MAJOR fix-round item e: dedup keyed on (file, id) -- ten identical
-# misses on the same file used to append ten near-duplicate entries
-# (title only, no de-dup), which then repeated the SAME decision up to
-# four times in the look-back own last-8 window (hooks/userprompt-
-# remind.sh). A repeat (file, id) pair is removed from its OLD position
-# and re-appended with a freshly-truncated title, so the look-back
-# "most recent" ordering reflects when it was last surfaced, not merely
-# first seen -- not a second, growing entry.
-new_keys = set()
-for h in new_hits:
-    if isinstance(h, dict):
-        new_keys.add((fb_file, str(h.get("id", ""))))
-existing = [
-    e for e in existing
-    if not (isinstance(e, dict) and (e.get("file"), e.get("id")) in new_keys)
-]
-for h in new_hits:
-    if not isinstance(h, dict):
-        continue
-    title = str(h.get("title", "") or "")[:120]
-    existing.append({
-        "file": fb_file,
-        "id": str(h.get("id", "")),
-        "title": title,
-        "hook": "pre-edit-chain",
-    })
-state["search_fallbacks"] = existing[-20:]
-print(json.dumps(state))
-' >>"$MC_LOG" 2>&1 || true
+        if ! mc_fallback_write_state "$STATE_FILE" "$FILE_PATH" "$FB_HITS_FOR_STATE" "pre-edit-chain" 0.25; then
+            FB_STATE_PART=" fb_state=skipped-lock"
+        fi
     fi
 
-    # BLOCKER fix-round item (continued): stdout emitted HERE -- strictly
-    # after the locked state write above -- see this branch's own comment
-    # a few lines up for the full rationale.
-    printf '%s\n' "$FB_JSON"
+    printf '%s\n' "$FB_TEXT"
 
-    finish "search-fallback" "hits=$FB_HITS ids=$FB_IDS mode=$FALLBACK_MODE q=$FALLBACK_QUERY_LOGGED$FB_MS_PART"
+    finish "search-fallback" "hits=$FB_HITS ids=$FB_IDS mode=$FALLBACK_MODE q=$FALLBACK_QUERY_LOGGED$FB_MS_PART$FB_STATE_PART"
 fi
 
 TOPIC_COUNT="$MATCHED_TOPIC_COUNT"
