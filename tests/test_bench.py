@@ -1131,17 +1131,33 @@ class TestRandomSamplingRunnerIsOutsideTheClaim(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestFtsStepAsideCoverage(unittest.TestCase):
-    # para-10 is the one paraphrase query whose FTS top-1 pick is a
-    # genuinely different, wrong record that happens to share real
-    # vocabulary with the query -- paraphrase queries are constructed to
-    # share no vocabulary with their OWN target (see
-    # TestParaphraseIndependence above), not with every other record in
-    # the corpus. The gate correctly leaves it to fuse normally.
+    # para-10 is a paraphrase query whose FTS top-1 pick is a genuinely
+    # different, wrong record that happens to share real vocabulary with
+    # the query -- paraphrase queries are constructed to share no
+    # vocabulary with their OWN target (see TestParaphraseIndependence
+    # above), not with every other record in the corpus. The gate
+    # correctly leaves it to fuse normally, and fusion still lands on the
+    # right answer via the vector channel (see memidx.py's own comment
+    # next to FTS_STEP_ASIDE_COVERAGE).
+    #
+    # 0.3.0 rebase (INC-0115 branch rebased onto main after main's own
+    # independent M4 fix round reworded para-05's query text to fix an
+    # unrelated corpus defect -- an equally-defensible second answer, see
+    # bench/queries.jsonl's own note on that id): the reworded para-05 now
+    # ALSO lands as a confident-but-wrong exception, at exactly
+    # FTS_STEP_ASIDE_COVERAGE's own 0.250 boundary. Unlike para-10, this
+    # is not a case fusion rescues -- `--mode vector` alone ranks the same
+    # wrong record top-1 for para-05 too (a genuine corpus-level ambiguity
+    # between two records, unrelated to this gate) -- so stepping aside or
+    # not costs nothing either way here. Pinned as a second named
+    # exception, not folded into EXPECTED_NOT_CONFIDENT, so a future
+    # corpus/query edit that moves it off this boundary is a visible,
+    # deliberate diff rather than a silent one.
     EXPECTED_NOT_CONFIDENT = {
-        "para-01", "para-02", "para-03", "para-04", "para-05",
+        "para-01", "para-02", "para-03", "para-04",
         "para-06", "para-07", "para-08", "para-09", "para-11",
     }
-    EXPECTED_CONFIDENT_EXCEPTION = "para-10"
+    EXPECTED_CONFIDENT_EXCEPTIONS = {"para-05", "para-10"}
 
     def test_kw_and_et_always_confident_para_mostly_not(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1185,7 +1201,7 @@ class TestFtsStepAsideCoverage(unittest.TestCase):
                 qid = q["id"]
                 if qid.startswith("kw-") or qid.startswith("et-"):
                     self.assertTrue(verdicts[qid], f"{qid}: expected FTS to be confident (plain/exact-term query)")
-                elif qid == self.EXPECTED_CONFIDENT_EXCEPTION:
+                elif qid in self.EXPECTED_CONFIDENT_EXCEPTIONS:
                     self.assertTrue(verdicts[qid], f"{qid}: expected the documented confident-but-wrong exception")
                 elif qid in self.EXPECTED_NOT_CONFIDENT:
                     self.assertFalse(verdicts[qid], f"{qid}: expected FTS to step aside (paraphrase noise)")

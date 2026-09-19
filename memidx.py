@@ -2726,17 +2726,28 @@ def vector_ranked(
 # slice added for this same investigation (id prefix `et-`: an error
 # message/file name/symbol/flag/quoted phrase a keyword search should
 # nail) ranges 0.500-1.0; para- (zero-vocabulary-with-TARGET paraphrases)
-# is 0.091-0.211 for 10 of its 11 queries -- the one exception, para-10 at
-# 0.286, is a case where FTS's top-1 pick is a genuinely different, WRONG
-# record that happens to share real vocabulary with the query (paraphrase
-# queries are constructed to share no vocabulary with their own target,
-# not with every other record in the corpus); this gate correctly leaves
-# that query to fuse normally rather than second-guessing a real (if
+# is 0.05-0.211 for 9 of its 11 queries -- two exceptions, both cases where
+# FTS's top-1 pick is a genuinely different, WRONG record that happens to
+# share real vocabulary with the query (paraphrase queries are constructed
+# to share no vocabulary with their own target, not with every other
+# record in the corpus): para-10 at 0.286, and para-05 at exactly 0.250
+# (the coverage this same query measured against BEFORE the 0.3.0 rebase
+# was 0.211-band noise; main independently reworded para-05's own text
+# after this comment was first written, to fix an unrelated corpus defect
+# -- an equally-defensible second answer, see bench/queries.jsonl's own
+# note on that id -- and the reworded text happens to land exactly on
+# FTS_STEP_ASIDE_COVERAGE's own boundary against this corpus). The two
+# exceptions are NOT interchangeable: for para-10 this gate correctly
+# leaves the query to fuse normally rather than second-guess a real (if
 # misdirected) FTS signal, and fusion still lands on the right answer
-# there via the vector channel's own contribution. So: a clean, wide empty
-# band between 0.211 (the real paraphrase-noise ceiling) and 0.500 (the
-# kw-/et- floor), with para-10 correctly on the confident side of it, not
-# inside it.
+# there via the vector channel's own contribution; for para-05, `--mode
+# vector` alone ALSO ranks the same wrong record top-1 (a genuine
+# corpus-level ambiguity between two records, unrelated to this gate), so
+# fusing instead of stepping aside costs nothing there either way. So: a
+# narrow band between 0.211 (the real paraphrase-noise ceiling) and 0.500
+# (the kw-/et- floor) holding exactly these two named exceptions and
+# nothing else, both correctly on the confident side of the gate, not
+# inside the noise class.
 #
 # FTS_STEP_ASIDE_COVERAGE sits in that empty band, deliberately closer to
 # the noise ceiling (0.211) than the confident floor (0.500): stepping
