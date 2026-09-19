@@ -22,6 +22,7 @@ history invariant instead of the schema rules above -- see
 """
 from __future__ import annotations
 
+import functools
 import os
 import re
 import subprocess
@@ -98,7 +99,12 @@ def _is_topic_frontmatter(fm: dict) -> bool:
     return bool(fm.get("links")) or fm.get("type") == "topic"
 
 
-def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
+def lint_topic(
+    path: Path,
+    fm: dict,
+    code_roots: list[Path] | None = None,
+    strict_citations: bool = False,
+) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
     links = fm.get("links") or []
@@ -106,6 +112,18 @@ def lint_topic(path: Path, fm: dict) -> tuple[list[str], list[str]]:
     for link in links:
         name = link.get("link", "?")
         prefix = f"{path}:{name}"
+
+        if code_roots:
+            ruling_for_citations = link.get("ruling") or {}
+            cite_errors, cite_warnings = _citation_errors(
+                prefix,
+                ruling_for_citations.get("source"),
+                link.get("evidence"),
+                code_roots,
+                strict=strict_citations,
+            )
+            errors.extend(cite_errors)
+            warnings.extend(cite_warnings)
 
         status = link.get("status")
         if status is not None and status not in STATUSES:
@@ -449,22 +467,343 @@ def lint_concept(
     return errors, warnings
 
 
-def lint_record(path: Path, fm: dict) -> tuple[list[str], list[str]]:
-    """Enum-validate a standalone (non-topic) record's top-level status/authority."""
+# ---------------------------------------------------------------------------
+# Cited commit / file:line verification (docs/SCHEMA.md sec3/sec9 addendum;
+# INC-0124 -- "invented commit subjects" is the one class of fabrication that
+# is mechanically checkable: a source:/evidence: entry naming a commit can be
+# verified against the wired code repository's history, the same way
+# code_refs/implemented_by are already verified against paths above). Gated
+# on code_roots exactly like lint_concept's own checks: nothing here is
+# checkable with no root, and both lint_topic's and lint_record's citation
+# pass are skipped entirely when code_roots is empty -- no line is printed
+# about citations at all in that case (never noise for a store that never
+# asked for this check).
+#
+# THE RECOGNIZER IS THE WHOLE DIFFICULTY (see module docstring's design
+# note): this store's own evidence carries many hex-looking tokens that are
+# NOT commits -- 16-hex snapshot hashes, sha256 prefixes, session ids,
+# render fingerprints, TOP-xxxx ids, dates. Two independent, narrow patterns,
+# not one greedy one:
+#
+#   (a) CONTEXT-triggered: a hex run immediately preceded by one of four
+#       words this store actually uses to introduce a commit in prose --
+#       "commit ", "merge ", "at " (as in "gate on PR #18 at f7fe011"), " as "
+#       (as in "merged as 87663ec") -- case-insensitive on the word, never on
+#       the hex.
+#   (b) BACKTICK-wrapped: a hex run inside `` `...` `` with no context word
+#       at all (a reviewer note quoting a bare hash).
+#
+# BOTH shapes require the hex run to be EXACTLY 7 or 40 characters long --
+# git's two canonical hash lengths (abbreviated short form, full form) --
+# enforced with a trailing \b so a longer run (a 12-hex render fingerprint,
+# a 16-hex snapshot hash, a 40+ non-hash token) never partially matches at
+# either length. This is what keeps the recognizer precise rather than
+# greedy: verified against this project's own real store (2026-09-19), it
+# is what correctly EXCLUDES "rendered by 118974ef7600 against an engine at
+# 049884e8b2ed" (INC-0117 evidence; both 12-hex, both render fingerprints,
+# "at" is one of the four trigger words but the length gate rejects them)
+# while still catching every real 7-char commit hash the store cites through
+# "commit "/"merge "/"at "/" as ".
+#
+# KNOWN MISSES, by design, not oversight:
+#   - a bare hash with NO context word and no backticks ("...fixed by
+#     e21bfa0 the same day") is invisible -- the whole point of requiring a
+#     trigger is refusing to guess that an arbitrary hex-looking word is a
+#     commit.
+#   - "against <hash>" (used by this store's own append-only NOTE lines,
+#     e.g. INC-0124's own evidence) is not a trigger word, on purpose: this
+#     store already uses "commit "/"at " for a CITATION and "against" for
+#     describing a git compare, and folding "against" in would flag prose
+#     that names a ref, not a claim about that ref's authenticity.
+#   - a hash quoted alongside `hash: rest-of-sentence` (no context word
+#     before the hash) is invisible -- see (a) above; this is deliberate,
+#     not a gap discovered late.
+#   - a comma-separated second line number ("progress.md:86,89") -- only
+#     the first number is checked; the citation format this schema
+#     documents is one path, one line.
+#   - only a DOUBLE-QUOTED string immediately following the hash (optional
+#     whitespace, nothing else between) is treated as a claimed subject
+#     ("commit abc1234 "Subject text""). A parenthetical, a colon-joined
+#     sentence, or a quote separated by other punctuation is never read as
+#     a subject claim -- this store's real citations never quote a subject
+#     this way today, so being strict here costs nothing on the real store
+#     and avoids inventing a subject out of unrelated prose that happens to
+#     follow a hash.
+#   - a citation to a commit or a file:line that is real but lives in a
+#     DIFFERENT repository than the one --code-root points at resolves to
+#     NOTHING here, indistinguishably from a fabricated one -- this checker
+#     has exactly one code root's worth of ground truth and cannot tell the
+#     two apart. That is why "not found" is a WARNING by default (worded
+#     "unverifiable, not necessarily wrong") rather than an ERROR: an ERROR
+#     it cannot substantiate is a false accusation. --strict-citations
+#     promotes it anyway, for a store known to cite only the wired repo.
+#     See the shipping report for the real instances this surfaced against
+#     this project's own store.
+# ---------------------------------------------------------------------------
+
+_COMMIT_CITE_RE = re.compile(
+    r"""
+    (?:
+        \b(?i:commit|merge|at|as)\b\s+(?P<hash_ctx>[0-9a-f]{40}|[0-9a-f]{7})\b
+      |
+        `(?P<hash_bt>[0-9a-f]{40}|[0-9a-f]{7})`
+    )
+    (?:\s*"(?P<subject>[^"]*)")?
+    """,
+    re.VERBOSE,
+)
+
+# path/to/file.ext:123[-456] -- the path portion must carry a dotted
+# extension (so "16:09 EDT" and a bare "TOP-0124:5"-shaped token never
+# match: neither contains a "."), and must not be immediately preceded by
+# another path/word character OR a colon -- the colon is what keeps a
+# URL's "host.tld:port" from matching (http://host.tld:port/path.py:12
+# would otherwise start matching right after "http:", where the two
+# slashes are themselves swallowed into the path group; excluding a
+# colon immediately before the match start closes that, since this
+# store's own "field: value" YAML lines always have a space after the
+# colon, never a bare path glued to it). Only the FIRST line number of a
+# "path:123-456" or "path:123,456" citation is captured -- a range's or
+# list's remaining numbers are a known miss (see module comment above).
+_FILE_LINE_CITE_RE = re.compile(
+    r"(?<![\w./:-])([A-Za-z0-9_.\-/]+\.[A-Za-z0-9]{1,8}):(\d+)(?:[-,]\d+)?"
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _is_git_repo(root: Path) -> bool:
+    """Cached (real-store cost: ~230 link/record citation checks would
+    otherwise each re-spawn `git rev-parse` for the same one or two code
+    roots): a --code-root that is not a git repository at all (or any
+    ancestor of it) contributes nothing to commit-hash resolution -- callers
+    skip it rather than erroring, so a plain filesystem checkout (the shape
+    every existing code_roots-bearing test in this suite already uses) keeps
+    the commit-citation check silently off while file:line citations, which
+    need only the filesystem, are unaffected. A root that does not exist on
+    disk at all (a typo'd --code-root) is also just "not a git repo" here,
+    never a crash: `_run_git` would otherwise raise GitError from
+    subprocess.run's own FileNotFoundError on a missing cwd, which nothing
+    in the ordinary schema-lint path catches (only --against-ref's dispatch
+    does) -- every other --code-root consumer (lint_concept's path.exists(),
+    lint_markers' walk) already tolerates a bad root by reporting "not
+    found," so this one does too rather than turning a typo into a
+    traceback."""
+    if not root.is_dir():
+        return False
+    try:
+        proc = _run_git(["-C", str(root), "rev-parse", "--git-dir"], root)
+    except GitError:
+        return False
+    return proc.returncode == 0
+
+
+def _commit_resolves(root: Path, commit_hash: str) -> bool:
+    """The one mechanism the task names explicitly: `git -C root cat-file -e
+    <hash>^{commit}`. Kept as its own one-line function (never folded into
+    `_commit_subject`, which would also need a second git call anyway) so a
+    test can stub exactly this call and nothing else (acceptance 7)."""
+    proc = _run_git(["-C", str(root), "cat-file", "-e", f"{commit_hash}^{{commit}}"], root)
+    return proc.returncode == 0
+
+
+def _commit_subject(root: Path, commit_hash: str) -> str | None:
+    """`git log -1 --format=%s <hash>` -- None if the hash does not resolve
+    in this particular root (a caller that already knows it resolves, e.g.
+    via _commit_resolves against a DIFFERENT root in a multi-root store,
+    should not read None here as "does not exist anywhere.")"""
+    proc = _run_git(["-C", str(root), "log", "-1", "--format=%s", f"{commit_hash}^{{commit}}"], root)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.decode("utf-8", "replace").rstrip("\n")
+
+
+def _extract_commit_citations(text: str) -> list[dict]:
+    """Every commit citation _COMMIT_CITE_RE finds in one string, as
+    {"hash": str, "subject": str | None} -- "subject" is the quoted text
+    immediately following the hash, when present, else None (see module
+    comment: only a directly-adjacent double-quoted string counts)."""
+    out = []
+    for m in _COMMIT_CITE_RE.finditer(text):
+        h = m.group("hash_ctx") or m.group("hash_bt")
+        out.append({"hash": h, "subject": m.group("subject")})
+    return out
+
+
+def _extract_file_line_citations(text: str) -> list[tuple[str, int]]:
+    """Every "path:line" _FILE_LINE_CITE_RE finds in one string, as
+    (path, line_number)."""
+    return [(m.group(1), int(m.group(2))) for m in _FILE_LINE_CITE_RE.finditer(text)]
+
+
+def _normalize_subject(s: str) -> str:
+    """Whitespace-normalized comparison, chosen (docs/SCHEMA.md sec3
+    addendum) as the safe default over an exact byte compare: a citation
+    typed by hand into YAML is expected to preserve the commit subject's
+    WORDS, not necessarily its exact run of internal whitespace, and a
+    stricter compare would flag a cosmetic re-wrap as a fabrication -- the
+    one thing this check must never do (INC-0124's own lesson: a guard for
+    fabrication must not itself cry wolf on a harmless reformat)."""
+    return " ".join(s.split())
+
+
+def _citation_errors(
+    prefix: str, source, evidence, code_roots: list[Path], strict: bool = False
+) -> tuple[list[str], list[str]]:
+    """The shared check behind lint_topic's per-link pass and lint_record's
+    standalone-record pass: scans `source` (a single free-text string, e.g.
+    ruling.source) and `evidence` (a list of free-text strings) for commit
+    and file:line citations and verifies each against `code_roots`. `prefix`
+    is everything the caller wants before the citation's own description
+    (already includes the file path and, for a link, its id). Returns
+    (errors, warnings) -- one string per mismatch, naming the field/index,
+    the citation, and what went wrong.
+
+    UNVERIFIABLE vs SUBSTANTIATED (coordinator ruling, 2026-09-19, after this
+    checker's own real-store run surfaced a topic that legitimately cites
+    another project's installer files, and INC-0124 citing an IceKEY commit):
+    with a single --code-root, "does not resolve" cannot be told apart from
+    "lives in a different repository" -- an ERROR for that case is a false
+    accusation the checker cannot back up. So a citation that resolves to
+    NOTHING under any configured root (a hash cat-file cannot find; a file
+    that is not found at all) is a WARNING by default, worded "unverifiable,
+    not necessarily wrong" -- and promotes to an ERROR only when `strict` is
+    set (--strict-citations, for a store whose records are known to cite
+    only the wired repo). A SUBSTANTIATED mismatch -- the hash resolves but
+    the quoted subject differs; the file exists but has fewer lines than
+    cited -- stays an ERROR unconditionally: the checker verified something
+    concrete and it was wrong, which is exactly the fabrication class
+    INC-0124 exists to catch, not a stylistic nit. An absolute-path citation
+    is also always an ERROR, strict or not: it violates the "relative to a
+    code root" citation shape categorically, independent of which repository
+    anything lives in, so there is nothing unverifiable about it.
+
+    Skips the commit-hash half of the check entirely when NONE of
+    code_roots is a git repository (the file:line half still runs -- it
+    needs only the filesystem). When several code_roots are given, a hash
+    is accepted if it resolves under ANY git root (content-addressed, so
+    "found in two roots" is not the ambiguity code_refs/implemented_by
+    guard against for a plain path) and a file:line citation is accepted if
+    it exists under ANY root.
+
+    Roots are `.resolve()`d up front, exactly like lint_concept's own
+    `resolved_roots` -- caught on macOS CI (Grok/first-CI-run finding): a
+    root under a path with a symlinked component (macOS's own
+    `/var` -> `/private/var`, which is where `tempfile.mkdtemp()` lands)
+    made `full.relative_to(root)` raise ValueError even for a file that
+    plainly exists under it, because `full` was resolved (following the
+    symlink) while `root` was not -- a real file:line citation was then
+    reported as "not found" purely from that mismatch, not from the file
+    actually being absent."""
     errors: list[str] = []
+    warnings: list[str] = []
+
+    def _unresolved(msg: str) -> None:
+        (errors if strict else warnings).append(msg)
+
+    code_roots = [r.resolve() for r in code_roots]
+    git_roots = [r for r in code_roots if _is_git_repo(r)]
+    roots_desc = ", ".join(str(r) for r in code_roots)
+
+    fields: list[tuple[str, str]] = []
+    if isinstance(source, str) and source.strip():
+        fields.append(("source", source))
+    if isinstance(evidence, list):
+        for i, item in enumerate(evidence):
+            if isinstance(item, str) and item.strip():
+                fields.append((f"evidence[{i}]", item))
+
+    for field_name, text in fields:
+        if git_roots:
+            for cite in _extract_commit_citations(text):
+                h = cite["hash"]
+                hit_root = None
+                for root in git_roots:
+                    if _commit_resolves(root, h):
+                        hit_root = root
+                        break
+                if hit_root is None:
+                    _unresolved(
+                        f"{prefix}: {field_name} cites commit {h!r} -- not found under any "
+                        f"configured code root tried ({', '.join(str(r) for r in git_roots)}); "
+                        f"unverifiable, not necessarily wrong"
+                    )
+                    continue
+                if cite["subject"] is not None:
+                    actual = _commit_subject(hit_root, h)
+                    if actual is None or _normalize_subject(actual) != _normalize_subject(cite["subject"]):
+                        errors.append(
+                            f"{prefix}: {field_name} cites commit {h!r} with subject "
+                            f"{cite['subject']!r} -- actual subject is {actual!r}"
+                        )
+        for ref_path, line_no in _extract_file_line_citations(text):
+            if Path(ref_path).is_absolute():
+                errors.append(
+                    f"{prefix}: {field_name} cites {ref_path!r}:{line_no} -- path is absolute, "
+                    f"must be relative to a code root ({roots_desc})"
+                )
+                continue
+            hit = None
+            for root in code_roots:
+                full = (root / ref_path).resolve()
+                try:
+                    full.relative_to(root)
+                except ValueError:
+                    continue
+                if full.exists() and full.is_file():
+                    hit = full
+                    break
+            if hit is None:
+                _unresolved(
+                    f"{prefix}: {field_name} cites {ref_path!r}:{line_no} -- not found under any "
+                    f"configured code root tried ({roots_desc}); unverifiable, not necessarily wrong"
+                )
+                continue
+            try:
+                with hit.open(encoding="utf-8", errors="ignore") as fh:
+                    line_count = sum(1 for _ in fh)
+            except OSError:
+                line_count = 0
+            if line_count < line_no:
+                errors.append(
+                    f"{prefix}: {field_name} cites {ref_path!r}:{line_no} -- file has only "
+                    f"{line_count} line(s)"
+                )
+    return errors, warnings
+
+
+def lint_record(
+    path: Path,
+    fm: dict,
+    code_roots: list[Path] | None = None,
+    strict_citations: bool = False,
+) -> tuple[list[str], list[str]]:
+    """Enum-validate a standalone (non-topic) record's top-level status/authority,
+    plus (SCHEMA sec3/sec9 addendum, INC-0124) verify any commit/file:line
+    citations in its top-level source:/evidence: fields -- see
+    _citation_errors."""
+    errors: list[str] = []
+    warnings: list[str] = []
     status = fm.get("status")
     if status is not None and status not in STATUSES:
         errors.append(f"{path}: unknown status {status!r} (must be one of {sorted(STATUSES)})")
     authority = fm.get("authority")
     if authority is not None and authority not in AUTHORITIES:
         errors.append(f"{path}: unknown authority {authority!r} (must be one of {sorted(AUTHORITIES)})")
-    return errors, []
+    if code_roots:
+        cid = fm.get("id") or path.stem
+        cite_errors, cite_warnings = _citation_errors(
+            f"{path}: {cid}", fm.get("source"), fm.get("evidence"), code_roots, strict=strict_citations
+        )
+        errors.extend(cite_errors)
+        warnings.extend(cite_warnings)
+    return errors, warnings
 
 
 def lint_file(
     path: Path,
     code_roots: list[Path] | None = None,
     known_topic_ids: set[str] | None = None,
+    strict_citations: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Design R2 (audit MC-P1-03, TOP-0123 L2): every diagnostic
     parse_record surfaced becomes `ERROR: <path>: <field>: <message>` for
@@ -484,9 +823,9 @@ def lint_file(
     else:
         is_topic = _is_topic_frontmatter(fm)
         if is_topic:
-            errors, more_warnings = lint_topic(path, fm)
+            errors, more_warnings = lint_topic(path, fm, code_roots, strict_citations)
         else:
-            errors, more_warnings = lint_record(path, fm)
+            errors, more_warnings = lint_record(path, fm, code_roots, strict_citations)
     return errors, warnings + more_warnings
 
 
@@ -585,7 +924,9 @@ def _duplicate_claim_errors(root: Path) -> list[str]:
     return errors
 
 
-def lint_root(root: Path, code_roots: list[Path] | None = None) -> tuple[list[str], list[str]]:
+def lint_root(
+    root: Path, code_roots: list[Path] | None = None, strict_citations: bool = False
+) -> tuple[list[str], list[str]]:
     """One pre-pass walk collects everything id-shaped (known ids for concept
     validation, explicit-id owners for the duplicate check, stem fallbacks for
     the collision warning) so the duplicate-id check costs no walk of its own
@@ -625,7 +966,9 @@ def lint_root(root: Path, code_roots: list[Path] | None = None) -> tuple[list[st
     all_errors: list[str] = list(fence_errors)
     all_warnings: list[str] = []
     for f in sorted(walk_markdown(root)):
-        errors, warnings = lint_file(f, code_roots, known_topic_ids=known_topic_ids)
+        errors, warnings = lint_file(
+            f, code_roots, known_topic_ids=known_topic_ids, strict_citations=strict_citations
+        )
         all_errors.extend(errors)
         all_warnings.extend(warnings)
     all_errors.extend(_duplicate_claim_errors(root))
@@ -2014,6 +2357,28 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
     return errors, changed, notes
 
 
+def _extract_strict_citations_flag(argv: list[str]) -> tuple[list[str], bool]:
+    """Pulls a bare `--strict-citations` flag out of argv before the
+    remainder reaches parse_argv unchanged -- parse_argv's own 3-tuple
+    contract stays exactly as it was (mirroring how _extract_against_ref_flags
+    already preprocesses its own flags without touching parse_argv). A
+    SEPARATE function, not folded into _extract_against_ref_flags, so the
+    two preprocessing passes merge cleanly with any other branch touching
+    that one. Meaningless without --code-root (the whole citation check is
+    skipped then) and meaningless under --against-ref (append-only mode
+    never uses a code root either) -- in both cases the flag is simply
+    never consulted, not specially rejected, to avoid adding another
+    rejection branch next to code this function does not own."""
+    rest: list[str] = []
+    strict = False
+    for a in argv:
+        if a == "--strict-citations":
+            strict = True
+        else:
+            rest.append(a)
+    return rest, strict
+
+
 def parse_argv(argv: list[str]) -> tuple[str | None, list[str], str | None]:
     """ROOT positional + repeatable --code-root PATH, in either order.
 
@@ -2068,9 +2433,31 @@ ERROR:/WARNING: line per finding. Exit 1 if any error was found, 0 otherwise
                      CONSTRAINT/HOLD link whose topic's code_refs name that
                      file (an error otherwise), and every such link with a
                      path#symbol ref is checked for a marker at that symbol
-                     (a warning if none is found yet). Omit --code-root
-                     entirely and all of these checks are skipped; every
-                     other rule still runs.
+                     (a warning if none is found yet). Also verifies cited
+                     commits: a link's ruling.source/evidence, or a
+                     standalone record's top-level source:/evidence:, that
+                     names a commit (via "commit "/"merge "/"at "/" as " or
+                     a backtick-quoted hash) or a path:line is checked
+                     against the given code roots. A citation that
+                     resolves to NOTHING (a hash cat-file cannot find; a
+                     file not found at all) is a WARNING by default,
+                     worded "unverifiable, not necessarily wrong" -- a
+                     single code root cannot tell "fabricated" apart from
+                     "cites a different repository." A SUBSTANTIATED
+                     mismatch -- the hash resolves but a quoted subject
+                     after it does not match that commit's actual subject;
+                     a cited file exists but has fewer lines than cited --
+                     is always a lint ERROR naming the record/link and the
+                     mismatch, strict or not. Omit --code-root entirely
+                     and all of these checks are skipped; every other rule
+                     still runs.
+  --strict-citations promotes an unresolved citation (the WARNING case
+                     above) to a lint ERROR too -- for a store whose
+                     records are known to cite only the wired repo, where
+                     "not found" really does mean wrong. Has no effect
+                     without --code-root, and no effect under
+                     --against-ref (append-only mode never uses a code
+                     root either).
   -h, --help         print this and exit
 
 Append-only history mode (a second, independent check -- given
@@ -2209,6 +2596,7 @@ def main(argv=None) -> int:
         print("--staged requires --against-ref", file=sys.stderr)
         print(USAGE, file=sys.stderr)
         return 2
+    rest, strict_citations = _extract_strict_citations_flag(rest)
     root_str, code_root_strs, unknown = parse_argv(rest)
     if unknown is not None:
         print(f"unknown argument: {unknown}", file=sys.stderr)
@@ -2243,7 +2631,7 @@ def main(argv=None) -> int:
             seen.add(resolved)
             code_roots.append(resolved)
     try:
-        errors, warnings = lint_root(root, code_roots)
+        errors, warnings = lint_root(root, code_roots, strict_citations)
     except Exception as exc:  # never a bare traceback -- same contract
         # _run_append_only already holds (spec test (j)): a real ERROR is
         # a printed diagnostic and exit 1, never an uncaught exception.

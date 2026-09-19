@@ -80,6 +80,58 @@ would mean an inference never gets promoted to a constraint at all; it stays
 distinct from `owner-verbatim` so it can never be confused with the owner's
 own words.
 
+### Cited commits and paths are verified, not merely written
+
+When `memlint.py` is given `--code-root DIR` (repeatable; otherwise this
+check is skipped entirely, exactly like the concept-record checks in §8.4 —
+no line is printed about citations at all), every commit citation in a
+link's `ruling.source`/`evidence` (or a standalone incident/investigation's
+top-level `source:`/`evidence:`, §9) is verified the same way `code_refs` are
+already verified against paths: a token introduced by `commit `, `merge `,
+`at `, or `as ` (case-insensitive), or wrapped in backticks with no
+introducing word at all, and exactly 7 or 40 lowercase hex characters long —
+git's two canonical hash lengths — is read as a commit citation and checked
+against every given code root that is itself a git repository
+(`git -C <code-root> cat-file -e <hash>^{commit}`); a quoted subject
+immediately following the hash (`commit a1b2c3d "the exact subject"`) must
+match `git log -1 --format=%s` for it, compared after whitespace
+normalization (a hand-typed citation is expected to preserve the subject's
+words, not its exact internal spacing). A `path/to/file.ext:123` citation
+(a dotted extension required, so a bare `16:09`-shaped token is never
+mistaken for one) is checked for existence under the code roots and, if
+found, for having at least that many lines.
+
+**Unverifiable warns, a substantiated mismatch errors, `--strict-citations`
+promotes.** A single `--code-root` cannot tell "fabricated" apart from
+"cites a different repository" — this store's own real records include a
+topic that legitimately cites another project's installer files (it is
+literally about borrowing that project's installer) and an incident citing
+a commit in that other project's own store. So a citation that resolves to
+NOTHING under any configured root — a hash `cat-file` cannot find, or a file
+that is not found at all — is a lint WARNING by default, worded "cites X --
+not found under any configured code root; unverifiable, not necessarily
+wrong": an ERROR the checker cannot substantiate would be a false
+accusation. A citation that resolves to something CONCRETE and WRONG — the
+hash exists but its quoted subject does not match; the file exists but has
+fewer lines than cited — is a lint ERROR unconditionally, naming the record,
+the link (or the standalone record's id), the field, the citation, and the
+mismatch: the checker verified something and it was wrong, exactly the
+fabrication class this check exists to catch, not a style nit. An
+absolute-path citation is likewise always an ERROR, strict or not — it
+violates the citation shape itself, independent of which repository
+anything lives in. `--strict-citations` promotes every unresolved
+("unverifiable") case to an ERROR too, for a store whose records are known
+to cite only the wired repo, where "not found" really does mean wrong.
+
+A citation with no introducing word and no backticks (a bare hash dropped
+into prose) is never checked — recognizing an arbitrary hex-looking word as
+a commit citation would be guessing, not verifying, and this store carries
+many hex-shaped tokens that are not commits at all (16-hex snapshot hashes,
+sha256 prefixes, session ids, render fingerprints); the exact-length-7-or-40
+rule is what keeps those out even when they do sit next to a trigger word (a
+12-hex render fingerprint after "at " is not 7 or 40 characters and is
+correctly excluded).
+
 ### Status values — exactly five
 
 | status | means | rule |
