@@ -630,7 +630,205 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     if [ "$ANY_QUERY_SUCCEEDED" -eq 0 ]; then
         finish "query-failed"
     fi
-    finish "no-match"
+
+    # --- search fallback (TOP-0133 L1) --------------------------------
+    # `for-path` found NOTHING bound to this file -- the ONLY branch this
+    # runs on (never a match, never worktree-unwired/-unresolved, both of
+    # which already `finish`ed above before this point is ever reached).
+    # `memidx.py search` -- the one channel that can deliver a decision
+    # NOT bound to the file being edited -- is queried on the path's OWN
+    # words instead, and the nearest decisions (if any) are handed to the
+    # agent labelled as a guess, never as a match. QUERY_SRC_PATH is
+    # WT_REMAPPED (the worktree block's own main-checkout-equivalent
+    # path) whenever that block actually produced one -- never a raw
+    # `.worktrees/x/...` path's words, which name the worktree, not the
+    # file. Never runs when QUERY_SRC_PATH sits under $MEMCONTINUUM_ROOT
+    # (the store itself -- that is duplicate-detection's job, out of
+    # scope here).
+    QUERY_SRC_PATH="${WT_REMAPPED:-$FILE_PATH}"
+
+    if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+        # shellcheck source=mc-path-lib.sh
+        source "$SCRIPT_DIR/mc-path-lib.sh"
+        mc_path_under_root "$QUERY_SRC_PATH" "$MEMCONTINUUM_ROOT"
+        if [ $? -eq 0 ]; then
+            finish "search-fallback-empty" "reason=store-root"
+        fi
+    fi
+
+    # shellcheck source=mc-query-lib.sh
+    source "$SCRIPT_DIR/mc-query-lib.sh"
+    QUERY_REL_PATH="$(mc_query_source_path "$QUERY_SRC_PATH" "$CWD" "${MEMCONTINUUM_STRIP_PREFIX:-}")"
+    FALLBACK_QUERY="$(mc_query_tokens "$QUERY_REL_PATH")"
+    if [ -z "$FALLBACK_QUERY" ]; then
+        finish "search-fallback-empty" "reason=no-query"
+    fi
+
+    # MEMCONTINUUM_FALLBACK_MODE (documented in docs/INTERNALS.md): hybrid|
+    # vector|fts, else the engine's own default (hybrid) -- deliberately
+    # the SAME default `memidx.py search` itself already uses when --mode
+    # is omitted, so an unset env var changes nothing about which mode
+    # runs. An unrecognized value falls back to that same default rather
+    # than failing the whole fallback over a typo'd env var.
+    FALLBACK_MODE="${MEMCONTINUUM_FALLBACK_MODE:-hybrid}"
+    case "$FALLBACK_MODE" in
+        hybrid | vector | fts) ;;
+        *) FALLBACK_MODE="hybrid" ;;
+    esac
+
+    # ONE process (round 5 precedent: `--with-chain-text` folded a second
+    # `for-path` call away the same way) -- `--hydrate` carries each hit's
+    # own chain_text in the same JSON envelope, so no separate `chain`
+    # call per hit. `--limit 2`, no `--status`/`--authority` filter (the
+    # engine's own defaults apply). Never `--root`: a stale-index warning
+    # on stderr here would be noise -- staleness is for-path's own concern
+    # above, already surfaced (index-stale-served) on the match path.
+    FB_ARGS=(search "$FALLBACK_QUERY" --mode "$FALLBACK_MODE" --project "$PROJECT" --db "$DB_PATH" --limit 2 --json --hydrate)
+    FALLBACK_JSON="$(PYTHONPATH= "$PY" "$MEMIDX" "${FB_ARGS[@]}" 2>>"$LOG")"
+    FALLBACK_RC=$?
+
+    # Query encoding for the log line (item 5): `_hook_log_fields`
+    # (memidx.py stats) splits on whitespace with no quote-awareness --
+    # `q="core scan unbound"` would truncate at the first space and spray
+    # the rest as bogus bare tokens. `+`-joined survives untouched.
+    FALLBACK_QUERY_LOGGED="${FALLBACK_QUERY// /+}"
+
+    FB_HITS=""
+    FB_IDS=""
+    FB_JSON=""
+    if [ $FALLBACK_RC -eq 0 ] && [ -n "$FALLBACK_JSON" ]; then
+        export HOOK_FB_LABEL='No recorded decision binds this file. Nearest by search -- may be unrelated:'
+        {
+            IFS= read -r -d '' FB_HITS
+            IFS= read -r -d '' FB_IDS
+            IFS= read -r -d '' FB_JSON
+            IFS= read -r -d '' FB_HITS_FOR_STATE
+        } < <(printf '%s' "$FALLBACK_JSON" | PYTHONPATH= "$PY" -c '
+import json, os, sys
+
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = None
+
+if isinstance(d, dict):
+    hits = d.get("results", [])
+elif isinstance(d, list):
+    hits = d
+else:
+    hits = []
+if not isinstance(hits, list):
+    hits = []
+
+label = os.environ.get("HOOK_FB_LABEL", "")
+chain_texts = []
+ids = []
+for_state = []
+for h in hits:
+    if not isinstance(h, dict):
+        continue
+    ct = h.get("chain_text", "") or ""
+    if not ct:
+        continue
+    hid = str(h.get("id", ""))
+    ids.append(hid)
+    chain_texts.append(ct)
+    for_state.append({"id": hid, "title": str(h.get("title", "") or "")})
+
+if not chain_texts:
+    fields = ("0", "", "", "")
+else:
+    ctx = label + "\n\n" + "\n\n".join(chain_texts)
+    envelope = json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": ctx,
+        }
+    })
+    fields = (str(len(chain_texts)), ",".join(ids), envelope, json.dumps(for_state))
+
+for field in fields:
+    sys.stdout.write(field.replace(chr(0), ""))
+    sys.stdout.write(chr(0))
+' 2>>"$LOG")
+    fi
+
+    if [ -z "$FB_HITS" ] || [ "$FB_HITS" = "0" ]; then
+        finish "search-fallback-empty" "reason=no-hits mode=$FALLBACK_MODE q=$FALLBACK_QUERY_LOGGED"
+    fi
+
+    printf '%s\n' "$FB_JSON"
+
+    # Session-state title storage (docs/INTERNALS.md "search fallback"):
+    # hook.log's own `ids=` field carries no title (item 5's field list is
+    # fixed) -- the look-back block (hooks/userprompt-remind.sh) needs a
+    # human-readable name per hit to render "search surfaced <title>
+    # (<id>) for <file>", so each hit is ALSO appended to this session's
+    # own state file (mc_state_file_for, the SAME per-session JSON state
+    # every write-side hook already shares -- WRITE-LOCK ruling E,
+    # hooks/memlib.sh) under `search_fallbacks`, capped at the last 20
+    # (mirrors newfile-nudge.sh's own `nudged_commits[-20:]`). This is the
+    # ONE state write this hook ever makes, sourced and paid for ONLY on
+    # this already-rare (a genuine miss AND at least one search hit)
+    # branch -- the store and the index stay read-only either way (item
+    # 7's own no-write property is about THOSE two, not this hook's
+    # existing sessions/*.json + hook.log writable surface; see
+    # docs/INTERNALS.md). A session_id this hook cannot resolve (missing
+    # from the payload, or memlib.sh unreachable) just skips the state
+    # write -- the additionalContext above has already been printed
+    # either way, so a human never loses the guess itself, only its later
+    # look-back mention.
+    SESSION_ID=""
+    if [ -n "$PAYLOAD" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            SESSION_ID="$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null)"
+        else
+            SESSION_ID="$(printf '%s' "$PAYLOAD" | "$PY" -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+print(d.get("session_id", "") or "")
+' 2>/dev/null)"
+        fi
+    fi
+    if [ -n "$SESSION_ID" ] && [ -n "${FB_HITS_FOR_STATE:-}" ]; then
+        # shellcheck source=memlib.sh
+        source "$SCRIPT_DIR/memlib.sh"
+        STATE_FILE="$(mc_state_file_for "$PROJECT" "$SESSION_ID")"
+        export MC_FB_FILE="$FILE_PATH"
+        export MC_FB_HITS_JSON="$FB_HITS_FOR_STATE"
+        mc_update_state_json "$STATE_FILE" '
+import json, os
+
+try:
+    new_hits = json.loads(os.environ.get("MC_FB_HITS_JSON") or "[]")
+except Exception:
+    new_hits = []
+if not isinstance(new_hits, list):
+    new_hits = []
+
+existing = state.get("search_fallbacks")
+if not isinstance(existing, list):
+    existing = []
+
+fb_file = os.environ.get("MC_FB_FILE", "")
+for h in new_hits:
+    if not isinstance(h, dict):
+        continue
+    existing.append({
+        "file": fb_file,
+        "id": str(h.get("id", "")),
+        "title": str(h.get("title", "")),
+        "hook": "pre-edit-chain",
+    })
+state["search_fallbacks"] = existing[-20:]
+print(json.dumps(state))
+' >>"$MC_LOG" 2>&1 || true
+    fi
+
+    finish "search-fallback" "hits=$FB_HITS ids=$FB_IDS mode=$FALLBACK_MODE q=$FALLBACK_QUERY_LOGGED"
 fi
 
 TOPIC_COUNT="$MATCHED_TOPIC_COUNT"

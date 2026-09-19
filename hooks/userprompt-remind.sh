@@ -901,7 +901,59 @@ if [ "${LB_ELIGIBLE:-0}" != "1" ]; then
     finish "no-evidence"
 fi
 
-LB_OUTPUT_JSON="$(SINCE_TURN="${SINCE_TURN:-0}" MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" \
+# search-fallback look-back mention (TOP-0133 L1): reads STATE, never
+# hook.log, and never re-searches. hook.log's own pre-edit-chain.sh
+# `search-fallback` lines carry no `session=` field at all (that hook
+# deliberately never sources memlib.sh -- see its own header), so hook.log
+# alone cannot be scoped to THIS session; STATE_FILE already IS this
+# session's own file (mc_state_file_for, loaded once above), and both
+# fallback-emitting hooks (pre-edit-chain.sh, newfile-nudge.sh) already
+# append every hit they show to its `search_fallbacks` list, titled, the
+# moment they fire -- so this block only ever READS that list, exactly
+# ruling B's "reads state and hook.log, never the prompt" (unchanged: this
+# is a state read, not a prompt read). Capped at 8, the same
+# `unmapped[:8]` cap coverage's own fact_line above already uses, so one
+# noisy session can't blow up the look-back block. This is what lets the
+# orchestrator later bind a right guess through the normal record path --
+# the hook itself never binds anything, only surfaces the guess again.
+FB_LOOKBACK_LINES="$(env PYTHONPATH= "$MC_PY" -c '
+import json, sys
+
+try:
+    with open(sys.argv[1]) as f:
+        state = json.load(f)
+    if not isinstance(state, dict):
+        state = {}
+except Exception:
+    state = {}
+
+fallbacks = state.get("search_fallbacks")
+if not isinstance(fallbacks, list):
+    fallbacks = []
+
+def _one_line(s):
+    # An env var cannot carry an embedded NUL at all (the OS environment
+    # is NUL-terminated strings), so this join -- unlike every NUL-
+    # delimited stdout/stdin transport elsewhere in these hooks -- uses
+    # "\n" as the field separator instead, and each field is flattened to
+    # one physical line first (a title/file value could in principle
+    # embed a literal newline; collapsed to a space so it can never be
+    # mistaken for a second entry downstream).
+    return " ".join(str(s).split())
+
+lines = []
+for h in fallbacks[-8:]:
+    if not isinstance(h, dict):
+        continue
+    title = _one_line(h.get("title", "") or "(untitled)")
+    hid = _one_line(h.get("id", "") or "?")
+    fpath = _one_line(h.get("file", "") or "?")
+    lines.append(f"search surfaced {title} ({hid}) for {fpath}")
+
+sys.stdout.write("\n".join(lines))
+' "$STATE_FILE" 2>>"$MC_LOG")"
+
+LB_OUTPUT_JSON="$(SINCE_TURN="${SINCE_TURN:-0}" MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" HOOK_FB_LOOKBACK="$FB_LOOKBACK_LINES" \
     env PYTHONPATH= "$MC_PY" -c '
 import json, os
 
@@ -909,6 +961,7 @@ since = os.environ.get("SINCE_TURN", "0")
 Q = chr(39)
 store_root = os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>"
 fact = f"Look-back signal — {since} user turns with no edited-file evidence."
+fb_lines = [l for l in os.environ.get("HOOK_FB_LOOKBACK", "").split(chr(10)) if l]
 question = (
     "Did the conversation since then establish any ruling, incident, "
     "rejected alternative, priority, wording choice, money decision, or "
@@ -917,7 +970,10 @@ question = (
     "an incident is a file in incidents/ (see docs/SCHEMA.md); NOT Claude "
     "Code auto-memory. If none, say so once."
 )
-ctx = fact + "\n\n" + question
+ctx = fact
+for fb in fb_lines:
+    ctx += "\n" + fb
+ctx += "\n\n" + question
 print(json.dumps({
     "hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",

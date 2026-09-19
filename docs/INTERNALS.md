@@ -42,8 +42,8 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 
 | script | event | does |
 |---|---|---|
-| `pre-edit-chain.sh` | `PreToolUse` (Edit/Write, filtered to `--code-root`) | `for-path` lookup on the file being edited; injects matching chains as `additionalContext` |
-| `newfile-nudge.sh` | `PreToolUse` (Write only, filtered to `--code-root`) | fires only when the write target does not exist yet and its extension is wired for this project; injects one reminder to search the code index first. Separately (newlang-nudge): when the extension is one the engine supports but this project never wired, injects a structured, numbered decision point (wire it / decline it permanently via `--never-ext` / not now) naming the language -- deduped once per language per session. The log-only DETECTION outcome (`outcome=language-available-not-wired`) still fires on every occurrence regardless of `--code-root`, unchanged and pre-existing; the VISIBLE decision point is gated on the SAME `--code-root` containment as the wired-file reminder |
+| `pre-edit-chain.sh` | `PreToolUse` (Edit/Write, filtered to `--code-root`) | `for-path` lookup on the file being edited; injects matching chains as `additionalContext`. On a genuine miss, runs the search fallback (see below) on the path's own words |
+| `newfile-nudge.sh` | `PreToolUse` (Write only, filtered to `--code-root`) | fires only when the write target does not exist yet and its extension is wired for this project; injects one reminder to search the code index first, plus the search fallback (see below) appended to that same reminder. Separately (newlang-nudge): when the extension is one the engine supports but this project never wired, injects a structured, numbered decision point (wire it / decline it permanently via `--never-ext` / not now) naming the language -- deduped once per language per session. The log-only DETECTION outcome (`outcome=language-available-not-wired`) still fires on every occurrence regardless of `--code-root`, unchanged and pre-existing; the VISIBLE decision point is gated on the SAME `--code-root` containment as the wired-file reminder |
 | `ledger-post-edit.sh` | `PostToolUse` (every tool; no settings-level matcher) | a bash-only prefilter exits before the watchdog for read-only built-ins (`Read`, `Grep`, ...); `Edit`/`Write`/`MultiEdit`/`NotebookEdit` ledger the tool's own file path (`source: tool`); `Bash` and any tool this hook has no dedicated branch for fall through to a shell-diff (`git status`) tree comparison against a per-root baseline (`source: shell-diff`); an unrecognized or missing `tool_name` additionally logs `outcome=unsupported-mutation-surface` |
 | `precompact-persist.sh` | `PreCompact` | persists session state before context is compacted away |
 | `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`/`clear`, initializes session state only (captures the code/store roots' git HEAD, prunes state older than 24h; `clear` resets the session's counters and pending nudges but carries the edit ledger over, `resume` keeps everything); only on `source: compact` does it inject what `precompact-persist.sh` left pending |
@@ -75,6 +75,80 @@ Every OTHER way this hook can
 fail (no python, an unborn HEAD, memlint erroring out, its own cwd not being
 the store) still fails open exactly
 like every other hook.
+
+**Search fallback (owner-ratified, 2026-09-19).** `memidx.py search` was the
+only channel that could deliver a decision NOT bound to the file being
+edited, and it had never once been invoked in this project's recorded
+history. So the hook calls it: on `pre-edit-chain.sh`'s own genuine-miss
+branch (never on a match, never on `worktree-unwired`/`worktree-unresolved`,
+both of which already end the run first), and on `newfile-nudge.sh`'s
+wired-new-file reminder, `memidx.py search --hydrate` is queried on the
+edited path's OWN words, and the nearest decisions (if any) are handed to
+the agent labelled as a guess, never as a match. Both hooks skip this
+entirely for a path under `$MEMCONTINUUM_ROOT` (the store itself — that is
+duplicate-detection's job, out of scope here).
+
+The query: the path is relativized first (`pre-edit-chain.sh` uses the
+worktree-remapped main-checkout-equivalent path when one exists, so a
+worktree path's `.worktrees/x/...` segment is never spelled into the
+query), then its extension is stripped and it is split into words on
+`/ _ - .` and camelCase boundaries, lowercased, deduped, and filtered:
+tokens shorter than 3 characters and a fixed generic-stem list (`src lib
+sources source docs doc test tests spec main index utils util helpers
+internal app core common base`) are dropped, and the result is capped at
+12 tokens (`hooks/mc-query-lib.sh`, side-effect-free, its own header
+states these limits). An empty query after filtering never runs a search.
+
+The search itself is ONE `memidx.py search --limit 2 --json --hydrate`
+call — `--hydrate` (new) adds a `chain_text` field to each JSON hit,
+reusing `topic_chain_lines`/`chain_lines` (the exact rendering `chain`
+already produces for that hit's own topic), so no second `chain`/`for-path`
+call per hit is ever needed. No `--status`/`--authority` filter (the
+engine's own defaults apply); mode is `MEMCONTINUUM_FALLBACK_MODE`
+(`hybrid`/`vector`/`fts`) when set, else the engine's own default
+(`hybrid`) — an unrecognized value falls back to that same default. On a
+hit, `additionalContext` gets a fixed first line, verbatim:
+
+    No recorded decision binds this file. Nearest by search -- may be unrelated:
+
+followed by each hit's `chain_text` — never the `snippet` field. Two new
+outcomes, logged instead of (not alongside) the plain miss this branch used
+to log: `search-fallback` (≥1 hit; `hits=N ids=<comma ids> mode=<m>
+q=<+-joined tokens>`) and `search-fallback-empty` (`reason=no-query` /
+`reason=no-hits` / `reason=store-root`). The query is `+`-joined, not
+quoted-with-spaces: `memidx.py stats`'s own generic `key=value` field scan
+has no quote-awareness (`\S*`), so a quoted, space-containing value would
+truncate at the first space. `newfile-nudge.sh`'s own outcome name for this
+branch never changes (`outcome=nudged` — `memidx.py stats`' `nf.nudged`
+metric already keys on that literal string); the fallback's own result
+rides along as extra `fb_outcome=`/`fb_hits=`/`fb_ids=`/`fb_mode=`/`fb_q=`/
+`fb_reason=` fields on that same line instead. The 2s watchdog is unchanged
+and covers the fallback's own run too; on a watchdog timeout the existing
+`MC_WATCHDOG_TIMEOUT_FALLBACK` line is what the model gets, same as any
+other timeout.
+
+**No write path.** The fallback never touches the store or the index
+beyond reading it — `git status --short` on a fixture store stays clean and
+the index file's sha256 is unchanged across repeated fallback runs. The one
+state write EITHER hook makes is titling: on a hit, each surfaced (id,
+title) pair is appended to the current session's own state file (the same
+`sessions/<project>/<session>.json`, `mc_update_state_json`, every
+write-side hook already shares) under a `search_fallbacks` list (capped at
+the last 20), so `userprompt-remind.sh`'s look-back nudge can name what was
+shown, reading only that state (never hook.log, never the prompt — ruling
+B is unchanged) and never re-searching: each entry renders as `search
+surfaced <title> (<id>) for <file>`, capped at 8 (the same cap coverage's
+own `unmapped[:8]` fact line uses) —
+`pre-edit-chain.sh`'s own hook.log lines carry no `session=` field at all
+(it never sources `memlib.sh`), so this state write is the ONLY place a
+title is recoverable per session. This is titling metadata, not a decision:
+the hook never binds anything, it only remembers what it already showed.
+
+**No relevance floor, by design.** This channel ships on the search engine's
+existing ranking as-is (hybrid default) with no minimum-score cutoff and no
+change to how `search` ranks anything — weeks of real queries are meant to
+decide that floor (and whether hybrid stays the default mode) later, not
+this feature.
 
 **Logging, per hook.** The seven project-level hooks each write exactly one
 `outcome=` line per run to `$MEMCONTINUUM_HOME/hook.log`.

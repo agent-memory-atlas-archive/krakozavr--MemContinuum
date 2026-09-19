@@ -1058,6 +1058,90 @@ class TestStatsPreCommitBucket(StatsTestBase):
         self.assertEqual(pcm["outcomes"]["skipped:engine-failure"], 1)
 
 
+class TestStatsFallbackBucket(StatsTestBase):
+    """search fallback: `stats` tallies outcome=search-fallback/-empty
+    (pre-edit-chain.sh, kind "pre-edit") and fb_outcome=... (newfile-
+    nudge.sh, kind "newfile-nudge", its own base outcome staying
+    "nudged") into ONE merged `fallback` block -- see
+    memidx.py's _tally_fallback_fields."""
+
+    def test_pre_edit_hit_and_empty_lines_are_tallied(self):
+        lines = [
+            f"{ts(1)} outcome=search-fallback elapsed=1s hits=2 "
+            "ids=alpha,beta mode=hybrid q=core+scan project=demo file=/a.py",
+            f"{ts(1)} outcome=search-fallback-empty elapsed=0s "
+            "reason=no-hits mode=fts q=zzz project=demo file=/b.py",
+            f"{ts(1)} outcome=search-fallback-empty elapsed=0s "
+            "reason=no-query project=demo file=/c.py",
+            f"{ts(1)} outcome=search-fallback-empty elapsed=0s "
+            "reason=store-root project=demo file=/d.py",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        fb = out["fallback"]
+        self.assertEqual(fb["search_fallback"], 1)
+        self.assertEqual(fb["search_fallback_empty"], 3)
+        self.assertEqual(fb["reasons"], {"no-hits": 1, "no-query": 1, "store-root": 1})
+        self.assertEqual(fb["hit_count_distribution"], {"2": 1})
+        self.assertEqual(fb["modes_seen"], {"hybrid": 1, "fts": 1})
+        self.assertIn({"id": "alpha", "count": 1}, fb["top_ids"])
+        self.assertIn({"id": "beta", "count": 1}, fb["top_ids"])
+        # elapsed is tallied for EVERY fallback attempt, hit or empty (it
+        # measures the channel's real cost, not just successful hits) --
+        # four lines here, elapsed=[1,0,0,0]s, sorted [0,0,0,1]: nearest-
+        # rank p50 is the 2nd of 4 (0s), p95 the 4th (1s).
+        self.assertEqual(fb["elapsed_s_p50"], 0)
+        self.assertEqual(fb["elapsed_s_p95"], 1)
+
+    def test_newfile_nudge_fallback_rides_on_the_nudged_outcome(self):
+        """newfile-nudge.sh never renames its own outcome -- memidx.py
+        stats' `nf.nudged` metric must still see "nudged", with the
+        fallback's own result read from the separate fb_* fields."""
+        lines = [
+            f"{ts(1)} newfile-nudge outcome=nudged fb_outcome=search-fallback "
+            "fb_hits=1 fb_ids=gamma fb_mode=hybrid fb_q=new+file "
+            "project=demo file=/e.swift",
+            f"{ts(1)} newfile-nudge outcome=nudged fb_outcome=search-fallback-empty "
+            "fb_reason=no-hits fb_mode=hybrid fb_q=nope "
+            "project=demo file=/f.swift",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["newfile_nudge"]["nudged"], 2)
+        fb = out["fallback"]
+        self.assertEqual(fb["search_fallback"], 1)
+        self.assertEqual(fb["search_fallback_empty"], 1)
+        self.assertEqual(fb["reasons"], {"no-hits": 1})
+        self.assertIn({"id": "gamma", "count": 1}, fb["top_ids"])
+        # newfile-nudge.sh's own lines carry no elapsed= at all.
+        self.assertIsNone(fb["elapsed_s_p50"])
+        self.assertIsNone(fb["elapsed_s_p95"])
+
+    def test_no_fallback_lines_yields_empty_block_not_a_crash(self):
+        self.write_log([f"{ts(1)} outcome=matched elapsed=0s project=demo file=/x.py"])
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        fb = out["fallback"]
+        self.assertEqual(fb["search_fallback"], 0)
+        self.assertEqual(fb["search_fallback_empty"], 0)
+        self.assertEqual(fb["hit_count_distribution"], {})
+        self.assertEqual(fb["top_ids"], [])
+        self.assertIsNone(fb["elapsed_s_p50"])
+
+    def test_text_mode_prints_a_fallback_line(self):
+        lines = [
+            f"{ts(1)} outcome=search-fallback elapsed=1s hits=1 "
+            "ids=alpha mode=hybrid q=core project=demo file=/a.py",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertIn("search fallback", out)
+        self.assertIn("hits=1", out)
+
+
 class TestStatsPreEditTopics(StatsTestBase):
     """eval-topic-logging: `pre_edit.topics_named` (how many matched/
     index-stale-served runs actually named the topics they injected),

@@ -3700,6 +3700,66 @@ class TestUserPromptLookback(HookTestBase):
         # exactly one block -- one hookSpecificOutput, one question
         self.assertEqual(ctx.count("Did the conversation"), 1)
 
+    def test_search_fallback_hits_are_listed_in_the_lookback(self):
+        """search fallback (TOP-0133 L1): the look-back block reads the
+        session's own `search_fallbacks` state (written by pre-edit-
+        chain.sh/newfile-nudge.sh when their own fallback fires) and lists
+        each hit as "search surfaced <title> (<id>) for <file>" -- never
+        re-searching, never reading hook.log (ruling B: state and
+        hook.log, never the prompt)."""
+        session_id = "s-lb-fallback-listed"
+        self._start(session_id)
+        self.patch_state(
+            session_id,
+            search_fallbacks=[
+                {
+                    "file": "/repo/src/needle.py", "id": "TOP-7001",
+                    "title": "Needle handling policy", "hook": "pre-edit-chain",
+                },
+            ],
+        )
+        for _ in range(4):
+            self._fire(session_id)
+        proc, _ = self._fire(session_id)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Look-back signal", ctx)
+        self.assertIn(
+            "search surfaced Needle handling policy (TOP-7001) for /repo/src/needle.py",
+            ctx,
+        )
+
+    def test_search_fallback_listing_capped_at_eight_most_recent(self):
+        session_id = "s-lb-fallback-capped"
+        self._start(session_id)
+        self.patch_state(
+            session_id,
+            search_fallbacks=[
+                {"file": f"/repo/f{i}.py", "id": f"TOP-{i}", "title": f"Title {i}", "hook": "pre-edit-chain"}
+                for i in range(12)
+            ],
+        )
+        for _ in range(4):
+            self._fire(session_id)
+        proc, _ = self._fire(session_id)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(ctx.count("search surfaced"), 8)
+        self.assertIn("(TOP-11)", ctx)  # most recent, kept
+        self.assertNotIn("(TOP-3)", ctx)  # oldest of the 12, dropped by the cap
+
+    def test_no_search_fallback_state_means_no_extra_lines(self):
+        session_id = "s-lb-fallback-none"
+        self._start(session_id)
+        for _ in range(4):
+            self._fire(session_id)
+        proc, _ = self._fire(session_id)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("search surfaced", ctx)
+
     def test_coverage_and_thin_same_turn_coverage_wins(self):
         session_id = "s-lb-coverage-wins"
         self._start(session_id)
@@ -6159,6 +6219,68 @@ class TestNewFileNudgeHook(unittest.TestCase):
         self.assertIn("New source file under", ctx)
         # exactly one line of additionalContext.
         self.assertEqual(len(ctx.splitlines()), 1, ctx)
+
+    def test_search_fallback_hit_appended_to_the_reminder(self):
+        """search fallback (TOP-0133 L1): the wired-file reminder above
+        stays intact; the fallback's own guess is APPENDED, never
+        replacing it. MEMCONTINUUM_FALLBACK_MODE=fts: no embedding model
+        dependency."""
+        store = Path(self.td) / "store"
+        (store / "topics").mkdir(parents=True)
+        (store / "topics" / "needle.md").write_text(
+            "---\ntype: topic\nid: TOP-7002\ntitle: Needle handling policy two\n"
+            "code_refs:\n  - somewhere/else/unrelated.py\n"
+            "links:\n"
+            '  - link: L1\n    status: active\n    '
+            'ruling: {text: "handle the needle case two", authority: owner-verbatim, source: s}\n'
+            "---\nBody.\n"
+        )
+        reindex(store, self.home / "default.sqlite")
+
+        target = self.code_root / "Sources" / "needle.swift"
+        env = self.base_env(MEMCONTINUUM_FALLBACK_MODE="fts")
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        # the ORIGINAL reminder is still there...
+        self.assertIn("New source file under", ctx)
+        self.assertIn("confirm the code index is initialized", ctx)
+        # ...with the fallback's guess appended, labelled, never as a match.
+        self.assertIn(
+            "No recorded decision binds this file. Nearest by search -- may be unrelated:",
+            ctx,
+        )
+        self.assertIn("TOP-7002", ctx)
+        self.assertIn("handle the needle case two", ctx)
+
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=nudged", log_text)
+        self.assertIn("fb_outcome=search-fallback ", log_text)
+        self.assertIn("fb_hits=1", log_text)
+        self.assertIn("fb_ids=TOP-7002", log_text)
+
+        state_file = self.home / "sessions" / "default" / "s-newfile-nudge.json"
+        state = json.loads(state_file.read_text())
+        fallbacks = state.get("search_fallbacks")
+        self.assertTrue(fallbacks)
+        self.assertEqual(fallbacks[0]["id"], "TOP-7002")
+        self.assertEqual(fallbacks[0]["hook"], "newfile-nudge")
+
+    def test_search_fallback_empty_still_leaves_reminder_one_line(self):
+        """No index at all (this class's base_env sets no project/root, so
+        the db file never exists) -- the fallback must skip cleanly
+        (no memidx.py call, see newfile-nudge.sh's own db-existence guard)
+        and the reminder stays exactly the one line it always was."""
+        target = self.code_root / "Sources" / "NoIndexYet.swift"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(len(ctx.splitlines()), 1, ctx)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("fb_outcome=search-fallback-empty", log_text)
+        self.assertIn("fb_reason=no-hits", log_text)
 
     def test_silent_for_an_existing_file(self):
         target = self.code_root / "Existing.swift"

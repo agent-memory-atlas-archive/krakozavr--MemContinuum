@@ -644,6 +644,199 @@ esac
 
 MESSAGE="New source file under ${CODE_ROOT} — confirm the code index is initialized and not stale, then run code-search; name relevant hits or say none."
 
+# --- search fallback (TOP-0133 L1) ------------------------------------
+# The same channel pre-edit-chain.sh runs on a genuine miss, mirrored here
+# for a brand-new file: nothing can be BOUND to a path that did not exist
+# a moment ago, so this hook's own existing reminder above is the only
+# signal a new file ever gets today. Appended to the SAME message (never
+# replacing it) -- the code-index reminder still fires exactly as before.
+# Skipped, silently (the reminder above still fires), for a file under
+# $MEMCONTINUUM_ROOT (the store itself -- out of scope, duplicate-
+# detection's job). The outcome logged for this whole branch stays
+# "nudged" either way (memidx.py stats' own `nf.nudged` metric already
+# keys on that literal string) -- the fallback's own result rides along as
+# extra `fb_*` fields on the SAME line, never a second outcome value.
+FB_EXTRA=""
+SKIP_FALLBACK=0
+if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+    mc_path_under_root "$FILE_PATH" "$MEMCONTINUUM_ROOT"
+    if [ $? -eq 0 ]; then
+        SKIP_FALLBACK=1
+    fi
+fi
+
+if [ "$SKIP_FALLBACK" -eq 0 ]; then
+    # shellcheck source=mc-query-lib.sh
+    source "$SCRIPT_DIR/mc-query-lib.sh"
+    FB_CWD=""
+    if [ -n "$PAYLOAD" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            FB_CWD="$(printf '%s' "$PAYLOAD" | jq -r '.cwd // empty' 2>/dev/null)"
+        else
+            FB_CWD="$(printf '%s' "$PAYLOAD" | "$PY" -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+print(d.get("cwd", "") or "")
+' 2>/dev/null)"
+        fi
+    fi
+    FB_QUERY_REL_PATH="$(mc_query_source_path "$FILE_PATH" "$FB_CWD" "${MEMCONTINUUM_STRIP_PREFIX:-}")"
+    FB_QUERY="$(mc_query_tokens "$FB_QUERY_REL_PATH")"
+    if [ -z "$FB_QUERY" ]; then
+        FB_EXTRA="fb_outcome=search-fallback-empty fb_reason=no-query"
+    else
+        FB_MODE="${MEMCONTINUUM_FALLBACK_MODE:-hybrid}"
+        case "$FB_MODE" in
+            hybrid | vector | fts) ;;
+            *) FB_MODE="hybrid" ;;
+        esac
+        FB_MEMIDX="$SCRIPT_DIR/../memidx.py"
+        FB_DB_PATH="$MEMCONTINUUM_HOME/$PROJECT.sqlite"
+        FB_QUERY_LOGGED="${FB_QUERY// /+}"
+        FB_JSON_RAW=""
+        FB_RC=1
+        # Unlike pre-edit-chain.sh (which never reaches its own fallback
+        # without an already-confirmed-present db, see its own header),
+        # this hook has no earlier index check -- a brand-new project with
+        # no reindex run yet is the everyday case a new-file nudge fires
+        # in. Skip the `search` call ENTIRELY when the db file plainly
+        # does not exist: there is nothing it could find, and calling it
+        # anyway would spawn python only to print `search: the decision
+        # index is missing ...` on stderr, which `2>>"$LOG"` below would
+        # otherwise fold into hook.log as a stray, untimestamped extra
+        # line -- breaking this hook's one-line-per-invocation contract
+        # for no benefit (the "search-fallback-empty reason=no-hits"
+        # outcome already says everything that stray line would have).
+        if [ -f "$FB_DB_PATH" ]; then
+            FB_ARGS=(search "$FB_QUERY" --mode "$FB_MODE" --project "$PROJECT" --db "$FB_DB_PATH" --limit 2 --json --hydrate)
+            FB_JSON_RAW="$(PYTHONPATH= "$PY" "$FB_MEMIDX" "${FB_ARGS[@]}" 2>>"$LOG")"
+            FB_RC=$?
+        fi
+        FB_HITS=""
+        FB_IDS=""
+        FB_LABEL_AND_CHAINS=""
+        FB_HITS_FOR_STATE=""
+        if [ $FB_RC -eq 0 ] && [ -n "$FB_JSON_RAW" ]; then
+            export HOOK_FB_LABEL='No recorded decision binds this file. Nearest by search -- may be unrelated:'
+            {
+                IFS= read -r -d '' FB_HITS
+                IFS= read -r -d '' FB_IDS
+                IFS= read -r -d '' FB_LABEL_AND_CHAINS
+                IFS= read -r -d '' FB_HITS_FOR_STATE
+            } < <(printf '%s' "$FB_JSON_RAW" | PYTHONPATH= "$PY" -c '
+import json, os, sys
+
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = None
+if isinstance(d, dict):
+    hits = d.get("results", [])
+elif isinstance(d, list):
+    hits = d
+else:
+    hits = []
+if not isinstance(hits, list):
+    hits = []
+
+label = os.environ.get("HOOK_FB_LABEL", "")
+chain_texts = []
+ids = []
+for_state = []
+for h in hits:
+    if not isinstance(h, dict):
+        continue
+    ct = h.get("chain_text", "") or ""
+    if not ct:
+        continue
+    hid = str(h.get("id", ""))
+    ids.append(hid)
+    chain_texts.append(ct)
+    for_state.append({"id": hid, "title": str(h.get("title", "") or "")})
+
+if not chain_texts:
+    fields = ("0", "", "", "")
+else:
+    fields = (
+        str(len(chain_texts)), ",".join(ids),
+        label + "\n\n" + "\n\n".join(chain_texts), json.dumps(for_state),
+    )
+
+for field in fields:
+    sys.stdout.write(field.replace(chr(0), ""))
+    sys.stdout.write(chr(0))
+' 2>>"$LOG")
+        fi
+        if [ -z "$FB_HITS" ] || [ "$FB_HITS" = "0" ]; then
+            FB_EXTRA="fb_outcome=search-fallback-empty fb_reason=no-hits fb_mode=$FB_MODE fb_q=$FB_QUERY_LOGGED"
+        else
+            MESSAGE="${MESSAGE}
+${FB_LABEL_AND_CHAINS}"
+            FB_EXTRA="fb_outcome=search-fallback fb_hits=$FB_HITS fb_ids=$FB_IDS fb_mode=$FB_MODE fb_q=$FB_QUERY_LOGGED"
+
+            # Session-state title storage (docs/INTERNALS.md "search
+            # fallback"): same mechanism, same `search_fallbacks` state key
+            # pre-edit-chain.sh's own fallback already writes to -- see
+            # that file's own comment for the full rationale. Lazy
+            # session_id parse + memlib.sh source, paid ONLY on this
+            # already-rare (new file, wired, at least one search hit)
+            # branch.
+            FB_SESSION_ID=""
+            if [ -n "$PAYLOAD" ]; then
+                if command -v jq >/dev/null 2>&1; then
+                    FB_SESSION_ID="$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null)"
+                else
+                    FB_SESSION_ID="$(printf '%s' "$PAYLOAD" | "$PY" -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+print(d.get("session_id", "") or "")
+' 2>/dev/null)"
+                fi
+            fi
+            if [ -n "$FB_SESSION_ID" ] && [ -n "$FB_HITS_FOR_STATE" ]; then
+                # shellcheck source=memlib.sh
+                source "$SCRIPT_DIR/memlib.sh"
+                FB_STATE_FILE="$(mc_state_file_for "$PROJECT" "$FB_SESSION_ID")"
+                export MC_FB_FILE="$FILE_PATH"
+                export MC_FB_HITS_JSON="$FB_HITS_FOR_STATE"
+                mc_update_state_json "$FB_STATE_FILE" '
+import json, os
+
+try:
+    new_hits = json.loads(os.environ.get("MC_FB_HITS_JSON") or "[]")
+except Exception:
+    new_hits = []
+if not isinstance(new_hits, list):
+    new_hits = []
+
+existing = state.get("search_fallbacks")
+if not isinstance(existing, list):
+    existing = []
+
+fb_file = os.environ.get("MC_FB_FILE", "")
+for h in new_hits:
+    if not isinstance(h, dict):
+        continue
+    existing.append({
+        "file": fb_file,
+        "id": str(h.get("id", "")),
+        "title": str(h.get("title", "")),
+        "hook": "newfile-nudge",
+    })
+state["search_fallbacks"] = existing[-20:]
+print(json.dumps(state))
+' >>"$MC_LOG" 2>&1 || true
+            fi
+        fi
+    fi
+fi
+
 # NIT 3 fix round (Grok, duplicate JSON envelope): this used to keep its
 # own inline copy of the JSON-building python instead of calling
 # _build_additional_context, even though that helper's own comment
@@ -654,4 +847,4 @@ if [ -z "$OUTPUT_JSON" ]; then
 fi
 
 printf '%s\n' "$OUTPUT_JSON"
-finish "nudged"
+finish "nudged" "$FB_EXTRA"

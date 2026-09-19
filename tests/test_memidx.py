@@ -1173,6 +1173,43 @@ class TestF1DecisionIndexState(unittest.TestCase):
             self.assertTrue(len(results) >= 0)  # proves it queried at all, not the refusal envelope
             self.assertNotIsInstance(json.loads(buf_out.getvalue()), dict)  # not the {"state":..} refusal shape
 
+    def test_search_hydrate_adds_chain_text_reusing_topic_chain_lines(self):
+        """search-fallback: --hydrate adds a chain_text field to each JSON
+        hit, holding the SAME rendering topic_chain_lines/chain_lines
+        already produce for that topic's own chain (`chain --topic`,
+        `for-path --with-chain-text`) -- one implementation, not a fourth
+        copy. Without --hydrate, no hit carries the field at all (today's
+        bare shape is unchanged)."""
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            reindex(FIXTURES / "schema", db, no_embed=True)
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="hidden files",
+                                           mode="fts", status=[], type=[], area=None, topic=None,
+                                           authority=None, limit=10, json=True, hydrate=True))
+            self.assertEqual(rc, 0)
+            results = json.loads(buf_out.getvalue())
+            self.assertTrue(results)
+            hit = results[0]
+            self.assertIn("chain_text", hit)
+            self.assertIn(hit["id"], hit["chain_text"])
+            # Cross-check against the exact same rendering `chain` itself
+            # produces for that topic -- not merely "some text came back".
+            conn = memidx.open_db_noncreating(db, project=memidx.DEFAULT_PROJECT)
+            topic_row = memidx.record_row_by_path(conn, hit["path"])
+            expected = "\n".join(memidx.topic_chain_lines(conn, topic_row))
+            conn.close()
+            self.assertEqual(hit["chain_text"], expected)
+
+            buf_out2 = io.StringIO()
+            with contextlib.redirect_stdout(buf_out2), contextlib.redirect_stderr(io.StringIO()):
+                memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="hidden files",
+                                      mode="fts", status=[], type=[], area=None, topic=None,
+                                      authority=None, limit=10, json=True))
+            results_no_hydrate = json.loads(buf_out2.getvalue())
+            self.assertNotIn("chain_text", results_no_hydrate[0])
+
     def test_for_path_missing_or_uninitialized_exits_3_with_named_state(self):
         # Final-fix-wave item 3: a bare `[]` under --json no longer tells a
         # direct caller WHICH non-current state it got (missing vs.

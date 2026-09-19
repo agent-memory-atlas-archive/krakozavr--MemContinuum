@@ -78,6 +78,13 @@ fail-open cases: it still answers from whatever it has, which is why keeping
 it current (`reindex`, or just committing the store) is worth doing. Nothing
 in this tool can stop you from working.
 
+When that lookup finds nothing bound to the file, the same hook falls back
+to searching the store on the file path's own words and, if anything comes
+back, hands over the nearest decisions labelled plainly as a guess — never
+presented as a match. A brand-new file gets the same treatment, alongside
+its own reminder to check the code index. The guess never binds anything by
+itself; a person or agent still decides whether it actually applies.
+
 The same idea runs in the other direction. When files have been edited under no
 decision topic at all, or when the conversation has moved on for a while right
 after real edits, the session gets **nudged** that something here might be worth

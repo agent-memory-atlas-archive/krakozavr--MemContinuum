@@ -3193,6 +3193,23 @@ def cmd_search(args) -> int:
             # hybrid mode populates it), so a plain link-row hit's own
             # matched_link_id (set above) is not duplicated by this field.
             entry["contributing_link_ids"] = links_by_channel
+        if getattr(args, "hydrate", False):
+            # search-fallback (TOP-0133 L1): entry["path"] is ALREADY the
+            # real topic path for both a topic hit and a link hit (F5's
+            # link_topic_path fallback a few lines up) -- so one
+            # record_row_by_path lookup finds the right topic_row either
+            # way, and topic_chain_lines (memidx.py, the same function
+            # for-path's own chain rendering already reuses) renders
+            # exactly the chain text `chain --topic <id>` would print for
+            # it. A hit whose own row is not a topic at all (a concept, or
+            # a row a race deleted between the ranking query and here)
+            # degrades to whatever chain_lines renders for a topic-shaped
+            # row with no links ("... -- current: (none)"), via the same
+            # function -- never a crash, never a second query implementation.
+            topic_row = record_row_by_path(conn, entry["path"])
+            entry["chain_text"] = (
+                "\n".join(topic_chain_lines(conn, topic_row)) if topic_row is not None else ""
+            )
         out.append(entry)
 
     if args.json:
@@ -7566,6 +7583,23 @@ def _new_stats_bucket():
         # see _stats_report and _TOPICS_CAP_MARKER_RE below.
         "pre_edit_topics_named": 0,
         "pre_edit_topic_counts": Counter(),
+        # search-fallback (TOP-0133 L1): tallied from BOTH producers --
+        # pre-edit-chain.sh's own outcome=search-fallback/-empty lines
+        # (kind "pre-edit") and newfile-nudge.sh's fb_outcome=... field on
+        # its own outcome=nudged lines (kind "newfile-nudge", see that
+        # hook's own header for why the base outcome name never changes).
+        # Merged into ONE set of counters regardless of which hook fired
+        # -- the spec's own "fallback" stats block is one combined view,
+        # not split by producer. `fallback_elapsed_s` is pre-edit-chain.sh
+        # ONLY (newfile-nudge.sh's own lines carry no `elapsed=` field at
+        # all -- see _hook_log_line_kind); named accordingly so a reader
+        # never mistakes it for a whole-fleet timing.
+        "fallback_outcomes": Counter(),
+        "fallback_reasons": Counter(),
+        "fallback_hit_counts": Counter(),
+        "fallback_ids": Counter(),
+        "fallback_modes": Counter(),
+        "fallback_elapsed_s": [],
     }
 
 
@@ -7713,6 +7747,58 @@ def _rotated_hook_log_paths(log_path: Path) -> list:
         return []
     numbered.sort(key=lambda t: t[0], reverse=True)
     return [p for _, p in numbered]
+
+
+def _percentile(sorted_values: list, pct: int):
+    """Nearest-rank percentile over an ALREADY-sorted list -- None (never
+    0) on an empty list, so a report can tell "no timed fallback ran yet"
+    apart from "every one measured 0s". `pct` in (0, 100]; nearest-rank
+    (ceil(pct/100 * n), 1-indexed) needs no interpolation and matches how
+    this repo's own docstrings already describe p95/p99 elsewhere (see
+    hooks/pre-edit-chain.sh's own watchdog-budget comment)."""
+    if not sorted_values:
+        return None
+    n = len(sorted_values)
+    idx = max(1, -(-n * pct // 100))  # ceil(n * pct / 100), integer-only
+    return sorted_values[min(idx, n) - 1]
+
+
+_FALLBACK_ELAPSED_S_RE = re.compile(r"^(\d+)s$")
+
+
+def _tally_fallback_fields(bucket: dict, fields: dict, outcome: str, elapsed_field: str = "", field_prefix: str = "") -> None:
+    """search-fallback (TOP-0133 L1): the one tally step BOTH producer
+    shapes share -- pre-edit-chain.sh's own bare `hits=`/`ids=`/`mode=`/
+    `q=`/`reason=` fields (field_prefix="", elapsed_field=fields["elapsed"])
+    and newfile-nudge.sh's `fb_`-prefixed twins (field_prefix="fb_", no
+    elapsed -- that kind's lines never carry one). `outcome` is already
+    resolved by the caller (pre-edit-chain.sh's own `outcome=`, or
+    newfile-nudge.sh's `fb_outcome=`) -- always "search-fallback" or
+    "search-fallback-empty", the caller's own gate before calling this.
+    Never raises on a malformed/missing field (a non-digit `hits=`, an
+    empty `ids=`) -- this is a best-effort report over a log a human
+    or a broken host could have written anything into, same fail-open
+    discipline every other hook.log reader in this file already holds."""
+    bucket["fallback_outcomes"][outcome] += 1
+    mode = fields.get(field_prefix + "mode", "")
+    if mode:
+        bucket["fallback_modes"][mode] += 1
+    if outcome == "search-fallback-empty":
+        reason = fields.get(field_prefix + "reason", "")
+        if reason:
+            bucket["fallback_reasons"][reason] += 1
+    else:
+        hits = fields.get(field_prefix + "hits", "")
+        if hits.isascii() and hits.isdigit():
+            bucket["fallback_hit_counts"][hits] += 1
+        ids_raw = fields.get(field_prefix + "ids", "")
+        for tid in ids_raw.split(","):
+            if tid:
+                bucket["fallback_ids"][tid] += 1
+    if elapsed_field:
+        m = _FALLBACK_ELAPSED_S_RE.match(elapsed_field)
+        if m:
+            bucket["fallback_elapsed_s"].append(int(m.group(1)))
 
 
 def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
@@ -7887,6 +7973,21 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
                     bucket["pre_edit_topics_named"] += 1
                     for tid in ids:
                         bucket["pre_edit_topic_counts"][tid] += 1
+
+            # search-fallback (TOP-0133 L1): outcome IS the fallback
+            # outcome on this kind (pre-edit-chain.sh's own finish()).
+            if outcome in ("search-fallback", "search-fallback-empty"):
+                _tally_fallback_fields(bucket, fields, outcome, elapsed_field=fields.get("elapsed", ""))
+        elif kind == "newfile-nudge":
+            # search-fallback (TOP-0133 L1): the OUTCOME here is always
+            # "nudged" (or one of this hook's other, unrelated outcomes) --
+            # the fallback's own result rides on the separate `fb_outcome=`
+            # field instead (see hooks/newfile-nudge.sh's own header for
+            # why the base outcome name is never renamed). No `elapsed=`
+            # field on this kind at all.
+            fb_outcome = fields.get("fb_outcome", "")
+            if fb_outcome in ("search-fallback", "search-fallback-empty"):
+                _tally_fallback_fields(bucket, fields, fb_outcome, field_prefix="fb_")
         bucket["outcomes"][kind][outcome] += 1
         # userprompt: `user_prompts` is derived at report time from this
         # same outcomes["userprompt"] Counter (round 2, item 8) -- no
@@ -8065,6 +8166,24 @@ def _stats_report(
     pcm_refused = pcm.get("refused", 0)
     pcm_skipped = sum(v for k, v in pcm.items() if k.startswith("skipped:"))
 
+    # search-fallback (TOP-0133 L1): VIEWS over the fallback_* counters
+    # _scan_hook_log already merged across both producers (pre-edit-
+    # chain.sh's bare fields, newfile-nudge.sh's fb_-prefixed twins) --
+    # same "computed at report time, never a separate scan-loop counter"
+    # discipline every other named field in this function already follows.
+    fb_outcomes = b["fallback_outcomes"]
+    fb_search_fallback = fb_outcomes.get("search-fallback", 0)
+    fb_search_fallback_empty = fb_outcomes.get("search-fallback-empty", 0)
+    fb_hit_dist = {k: v for k, v in sorted(b["fallback_hit_counts"].items(), key=lambda kv: int(kv[0]))}
+    fb_top_ids = [
+        {"id": tid, "count": count}
+        for tid, count in sorted(b["fallback_ids"].items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    ]
+    fb_modes_seen = dict(b["fallback_modes"])
+    fb_elapsed = sorted(b["fallback_elapsed_s"])
+    fb_elapsed_p50 = _percentile(fb_elapsed, 50)
+    fb_elapsed_p95 = _percentile(fb_elapsed, 95)
+
     flags = []
     if args.project != UNKNOWN_STATS_PROJECT:
         if nudges_total >= 3 and ledger_store == 0:
@@ -8147,6 +8266,22 @@ def _stats_report(
             "refused": pcm_refused,
             "skipped": pcm_skipped,
             "outcomes": dict(pcm),
+        },
+        # search-fallback (TOP-0133 L1): merged across pre-edit-chain.sh
+        # and newfile-nudge.sh -- see _tally_fallback_fields. No relevance
+        # floor lives here or anywhere in this feature by design (docs/
+        # INTERNALS.md); this block only reports what actually happened,
+        # for weeks of real queries to eventually decide one.
+        "fallback": {
+            "search_fallback": fb_search_fallback,
+            "search_fallback_empty": fb_search_fallback_empty,
+            "hit_count_distribution": fb_hit_dist,
+            "top_ids": fb_top_ids,
+            "modes_seen": fb_modes_seen,
+            "elapsed_s_p50": fb_elapsed_p50,
+            "elapsed_s_p95": fb_elapsed_p95,
+            "outcomes": dict(fb_outcomes),
+            "reasons": dict(b["fallback_reasons"]),
         },
         "store_commits": store_commits,
         "unknown_lines": unknown_lines,
@@ -8296,6 +8431,16 @@ def cmd_stats(args) -> int:
         pcm = result["pre_commit"]
         print(f"pre-commit (store append-only guard): pass={pcm['pass']} "
               f"refused={pcm['refused']} skipped={pcm['skipped']}")
+        fb = result["fallback"]
+        p50_txt = "n/a" if fb["elapsed_s_p50"] is None else f"{fb['elapsed_s_p50']}s"
+        p95_txt = "n/a" if fb["elapsed_s_p95"] is None else f"{fb['elapsed_s_p95']}s"
+        modes_txt = ", ".join(f"{m}:{c}" for m, c in sorted(fb["modes_seen"].items())) or "(none)"
+        reasons_txt = ", ".join(f"{r}:{c}" for r, c in sorted(fb["reasons"].items())) or "(none)"
+        top_ids_txt = ", ".join(f"{t['id']}:{t['count']}" for t in fb["top_ids"]) or "(none)"
+        print(f"search fallback (pre-edit-chain.sh + newfile-nudge.sh): "
+              f"hits={fb['search_fallback']} empty={fb['search_fallback_empty']} "
+              f"(reasons: {reasons_txt}) modes={modes_txt} elapsed p50/p95={p50_txt}/{p95_txt} "
+              f"top-ids={top_ids_txt}")
         eb = result["embedding_backlog"]
         rows_txt = "unknown (db unreadable)" if eb["rows_without_fresh_vector"] is None else eb["rows_without_fresh_vector"]
         print(f"embedding backlog: pending-marker={eb['pending_marker']} "
@@ -8432,6 +8577,17 @@ def main(argv=None) -> int:
         help="search-inbox-downrank: inbox/ records are excluded by default "
              "(they are freeform consult drops, not rulings); pass this to "
              "widen results to include them",
+    )
+    p_search.add_argument(
+        "--hydrate", action="store_true",
+        help="search fallback: add a chain_text field to each "
+             "--json hit, holding the SAME plain-text chain rendering "
+             "topic_chain_lines/chain_lines produce for that hit's own "
+             "topic (reused, not reimplemented) -- so a caller (hooks/"
+             "pre-edit-chain.sh, hooks/newfile-nudge.sh) can inject the "
+             "nearest decisions' chains off ONE search call, with no "
+             "second `chain`/`for-path` call per hit. Ignored without "
+             "--json (chain_text has no plain-text rendering slot).",
     )
     p_search.set_defaults(func=cmd_search)
 
