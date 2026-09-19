@@ -507,8 +507,19 @@ _FENCE_REQUIRED_DIRS = frozenset({"topics", "incidents", "investigations"})
 
 
 def _fence_error(root: Path, path: Path) -> str | None:
+    # CI gate finding (macOS): `walk_markdown` resolves `root` before
+    # yielding paths under it (a symlinked --root walks the real tree), so
+    # `path` always comes back resolved -- e.g. `/private/var/folders/...`
+    # on macOS, where `/var` is itself a symlink to `/private/var`. Callers
+    # of `_fence_error` (via `lint_root`) may still pass the UNRESOLVED
+    # `root` a caller gave them, so `path.relative_to(root)` silently
+    # raised ValueError on every macOS run -- caught, fell back to
+    # `path.parts`, whose first component is never one of the required
+    # directory names, so this check no-op'd everywhere on that platform.
+    # Resolving `root` here, the same way `walk_markdown` already resolved
+    # it, restores the match without changing `lint_root`'s own signature.
     try:
-        rel_parts = path.relative_to(root).parts
+        rel_parts = path.relative_to(root.resolve()).parts
     except ValueError:
         rel_parts = path.parts
     if not rel_parts or rel_parts[0] not in _FENCE_REQUIRED_DIRS:
