@@ -2018,6 +2018,9 @@ id:
 | a topic-like record present at `REF` is deleted or renamed | error naming the path and its real kind (`topic`/`incident`/`investigation`/`concept`, or `record` when the kind itself could not be recovered) — `--no-renames` means a rename is a plain delete + a plain add, so one rule covers both |
 | a duplicate link id within one topic on the NEW side | error naming the id, `<path>: duplicate link id '<id>' used <n> times` — the same `memidx.validate_record_shape` diagnostic every consumer shares |
 | a valid forward `status` move (with `superseded_by` added when the new status is `superseded`), `promoted_by` added, alone on the link; new links; changes to `current`, `title`, `tags`, `code_refs`, or the body text | free |
+| a link present at `REF` has its PARSED fields unchanged but its RAW TEXT SPAN changed (a YAML dumper re-render: different quoting, key order, wrapping, or a whitespace-only edit, with identical parsed content) | error, `<path>:<link>: link reformatted, not appended` — the field-level comparison above never fires for these (every field is equal), so the span is compared byte-for-byte separately; a span that cannot be safely attributed to its link on the `REF` side (structural extraction inconclusive — see below) skips this comparison with a NOTE, never an error — the field-level rules above still apply |
+| the same, but the span cannot be attributed on the NEW side (structural extraction inconclusive there instead) while the `REF` side extracted fine | error, `<path>:<link>: link's span could not be extracted on the new side; treated as changed` — a deliberately different message from the row above: this is a proven extraction FAILURE treated as a change (fail closed), never a claim that the bytes were actually compared and found to differ |
+| a new link (present now, absent at `REF`) sorts BELOW some link that already existed at `REF`, in the new file's own link order | error, `<path>:<link>: link inserted out of order` — every new link must sort above every `REF`-side link, newest-first; reordering AMONG `REF`-side links themselves is not separately checked |
 | the `REF`-side blob failed full validation (a shape error, or a duplicate link id) but its `links` field itself still recovers at least one usable entry | not a repair — those recovered links (a duplicate id keeps its FIRST occurrence, file order) are still compared against the new side by every rule above, exactly as if the REF blob had parsed cleanly, with a note naming the REF-side diagnostic that made the blob invalid |
 | the `REF`-side blob never parsed at all (or parsed but recovered no usable `links`), and the new blob now parses cleanly | a note, not an error (`repaired — the blob at REF could not be safely parsed …`) — nothing here was ever recorded link history to freeze, so fixing it is a repair, never an append-only violation |
 | frontmatter that does not parse on the new side, or on both sides | error, the typed-parse diagnostic — never a traceback |
@@ -2036,14 +2039,61 @@ place — those two directions were never legal moves for that field; what
 promotion DOES edit on the OLD link is `promoted_by`, once, naming the new
 link, with no requirement that the old link's own status move at all.
 
+**Residual gap (documented, not closed here):** a link making a legitimate
+lifecycle move (say `active` → `historical`) has PARSED fields that differ
+by definition, so the byte-span comparison never runs on it at all — only
+the field-level rules judge it. A commit that both promotes a link's status
+AND re-renders that same link's bytes in whatever way it likes is invisible
+to the byte layer for that one link; every OTHER link in the same file still
+guards a whole-file regeneration (their parsed fields stay equal, so their
+spans are compared), so the exposure is narrow — one link, the one commit
+that moves it — not a whole-file regeneration.
+
+**Structural extraction, and when it gives up.** The byte-span comparison
+locates each link's raw text by INDENTATION, never by regexing an id back
+out of a `- link:`-style line — a `yaml.safe_dump` re-render sorts an
+item's keys and may start it with any field (`- alternatives:`, `- date:`),
+not necessarily `link:`. It tolerates a trailing space after `links:` and a
+`#`-comment line at any indent (attributed to whichever span is already
+open, never mistaken for a boundary). It still gives up — a NOTE on the
+`REF` side, an error on the new side (see the table) — on a flow-style
+`links: [...]` (no real store file does this today), or when the number of
+structurally-found items does not match the parsed `links` list (a `REF`-
+side duplicate id `_recovered_old_links` already resolved to one entry is
+the one case seen in practice).
+
+A comment line's own position still matters, even though its indent never
+does: one added directly under `links:`, before the first item, belongs to
+no span at all and is free (attributed to nothing, the same as any other
+text outside every item's own range). One added AFTER the last recorded
+item, by contrast, becomes part of THAT item's span — a genuinely new
+trailing byte inside the last link's own range — and correctly flags that
+link as reformatted; the message is literally accurate, not a false
+positive, because the file at that link's position really did change. And
+because the newest-first order check (above) matches a new link to a `REF`-
+side one by id rather than by position, it refuses an in-place repair that
+merely ADDS a missing `link:` key to a `REF`-side entry that never had one
+(a shape error distinct from a duplicate id): the repaired entry now
+carries an id `REF` never associated with that position, which the check
+reads as a new link landing below an existing one. The only way through is
+`--no-verify` — narrow, and the honest cost of matching by id rather than
+by position.
+
 `--staged` compares `REF` to the INDEX (`git show :path`, what `git commit`
 would actually commit); the default compares `REF` to the working tree
 (`git diff REF` — the standard "everything you'd get if you staged
 everything" comparison). The summary line
-(`memlint: append-only against <ref>: changed=<n> errors=<n>`) is what
-`hooks/pre-commit-append-only.sh` parses `changed=` off of for its own
-`hook.log` line; `changed` counts topic files the diff actually concerned,
-independent of whether any produced an error.
+(`memlint: append-only against <ref>: changed=<n> errors=<n> notes=<n>`) is
+what `hooks/pre-commit-append-only.sh` parses `changed=` and `notes=` off of
+for its own `hook.log` line; `changed` counts topic files the diff actually
+concerned, independent of whether any produced an error; `notes` counts
+informational lines (a repair, or a structural-extraction bail-out) — never
+an error, but worth seeing: a NOTE used to print to stdout with no count on
+the summary line, so a clean (`rc=0`) run — the only shape the hook never
+echoes its captured output for — could carry one and nobody would know.
+NOTE lines now print to stderr and the count rides the summary line
+`hooks/pre-commit-append-only.sh` already parses, so this is visible in
+`hook.log` on every run, clean or not.
 
 The store's own git `pre-commit` hook (`hooks/pre-commit-append-only.sh`,
 wired by `scripts/repo-init.sh` step 6b the same way `post-commit-reindex.sh`
@@ -2051,11 +2101,18 @@ is wired at step 6) runs `--against-ref HEAD --staged` on every commit and
 BLOCKS the ones that fail it — see "Fail-open is the contract, not a
 fallback" above for the one deliberate exception this makes to every other
 hook's fail-open rule, and "The watchdog"'s `Unguarded:` list for why no
-timeout wraps it. `git commit --no-verify` bypasses it, same as any git hook;
-the same check run again in CI against a wider range, plus a protected
-branch, is the real guarantee against a rewritten history for a store other
-machines also touch — not this hook alone, which only ever sees one commit
-at a time on one machine.
+timeout wraps it. The same hook also runs the plain schema check
+(`memlint.py ROOT`, no `--against-ref`, no `--code-root`) and blocks on any
+ERROR from it (warnings pass) — a fenceless record committed under
+`topics/`, `incidents/`, or `investigations/` (§7) is exactly the kind of
+problem this catches that the append-only diff alone never would, since a
+brand-new file has no history at `REF` to compare. The schema pass reads the
+WORKING TREE, not the staged index (unlike the append-only diff, it has no
+`--staged` form), a narrow gap of its own. `git commit --no-verify` bypasses
+both, same as any git hook; the same checks run again in CI against a wider
+range, plus a protected branch, are the real guarantee against a rewritten
+or unfenced history for a store other machines also touch — not this hook
+alone, which only ever sees one commit at a time on one machine.
 
 ## Storage and index
 

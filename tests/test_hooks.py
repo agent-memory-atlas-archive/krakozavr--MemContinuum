@@ -2362,6 +2362,123 @@ class TestPreCommitAppendOnlyHook(unittest.TestCase):
         self.assertIn("changed=1", log_text)
         self.assertIn("project=bad-proj", log_text)
 
+    def test_reformatted_history_staged_edit_exits_1_and_logs_rc1(self):
+        """Acceptance 8 / INC-0124: the hook path for a REFORMAT, not just
+        an ordinary field edit -- a whole-file `yaml.safe_dump` re-render
+        of the fixture topic with every parsed link field unchanged. Before
+        this fix this staged edit passed the hook (`rc=0`) exactly as it
+        passed the unpatched `memlint.py` in INC-0124's own repro; this
+        confirms the new check blocks the commit through the real
+        pre-commit path, not only via a direct `memlint.py` invocation."""
+        import yaml
+
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-reformat-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        store = _init_topic_store(Path(tmp) / "store")
+        original = (store / "topics" / "foo.md").read_text()
+        fm = yaml.safe_load(original.split("---\n", 2)[1])
+        regenerated = "---\n" + yaml.safe_dump(fm) + "---\n\nBody.\n"
+        self.assertNotEqual(regenerated, original, "fixture stale: dump matches source verbatim")
+        self.assertEqual(
+            yaml.safe_load(regenerated.split("---\n", 2)[1]), fm,
+            "fixture invalid: regenerated blob must parse to the same dict as the original",
+        )
+        (store / "topics" / "foo.md").write_text(regenerated)
+        _git(["add", "-A"], cwd=store)
+        env = clean_env(
+            HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_ROOT=str(store),
+            MEMCONTINUUM_PROJECT="reformat-proj", MEMCONTINUUM_PYTHON=VENV_PYTHON,
+        )
+        # cwd=store: see test_unborn_head_skips's comment above.
+        proc = subprocess.run(
+            [MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=15, cwd=store,
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reformatted, not appended", proc.stderr)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("pre-commit-append-only: rc=1", log_text)
+        self.assertIn("changed=1", log_text)
+        self.assertIn("project=reformat-proj", log_text)
+
+    def test_unfenced_topic_added_is_blocked_by_the_schema_check(self):
+        """INC-0127: the hook now ALSO runs the plain schema check
+        (`memlint.py ROOT`, no `--against-ref`) and blocks on any ERROR
+        from it. A brand-new (status `A` in the diff) unfenced topic is
+        free under the append-only diff itself (no history to protect --
+        `check_append_only` continues on status "A"), so before this fix
+        round nothing in this hook would have caught it at all."""
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-unfenced-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        store = _init_topic_store(Path(tmp) / "store")
+        (store / "topics" / "bar.md").write_text(
+            "type: topic\nid: TOP-9600\ntitle: Unfenced\nlinks:\n  - link: L1\n    status: active\n"
+        )
+        _git(["add", "-A"], cwd=store)
+        env = clean_env(
+            HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_ROOT=str(store),
+            MEMCONTINUUM_PROJECT="unfenced-proj", MEMCONTINUUM_PYTHON=VENV_PYTHON,
+        )
+        # cwd=store: see test_unborn_head_skips's comment above.
+        proc = subprocess.run(
+            [MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=15, cwd=store,
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("missing opening frontmatter fence", proc.stderr)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("pre-commit-append-only: schema-rc=1", log_text)
+        self.assertIn("project=unfenced-proj", log_text)
+
+    def test_broken_python_crash_is_fail_open_not_a_schema_block(self):
+        """Re-gate MAJOR: `$MEMCONTINUUM_PYTHON` pointing at an executable
+        that CAN be launched but crashes before printing memlint's own
+        summary line (the reviewer's own repro -- a venv missing PyYAML,
+        reproduced here as a fake python that always prints a traceback-
+        shaped stderr and exits 1, the finding's own offered alternative
+        to building a real broken venv) must never read as a schema ERROR.
+        Store is schema-clean with one legitimate NEW link staged (the
+        reviewer's exact fixture) -- before this fix, rc=1 with `schema-
+        rc=1` in hook.log, indistinguishable from a real fence violation;
+        after it, both memlint invocations fail the same way (schema AND
+        append-only alike -- the crash has nothing to do with argv), each
+        recognized as an engine failure by its own missing summary-line
+        marker, and the commit is let through."""
+        tmp = tempfile.mkdtemp(prefix="memcontinuum-precommit-crash-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        store = _init_topic_store(Path(tmp) / "store")
+        text = _prepend_new_link((store / "topics" / "foo.md").read_text())
+        (store / "topics" / "foo.md").write_text(text)
+        _git(["add", "-A"], cwd=store)
+        fake_py = Path(tmp) / "fake-python-crashes-on-import"
+        fake_py.write_text(
+            "#!/usr/bin/env bash\n"
+            'echo "Traceback (most recent call last):" >&2\n'
+            'echo \'  File "memlint.py", line 33, in <module>\' >&2\n'
+            'echo "    from memidx import (" >&2\n'
+            'echo "ModuleNotFoundError: No module named '"'"'yaml'"'"'" >&2\n'
+            "exit 1\n"
+        )
+        fake_py.chmod(0o755)
+        env = clean_env(
+            HOME=str(tmp), MEMCONTINUUM_HOME=str(home), MEMCONTINUUM_ROOT=str(store),
+            MEMCONTINUUM_PROJECT="crash-proj", MEMCONTINUUM_PYTHON=str(fake_py),
+        )
+        # cwd=store: see test_unborn_head_skips's comment above.
+        proc = subprocess.run(
+            [MC_BASH, str(PRE_COMMIT_HOOK)], capture_output=True, text=True, env=env, timeout=15, cwd=store,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        log_text = (home / "hook.log").read_text()
+        self.assertIn("schema=skipped-engine-failure", log_text)
+        self.assertIn("skipped=engine-failure", log_text)
+        self.assertIn("project=crash-proj", log_text)
+        self.assertNotIn("schema-rc=1", log_text)
+
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestPreCommitAppendOnlyRealCommit(unittest.TestCase):
