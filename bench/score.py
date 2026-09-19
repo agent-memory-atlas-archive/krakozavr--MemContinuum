@@ -727,19 +727,24 @@ def negative_control(report: dict, queries: list[dict]) -> dict:
 
 def summarize(report: dict, queries: list[dict]) -> dict:
     """{display_name: {"overall": {...}, "path": {...}, "question": {...},
-    "paraphrase": {...}, "exact-term": {...}, "plain": {...}, "errors": n}}
-    -- a query with a runner error is excluded from that runner's own
-    aggregates (never silently scored as zero, never silently dropped
-    without a count).
+    "paraphrase": {...}, "exact-term": {...}, "plain": {...},
+    "long-exact-term": {...}, "errors": n}} -- a query with a runner error
+    is excluded from that runner's own aggregates (never silently scored
+    as zero, never silently dropped without a count).
 
-    Three disjoint sub-slices of `question` by id prefix: "paraphrase"
+    Four disjoint sub-slices of `question` by id prefix: "paraphrase"
     (`para-`, zero shared vocabulary with the target -- see bench/README.md),
     "exact-term" (`et-`, an error message/file name/symbol/flag/quoted
-    phrase a keyword search should nail -- INC-0115 step 2), and "plain"
+    phrase a keyword search should nail -- INC-0115 step 2), "plain"
     (`kw-`, ordinary keyword-shaped developer questions, the baseline
-    "plain" slice INC-0115 step 4 measures a fix against for regressions).
-    `question` itself stays the union of all three (plus any other
-    question-kind query), unchanged, for backward compatibility."""
+    "plain" slice INC-0115 step 4 measures a fix against for regressions),
+    and "long-exact-term" (`let-`, PR #21 / Opus BLOCKER: the SAME kind of
+    literal anchor term as the `et-` slice, but embedded in a 12-20 word
+    agent-shaped question -- diluted content-term coverage measured
+    against the same corpus/threshold the owner chose to keep un-gated,
+    see bench/README.md's "The long-exact-term queries"). `question`
+    itself stays the union of all four (plus any other question-kind
+    query), unchanged, for backward compatibility."""
     by_id = {q["id"]: q for q in queries}
     out = {}
     for display, data in report.items():
@@ -755,9 +760,71 @@ def summarize(report: dict, queries: list[dict]) -> dict:
             "paraphrase": aggregate(subset(lambda q: q["id"].startswith("para-"))),
             "exact-term": aggregate(subset(lambda q: q["id"].startswith("et-"))),
             "plain": aggregate(subset(lambda q: q["id"].startswith("kw-"))),
+            "long-exact-term": aggregate(subset(lambda q: q["id"].startswith("let-"))),
             "errors": len(data["errors"]),
         }
     return out
+
+
+def hybrid_stepaside_report(report: dict, queries: list[dict], prefix: str = "let-") -> dict | None:
+    """PR #21 gate (Opus BLOCKER, item 5): "measure, don't gate" -- reports
+    how often hybrid's own FTS-step-aside decision actually fired on the
+    `prefix` slice (default the `let-` long-exact-term queries), and
+    whether that step-aside helped or hurt, WITHOUT re-running any search
+    or reimplementing the gate: `report` already carries each runner's own
+    `per_query[id]["ranked"]` (see run_query/evaluate_query above), so this
+    reads memcontinuum:fts / memcontinuum:vector / memcontinuum:hybrid's
+    THREE already-computed ranked lists for the same slice and infers the
+    gate's own verdict from them --
+
+      stepped aside  : hybrid's ranked list equals vector's AND fts's own
+                        list differs from vector's (an ordinary channel
+                        AGREEMENT is not a step-aside: hybrid would equal
+                        vector either way, so it is excluded rather than
+                        counted as one)
+      regression      : stepped aside, AND fts's own top-1 is a correct
+                        answer (in `expect`) while vector's top-1 is not
+                        -- the step-aside threw away a hit FTS already had
+      improvement     : stepped aside, AND vector's own top-1 is correct
+                        while fts's top-1 is not -- the step-aside is what
+                        rescued the query
+
+    Returns None (not a runner error) when any of the three required
+    runners is missing from `report` -- callers should print nothing
+    rather than a misleading partial count. This mirrors, on the small
+    tracked `let-` slice, the same three-way classification Opus's own
+    (untracked, one-off) 60-query sweep used -- see the PR body for both
+    sets of numbers side by side."""
+    by_id = {q["id"]: q for q in queries}
+    slice_ids = [qid for qid, q in by_id.items() if q["id"].startswith(prefix)]
+    needed = ("memcontinuum:fts", "memcontinuum:vector", "memcontinuum:hybrid")
+    if not all(name in report for name in needed):
+        return None
+    fts_pq = report["memcontinuum:fts"]["per_query"]
+    vec_pq = report["memcontinuum:vector"]["per_query"]
+    hyb_pq = report["memcontinuum:hybrid"]["per_query"]
+
+    stepped_aside, regressions, improvements = [], [], []
+    for qid in slice_ids:
+        if qid not in fts_pq or qid not in vec_pq or qid not in hyb_pq:
+            continue   # a runner error on this one query -- excluded, not miscounted
+        fts_ranked, vec_ranked, hyb_ranked = fts_pq[qid]["ranked"], vec_pq[qid]["ranked"], hyb_pq[qid]["ranked"]
+        if hyb_ranked != vec_ranked or fts_ranked == vec_ranked:
+            continue   # not a step-aside: hybrid didn't collapse to vector-only, or the channels already agreed
+        stepped_aside.append(qid)
+        expect = set(by_id[qid]["expect"])
+        fts_top1_right = bool(fts_ranked) and fts_ranked[0] in expect
+        vec_top1_right = bool(vec_ranked) and vec_ranked[0] in expect
+        if fts_top1_right and not vec_top1_right:
+            regressions.append(qid)
+        elif vec_top1_right and not fts_top1_right:
+            improvements.append(qid)
+    return {
+        "slice_n": len(slice_ids),
+        "stepped_aside": stepped_aside,
+        "regressions": regressions,
+        "improvements": improvements,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -765,7 +832,7 @@ def summarize(report: dict, queries: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 def print_table(summary: dict) -> None:
-    rows = ["overall", "path", "question", "paraphrase", "exact-term", "plain"]
+    rows = ["overall", "path", "question", "paraphrase", "exact-term", "plain", "long-exact-term"]
     header = f"{'runner':<22}{'slice':<11}{'n':>4}{'R@1':>7}{'R@3':>7}{'R@10':>7}{'MRR':>7}{'errors':>8}"
     print(header)
     print("-" * len(header))
@@ -932,11 +999,15 @@ def main(argv=None) -> int:
     report = run_all(queries, corpus, runner_specs, args.limit)
     summary = summarize(report, queries)
     control = negative_control(report, queries)
+    stepaside = hybrid_stepaside_report(report, queries)
 
     if args.json:
         # keep the control OUT of `summary` itself: print_table and every
         # consumer iterate summary's keys as runner names.
-        print(json.dumps({"runners": summary, "negative_control": control}, indent=2))
+        out = {"runners": summary, "negative_control": control}
+        if stepaside is not None:
+            out["hybrid_stepaside"] = stepaside
+        print(json.dumps(out, indent=2))
     else:
         print(f"{len(queries)} queries ({sum(1 for q in queries if q['kind']=='path')} path, "
               f"{sum(1 for q in queries if q['kind']=='question')} question, "
@@ -945,6 +1016,20 @@ def main(argv=None) -> int:
         print_table(summary)
         print()
         print_control(control, list(summary))
+        if stepaside is not None:
+            n = stepaside["slice_n"]
+            sa = len(stepaside["stepped_aside"])
+            print(
+                f"hybrid step-aside on the long-exact-term slice: {sa}/{n} queries stepped aside "
+                f"({len(stepaside['regressions'])} regression(s), {len(stepaside['improvements'])} "
+                f"improvement(s)) -- see bench/README.md's \"The long-exact-term queries\""
+            )
+            if stepaside["stepped_aside"]:
+                print(f"  stepped aside: {', '.join(stepaside['stepped_aside'])}")
+            if stepaside["regressions"]:
+                print(f"  regressions:   {', '.join(stepaside['regressions'])}")
+            if stepaside["improvements"]:
+                print(f"  improvements:  {', '.join(stepaside['improvements'])}")
         for display, data in report.items():
             for qid, msg in data["errors"].items():
                 print(f"ERROR  {display}  {qid}: {msg}", file=sys.stderr)

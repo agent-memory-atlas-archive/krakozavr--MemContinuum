@@ -1881,6 +1881,74 @@ class TestRuling80EmbeddingFailureFailsOpen(unittest.TestCase):
             self.assertGreater(len(out["results"]), 0, out)
 
 
+class TestFtsStepAsideVisibility(unittest.TestCase):
+    """PR #21 gate (Grok/Opus): a step-aside used to be invisible in both
+    --json and stderr -- `contributing` stayed {} exactly like an ordinary
+    single-link-family hit, so nothing distinguished "FTS agreed, nothing
+    to report" from "FTS was overruled". `_fts_top_hit_is_confident` (and,
+    on step-aside, `_fts_top_hit_coverage`) are mocked directly here rather
+    than constructed via a crafted low-coverage query -- this pins the
+    WIRING between the gate's own verdict and cmd_search's downstream
+    output, independent of tests/test_bench.py's TestFtsStepAsideCoverage,
+    which pins the coverage NUMBERS against the real bench corpus."""
+
+    def _two_topics(self, td):
+        root = Path(td) / "root"; (root / "topics").mkdir(parents=True)
+        (root / "topics" / "a.md").write_text(
+            "---\ntype: topic\nid: TOP-1\ntitle: alpha\nlinks:\n"
+            "  - link: L1\n    status: active\n"
+            "    ruling: {text: alpha ruling text, authority: owner-verbatim, source: s}\n"
+            "---\nalpha body\n"
+        )
+        (root / "topics" / "b.md").write_text(
+            "---\ntype: topic\nid: TOP-2\ntitle: beta\nlinks:\n"
+            "  - link: L1\n    status: active\n"
+            "    ruling: {text: beta ruling text, authority: owner-verbatim, source: s}\n"
+            "---\nbeta body\n"
+        )
+        return root
+
+    def test_step_aside_sets_json_fusion_vector_only_and_stderr_note(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._two_topics(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=False)
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with mock.patch.object(memidx, "_fts_top_hit_is_confident", return_value=False), \
+                 mock.patch.object(memidx, "_fts_top_hit_coverage", return_value=0.17), \
+                 contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="alpha",
+                                           mode="hybrid", status=[], type=[], area=None, topic=None,
+                                           authority=None, limit=10, json=True))
+            self.assertEqual(rc, 0)
+            self.assertIn(
+                "hybrid: FTS top hit not confident (coverage 0.17); vector ranking only",
+                buf_err.getvalue(),
+            )
+            out = json.loads(buf_out.getvalue())
+            self.assertIsInstance(out, dict, out)
+            self.assertEqual(out["fusion"], "vector-only")
+
+    def test_normal_fusion_sets_json_fusion_rrf_and_no_stderr_note(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._two_topics(td)
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=False)
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                # Real gate, real channels, no mocking: "alpha" genuinely
+                # overlaps TOP-1's own indexed text (coverage 1.0), so this
+                # exercises the ordinary confident/fuse path for real.
+                rc = memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="alpha",
+                                           mode="hybrid", status=[], type=[], area=None, topic=None,
+                                           authority=None, limit=10, json=True))
+            self.assertEqual(rc, 0)
+            self.assertNotIn("vector ranking only", buf_err.getvalue())
+            out = json.loads(buf_out.getvalue())
+            self.assertIsInstance(out, dict, out)   # hybrid --json is always the envelope now
+            self.assertEqual(out["fusion"], "rrf")
+
+
 class TestF3TrustModel(unittest.TestCase):
     # Fix wave 1 G1 (Codex 2): the second link used to share id "L1" with
     # the first, deliberately, as one more of the "five simultaneous
@@ -2957,7 +3025,9 @@ class TestF5LinkRows(unittest.TestCase):
                     memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="x",
                                           mode="hybrid", status=[], type=[], area=None, topic=None,
                                           authority=None, limit=10, json=True))
-                out = json.loads(buf.getvalue())
+                # hybrid --json is always the {"fusion": ..., "results": [...]}
+                # envelope now (PR #21 gate) -- never a bare list.
+                out = json.loads(buf.getvalue())["results"]
             hit = next(h for h in out if h["path"].endswith("t.md"))
             self.assertEqual(hit.get("contributing_link_ids"), {"fts": "L1", "vector": "L2"})
 
@@ -2988,7 +3058,7 @@ class TestF5LinkRows(unittest.TestCase):
                     memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="x",
                                           mode="hybrid", status=[], type=[], area=None, topic=None,
                                           authority=None, limit=10, json=True))
-                out = json.loads(buf.getvalue())
+                out = json.loads(buf.getvalue())["results"]
             hit = next(h for h in out if h["path"].endswith("t.md"))
             self.assertEqual(hit.get("contributing_link_ids"), {"fts": "L1"})
             self.assertEqual(hit.get("matched_link_id"), "L1")
@@ -3014,7 +3084,7 @@ class TestF5LinkRows(unittest.TestCase):
                     memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="x",
                                           mode="hybrid", status=[], type=[], area=None, topic=None,
                                           authority=None, limit=10, json=True))
-                out = json.loads(buf.getvalue())
+                out = json.loads(buf.getvalue())["results"]
             hit = next(h for h in out if h["path"].endswith("t.md"))
             self.assertEqual(hit.get("contributing_link_ids"), {"vector": "L1"})
             self.assertIsNone(hit.get("matched_link_id"))
@@ -3087,7 +3157,7 @@ class TestF5LinkRows(unittest.TestCase):
                                       query="widget cache invalidated", mode="hybrid",
                                       status=[], type=[], area=None, topic=None,
                                       authority=None, limit=10, json=True))
-            out = json.loads(buf.getvalue())
+            out = json.loads(buf.getvalue())["results"]
             paths = [hit["path"] for hit in out]
             self.assertEqual(len(paths), len(set(paths)),
                               f"a topic and its own link row must never both appear in hybrid results: {out}")

@@ -38,18 +38,20 @@ For each query we compute, per runner:
 - **MRR** — `1 / rank of the first expected id` anywhere in the runner's
   output (not capped at any k). Zero if no expected id was returned at all.
 
-`bench/score.py` reports these per `kind` (`path`, `question`), three
+`bench/score.py` reports these per `kind` (`path`, `question`), four
 disjoint sub-slices of `question` by id prefix — `paraphrase` (`para-`, see
 below), `exact-term` (`et-`, an error message/file name/symbol/flag/quoted
 phrase a keyword search should nail — see "The exact-term queries" below),
 `plain` (`kw-`, ordinary keyword-shaped developer questions, see "The
-paraphrase queries" below) — and `overall`. `overall` and `question` are
-each the union of every query of that shape, `exact-term` included: they
-moved slightly easier when the 12 `et-` queries were added (fix round: was
-45 queries with no `et-` slice; the exact-term R@1/MRR are near-ceiling by
-construction, since that is the point of the slice), which is exactly why
-the sliced numbers exist — read `paraphrase` as the hard number and
-`overall`/`question` as a blend, not the other way around.
+paraphrase queries" below), `long-exact-term` (`let-`, see "The
+long-exact-term queries" below) — and `overall`. `overall` and `question`
+are each the union of every query of that shape, `exact-term` included:
+they moved slightly easier when the 12 `et-` queries were added (fix
+round: was 45 queries with no `et-` slice; the exact-term R@1/MRR are
+near-ceiling by construction, since that is the point of the slice),
+which is exactly why the sliced numbers exist — read `paraphrase` as the
+hard number and `overall`/`question` as a blend, not the other way
+around.
 
 ## How to run it
 
@@ -64,17 +66,24 @@ PYTHONPATH= "$MEMCONTINUUM_PYTHON" bench/score.py
 `memidx.py` needs `$MEMCONTINUUM_PYTHON`, and it reads that variable
 itself). `--json` gets the same result as a machine-readable envelope
 instead of a table: `{"runners": {<display name>: {"overall", "path",
-"question", "paraphrase", "exact-term", "plain", "errors"}}, "negative_
-control": {<display name>: {"real_mrr", "shuffled_mrr", "gain", "spread",
-"se", "returns_nothing", "is_exempt_baseline", "separates"}, "verdict",
-"failed_runners"}}` — pinned by `tests/test_bench.py::TestJSONOutputShape`
-so a future change to this shape is a deliberate, visible diff, not a
-silent break. (Fix round: `negative_control`'s own per-runner keys changed
-again this pass — `reversed_mrr`/`min_gain` are gone, `shuffled_mrr`/
-`spread`/`is_exempt_baseline` are new. Fix round 2: `se` is new — the
-`spread` field is the raw sample standard deviation of the per-query paired
+"question", "paraphrase", "exact-term", "plain", "long-exact-term",
+"errors"}}, "negative_control": {<display name>: {"real_mrr",
+"shuffled_mrr", "gain", "spread", "se", "returns_nothing",
+"is_exempt_baseline", "separates"}, "verdict", "failed_runners"},
+"hybrid_stepaside": {"slice_n", "stepped_aside", "regressions",
+"improvements"}}` — the `hybrid_stepaside` key is present only when all
+three `memcontinuum:fts`/`:vector`/`:hybrid` runners ran (omitted, not
+`null`, otherwise — e.g. `--runner nomemory --runner keyword`) — pinned by
+`tests/test_bench.py::TestJSONOutputShape` so a future change to this
+shape is a deliberate, visible diff, not a silent break. (Fix round:
+`negative_control`'s own per-runner keys changed again this pass —
+`reversed_mrr`/`min_gain` are gone, `shuffled_mrr`/`spread`/
+`is_exempt_baseline` are new. Fix round 2: `se` is new — the `spread`
+field is the raw sample standard deviation of the per-query paired
 differences; `se` is what the pass/fail decision actually compares `gain`
-against (`spread / sqrt(n)`) — see "The negative control" below.)
+against (`spread / sqrt(n)`) — see "The negative control" below. PR #21:
+`long-exact-term`/`hybrid_stepaside` are new — see "The long-exact-term
+queries" below.)
 `--runner NAME[:mode]` (repeatable) selects a subset; see "Runner
 interface" below for what `NAME` can be. Everything runs strictly
 sequentially — several `memcontinuum:*` runner invocations share one
@@ -125,7 +134,7 @@ for its own sake:
   superseded link's own row, so a query about the *old* choice is only
   answerable at all through what the *current* link says about it. A query
   that needed `--status any` to be answerable would be testing
-  `memidx.py`'s CLI, not the corpus, so none of the 57 queries need it.
+  `memidx.py`'s CLI, not the corpus, so none of the 69 queries need it.
 - **Concept boundaries that pull in topics no direct `code_refs` would
   find.** `CON-303` ("Upload Pipeline") is governed by both `TOP-110`
   (retry, this file's own `code_refs`) and `TOP-113` (streaming, a
@@ -217,9 +226,60 @@ compatibility with the pre-`et-` query set (see "What is measured" above)
 — read the `exact-term` row in isolation to compare it against
 `paraphrase`, not against `overall`.
 
+### The long-exact-term queries
+
+PR #21's gate (Opus, BLOCKER): `FTS_STEP_ASIDE_COVERAGE`'s gate is a
+CONTENT-TERM COVERAGE ratio of the FTS channel's own top-1 pick — `|query
+content terms ∩ top-1's content terms| / |query content terms|` — which
+makes it, incidentally, a query-LENGTH detector as much as a query-
+CORRECTNESS one: a long, agent-shaped question that happens to be exactly
+right (its anchor term genuinely is in the target, and FTS's top-1 pick
+genuinely is that target) can still measure a low coverage ratio purely
+because the question carries many OTHER real content words the target
+doesn't contain, diluting the fraction's denominator without touching the
+numerator. Opus's own one-off 60-query sweep (not tracked in this repo)
+found 32/60 stepped aside even though FTS's own top-1 pick literally
+contained the query's anchor term, with 17 net regressions against 6
+improvements.
+
+The 12 `let-` queries are this repo's own small, TRACKED version of that
+sweep: each one embeds a literal anchor term from a single record's own
+indexed text (several reuse the exact same anchor an `et-` query already
+uses — `let-03`/`et-06` both anchor on TOP-112's `50MB`, `let-04`/`et-12`
+both anchor on TOP-105's `30 days`, `let-06`/`et-10` both anchor on
+TOP-111's token-bucket figure — deliberately, to contrast the SAME anchor
+at two lengths) inside a 12-20 word agent-shaped question built from real
+content vocabulary the target does NOT contain, the way an agent
+paraphrasing a user's actual question would write it, not a bare keyword
+query. `let-01` anchors on a bare digit (`6`, TOP-110's retry-attempt
+cap) specifically to exercise the MINOR finding below.
+
+`bench/score.py`'s own `hybrid_stepaside_report` (no `--mode` argument,
+no in-process retrieval of its own — it reads the THREE canonical
+runners' already-computed `ranked` lists for this slice) reports how many
+of the 12 actually stepped aside on this corpus, and whether each
+step-aside was a regression (FTS's own top-1 was already correct; vector
+alone was not) or an improvement (the reverse); printed after the table
+and included under `hybrid_stepaside` in `--json` output. See the PR
+body for the numbers measured against this corpus.
+
+Per the owner's ruling on PR #21: this slice MEASURES the risk, it does
+not gate anything — `FTS_STEP_ASIDE_COVERAGE` and `_content_terms`'s
+tokenization are both left exactly as they are, deliberately, until real
+production query traffic (not a small constructed corpus) has had weeks
+to weigh in.
+
+**MINOR, stated as a limit, not fixed here** (same ruling): `memidx._content_terms`'s
+`_CONTENT_TOKEN_RE` (`[a-z0-9]+`) drops every 1-character and non-ASCII
+token on BOTH the query and the document side, while FTS5's own tokenizer
+keeps 1-character tokens. A query anchored on one — `let-01`'s bare `6` —
+never enters the coverage computation's own token set at all, even though
+FTS5 itself matched on it and the record contains it verbatim; see
+`memidx._content_terms`'s own docstring.
+
 ### `notes`
 
-Every one of the 57 queries' `notes` field states which record(s) are
+Every one of the 69 queries' `notes` field states which record(s) are
 expected and why, in terms of what is actually in the corpus (a
 `code_refs` entry, a concept's `governed_by`, shared or absent vocabulary)
 — never "because the tool returns this," which would make the key a
@@ -351,7 +411,7 @@ PYTHONPATH= "$MEMCONTINUUM_PYTHON" python -m unittest tests.test_bench -v
   independence check) but not against a second reviewer's independent
   read. A key that is wrong in a way its own author cannot see is not
   caught by that author re-checking their own work.
-- **32 records and 57 queries is small.** Recall@k on a corpus this size
+- **32 records and 69 queries is small.** Recall@k on a corpus this size
   moves by more than one query's worth of luck; treat single-decimal
   differences between runners as noise and multi-decimal differences (the
   paraphrase-slice gap between `keyword` and `memcontinuum:vector`, for

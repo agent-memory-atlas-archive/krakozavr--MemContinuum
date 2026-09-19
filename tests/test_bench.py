@@ -13,11 +13,12 @@ the system temp directory, never $MEMCONTINUUM_HOME.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import math
 import os
 import random
-import re
 import subprocess
 import sys
 import tempfile
@@ -225,7 +226,7 @@ class TestJSONOutputShape(unittest.TestCase):
         for slices in payload["runners"].values():
             self.assertEqual(
                 set(slices.keys()),
-                {"overall", "path", "question", "paraphrase", "exact-term", "plain", "errors"},
+                {"overall", "path", "question", "paraphrase", "exact-term", "plain", "long-exact-term", "errors"},
             )
         nc = payload["negative_control"]
         self.assertEqual(set(nc.keys()) - {"nomemory", "keyword"}, {"verdict", "failed_runners"})
@@ -243,6 +244,68 @@ class TestJSONOutputShape(unittest.TestCase):
         # printed verdict (M3).
         self.assertEqual(nc["verdict"], "ok")
         self.assertEqual(rc, 0)
+
+
+class TestHybridStepasideReport(unittest.TestCase):
+    """PR #21 gate item 5 (Opus BLOCKER, "measure, don't gate"): unit-level
+    coverage of score.hybrid_stepaside_report's own classification logic
+    against synthetic per_query data -- no corpus, no subprocess, no
+    embeddings, so this runs in milliseconds next to the live end-to-end
+    number tests/test_bench.py::TestFtsStepAsideCoverage measures against
+    the real corpus."""
+
+    QUERIES = [
+        {"id": "let-01", "kind": "question", "expect": ["A"]},
+        {"id": "let-02", "kind": "question", "expect": ["B"]},
+        {"id": "let-03", "kind": "question", "expect": ["C"]},
+        {"id": "kw-01", "kind": "question", "expect": ["D"]},   # not in the let- slice
+    ]
+
+    def _report(self, fts, vector, hybrid):
+        return {
+            "memcontinuum:fts": {"per_query": {qid: {"ranked": r} for qid, r in fts.items()}, "errors": {}},
+            "memcontinuum:vector": {"per_query": {qid: {"ranked": r} for qid, r in vector.items()}, "errors": {}},
+            "memcontinuum:hybrid": {"per_query": {qid: {"ranked": r} for qid, r in hybrid.items()}, "errors": {}},
+        }
+
+    def test_classifies_stepaside_regression_and_improvement_and_ignores_agreement(self):
+        report = self._report(
+            fts={"let-01": ["A", "X"], "let-02": ["Y", "B"], "let-03": ["C", "Z"], "kw-01": ["D"]},
+            vector={"let-01": ["W", "A"], "let-02": ["B", "Y"], "let-03": ["C", "Z"], "kw-01": ["D"]},
+            hybrid={
+                # let-01: hybrid == vector, fts != vector -> a step-aside. fts's own
+                # top-1 (A) is correct, vector's own top-1 (W) is not -> regression.
+                "let-01": ["W", "A"],
+                # let-02: hybrid == vector, fts != vector -> a step-aside. vector's
+                # own top-1 (B) is correct, fts's own top-1 (Y) is not -> improvement.
+                "let-02": ["B", "Y"],
+                # let-03: hybrid == vector, but fts == vector too (channels already
+                # agreed) -> NOT a step-aside, excluded rather than miscounted.
+                "let-03": ["C", "Z"],
+                "kw-01": ["D"],
+            },
+        )
+        result = score.hybrid_stepaside_report(report, self.QUERIES)
+        self.assertEqual(result["slice_n"], 3)   # only the let- ids
+        self.assertEqual(set(result["stepped_aside"]), {"let-01", "let-02"})
+        self.assertEqual(result["regressions"], ["let-01"])
+        self.assertEqual(result["improvements"], ["let-02"])
+
+    def test_ordinary_fusion_is_not_a_stepaside(self):
+        report = self._report(
+            fts={"let-01": ["A", "X"]},
+            vector={"let-01": ["X", "A"]},
+            hybrid={"let-01": ["A", "X"]},   # RRF fusion, not equal to vector's own list
+        )
+        result = score.hybrid_stepaside_report(report, [self.QUERIES[0]])
+        self.assertEqual(result["stepped_aside"], [])
+        self.assertEqual(result["regressions"], [])
+        self.assertEqual(result["improvements"], [])
+
+    def test_returns_none_when_a_needed_runner_is_missing(self):
+        report = {"memcontinuum:fts": {"per_query": {}, "errors": {}},
+                  "memcontinuum:vector": {"per_query": {}, "errors": {}}}   # no :hybrid
+        self.assertIsNone(score.hybrid_stepaside_report(report, self.QUERIES))
 
 
 # ---------------------------------------------------------------------------
@@ -422,21 +485,11 @@ class TestPathOracle(unittest.TestCase):
 # 6. paraphrase queries genuinely share no vocabulary with their target
 # ---------------------------------------------------------------------------
 
-_STOPWORDS = frozenset("""
-a an the is are was were be been being do does did doing have has had having
-i you he she it we they me him her us them my your his its our their this
-that these those to of in on at by for with about against between into
-through during before after above below from up down out off over under
-again further then once here there when where why how all any both each
-few more most other some such no nor not only own same so than too very
-can will just don should now what which who whom or and but if because as
-until while
-""".split())
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
-
-
-def _tokens(text: str) -> set[str]:
-    return {w for w in _TOKEN_RE.findall(text.lower()) if w not in _STOPWORDS and len(w) > 1}
+# INC-0115: this stopword list/tokenizer used to be defined here only; it
+# now also backs memidx._fts_top_hit_is_confident's own content-term
+# coverage gate (hybrid's FTS-step-aside threshold), so it lives in
+# memidx.py and is imported, not duplicated, here.
+_tokens = memidx._content_terms
 
 
 def _indexed_text_for(record_id: str, topics: dict, incidents: dict) -> str:
@@ -1127,6 +1180,200 @@ class TestRandomSamplingRunnerIsOutsideTheClaim(unittest.TestCase):
                           "across 50 seeded runs this runner always passed -- that would "
                           "mean the floor no longer distinguishes it from noise at all, "
                           "a different (worse) problem than the one this test documents")
+
+
+# ---------------------------------------------------------------------------
+# 7. INC-0115's FTS-step-aside threshold: pin the coverage separation the
+#    code comment next to FTS_STEP_ASIDE_COVERAGE claims, against the REAL
+#    gate memidx._fts_top_hit_is_confident and the REAL, status-filtered,
+#    family-collapsed fts_ranked() top-1 -- not a reimplementation of
+#    either, which is exactly the kind of drift that produced a wrong
+#    number in that comment's first draft (a raw, unfiltered `fts MATCH`
+#    query can surface a superseded link row real search never returns).
+# ---------------------------------------------------------------------------
+
+class TestFtsStepAsideCoverage(unittest.TestCase):
+    # para-10 is a paraphrase query whose FTS top-1 pick (TOP-107) is a
+    # genuinely different, wrong record that happens to share real
+    # vocabulary with the query ("actually"/"keeping"/"separate"/"take",
+    # coverage 4/14 = 0.286) -- paraphrase queries are constructed to
+    # share no vocabulary with their OWN target (see
+    # TestParaphraseIndependence above), not with every other record in
+    # the corpus. Neither channel's own top-1 pick is right here (FTS:
+    # TOP-107, vector: TOP-106); the gate correctly leaves it to fuse
+    # rather than second-guess a real (if misdirected) FTS signal, and
+    # fusion is what gets it right, because the actual answer (TOP-101)
+    # sits at FTS rank 2 AND vector rank 2 -- two rank-2 contributions
+    # from BOTH channels outweigh either channel's own wrong rank-1 pick
+    # in RRF's sum (see memidx.py's own comment next to
+    # FTS_STEP_ASIDE_COVERAGE for the full worked numbers).
+    #
+    # para-05 lands as a second, different-shaped confident-but-wrong
+    # exception, at exactly FTS_STEP_ASIDE_COVERAGE's own 0.250 boundary
+    # (3/12: "app"/"large"/"stop" against INC-205). Unlike para-10, this
+    # is not a case fusion rescues -- `--mode vector` alone ALSO ranks the
+    # same wrong record (INC-205) top-1 for this query, a genuine
+    # corpus-level ambiguity between INC-205 and the expected TOP-112,
+    # unrelated to this gate -- so stepping aside or not costs nothing
+    # either way here. Pinned as a second named exception, not folded
+    # into EXPECTED_NOT_CONFIDENT, so a future corpus/query edit that
+    # moves it off this boundary is a visible, deliberate diff rather
+    # than a silent one.
+    EXPECTED_NOT_CONFIDENT = {
+        "para-01", "para-02", "para-03", "para-04",
+        "para-06", "para-07", "para-08", "para-09", "para-11",
+    }
+    EXPECTED_CONFIDENT_EXCEPTIONS = {"para-05", "para-10"}
+
+    # PR #21 gate (Grok MAJOR): spying on _fts_top_hit_is_confident's own
+    # boolean pins the GATE's verdict but not how _search_hits USES it --
+    # flipping `and not _fts_top_hit_is_confident(...)` to
+    # `and _fts_top_hit_is_confident(...)` in _search_hits inverts the
+    # branch taken for EVERY query and still passed the old version of
+    # this test. LIMIT exceeds the 25-40 file corpus so a captured result
+    # list is never silently truncated before the order comparison below
+    # means anything.
+    LIMIT = 200
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_kw_and_et_always_confident_para_mostly_not(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            rc = memidx.cmd_reindex(type("NS", (), {
+                "root": str(CORPUS), "db": str(db), "project": memidx.DEFAULT_PROJECT,
+                "full": False, "no_embed": False,
+            })())
+            self.assertEqual(rc, 0)
+
+            conn = memidx.open_db_noncreating(db, project=memidx.DEFAULT_PROJECT)
+
+            orig_gate = memidx._fts_top_hit_is_confident
+            orig_fts_ranked = memidx.fts_ranked
+            orig_vector_ranked = memidx.vector_ranked
+            questions = [q for q in load_queries() if q["kind"] == "question"]
+            verdicts: dict[str, bool] = {}
+            hybrid_ids: dict[str, list[str]] = {}
+            hybrid_fusion: dict[str, str] = {}
+            vector_ids: dict[str, list[str]] = {}
+            fused_ids: dict[str, list[str]] = {}
+            try:
+                for q in questions:
+                    captured = {}
+
+                    def wrapped_gate(c, project, query, top_path, _cap=captured):
+                        v = orig_gate(c, project, query, top_path)
+                        _cap["verdict"] = v
+                        return v
+
+                    def wrapped_fts(c, query, project, *a, _cap=captured, **kw):
+                        r = orig_fts_ranked(c, query, project, *a, **kw)
+                        _cap["fts_list"] = r
+                        return r
+
+                    def wrapped_vector(c, query, project, *a, _cap=captured, **kw):
+                        r = orig_vector_ranked(c, query, project, *a, **kw)
+                        _cap["vec_scored"] = r
+                        return r
+
+                    memidx._fts_top_hit_is_confident = wrapped_gate
+                    memidx.fts_ranked = wrapped_fts
+                    memidx.vector_ranked = wrapped_vector
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = memidx.main([
+                            "search", "--project", memidx.DEFAULT_PROJECT, "--db", str(db),
+                            q["query"], "--mode", "hybrid", "--json", "--limit", str(self.LIMIT),
+                        ])
+                    self.assertEqual(rc, 0, q["id"])
+                    # The gate is only called when both channels return at
+                    # least one candidate (see _search_hits); every query
+                    # in this corpus does, so it must have been captured.
+                    self.assertIn("verdict", captured, f"{q['id']}: gate was not invoked")
+                    verdicts[q["id"]] = captured["verdict"]
+
+                    out = json.loads(buf.getvalue())
+                    self.assertIsInstance(
+                        out, dict, f"{q['id']}: hybrid --json must always carry the fusion envelope now"
+                    )
+                    self.assertIn("fusion", out, f"{q['id']}: envelope is missing the fusion key")
+                    hybrid_fusion[q["id"]] = out["fusion"]
+                    hybrid_ids[q["id"]] = [hit["id"] for hit in out["results"]]
+
+                    # vector_ranked is the SAME function --mode vector's own
+                    # branch of _search_hits calls with the SAME arguments
+                    # (query/project/filters) -- the channel output captured
+                    # here IS "--mode vector"'s own result, without paying
+                    # for a second live search subprocess/model call per
+                    # query.
+                    vec_scored = captured.get("vec_scored", [])
+                    vector_ids[q["id"]] = [
+                        row["id"] for p, _s in vec_scored
+                        if (row := memidx.record_row_by_path(conn, p)) is not None
+                    ]
+
+                    # Independent oracle for the FUSED case: re-derive RRF
+                    # fusion from the two REAL channel lists _search_hits
+                    # itself used for this query (captured above, not
+                    # re-run) -- same k=60 and family-collapse formula
+                    # _search_hits's own fused branch uses, via the
+                    # production _batch_record_meta helper (a stable
+                    # metadata batch lookup, not part of the ranking/gate
+                    # logic under test), but written fresh here rather than
+                    # calling into _search_hits's own fused branch -- so a
+                    # mutation of THAT branch's condition can never also
+                    # corrupt the oracle it is being checked against.
+                    fts_list = captured.get("fts_list", [])
+                    fts_paths_only = fts_list
+                    vec_paths_only = [p for p, _s in vec_scored]
+                    meta = memidx._batch_record_meta(conn, memidx.DEFAULT_PROJECT, fts_paths_only + vec_paths_only)
+                    k = 60
+                    scores: dict[str, float] = {}
+                    family_winner: dict[str, str] = {}
+                    for lst in (fts_paths_only, vec_paths_only):
+                        for i, p in enumerate(lst):
+                            m = meta.get(p) or {"family": p}
+                            fam = m["family"]
+                            scores[fam] = scores.get(fam, 0.0) + 1.0 / (k + i + 1)
+                            family_winner.setdefault(fam, p)
+                    fused_order = [family_winner[fam] for fam, _s in
+                                   sorted(scores.items(), key=lambda t: t[1], reverse=True)]
+                    fused_ids[q["id"]] = [
+                        row["id"] for p in fused_order
+                        if (row := memidx.record_row_by_path(conn, p)) is not None
+                    ]
+            finally:
+                memidx._fts_top_hit_is_confident = orig_gate
+                memidx.fts_ranked = orig_fts_ranked
+                memidx.vector_ranked = orig_vector_ranked
+                conn.close()
+
+            for q in questions:
+                qid = q["id"]
+                if qid.startswith("kw-") or qid.startswith("et-"):
+                    self.assertTrue(verdicts[qid], f"{qid}: expected FTS to be confident (plain/exact-term query)")
+                elif qid in self.EXPECTED_CONFIDENT_EXCEPTIONS:
+                    self.assertTrue(verdicts[qid], f"{qid}: expected the documented confident-but-wrong exception")
+                elif qid in self.EXPECTED_NOT_CONFIDENT:
+                    self.assertFalse(verdicts[qid], f"{qid}: expected FTS to step aside (paraphrase noise)")
+
+                # PR #21 gate item 2: pin the RESULT the gate's verdict is
+                # supposed to control, not just the verdict itself.
+                if verdicts[qid]:
+                    self.assertEqual(hybrid_fusion[qid], "rrf", f"{qid}: confident verdict but fusion != 'rrf'")
+                    self.assertEqual(
+                        hybrid_ids[qid][:20], fused_ids[qid][:20],
+                        f"{qid}: gate says confident (fuse), but hybrid's own result doesn't match "
+                        f"the independently-computed RRF fusion of the real channel outputs",
+                    )
+                else:
+                    self.assertEqual(
+                        hybrid_fusion[qid], "vector-only", f"{qid}: not-confident verdict but fusion != 'vector-only'"
+                    )
+                    self.assertEqual(
+                        hybrid_ids[qid], vector_ids[qid],
+                        f"{qid}: gate says not confident (step aside), but hybrid's own result "
+                        f"doesn't match --mode vector's (ids and order)",
+                    )
 
 
 if __name__ == "__main__":
