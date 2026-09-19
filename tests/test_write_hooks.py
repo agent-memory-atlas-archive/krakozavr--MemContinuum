@@ -5078,21 +5078,59 @@ class TestMcRotateHookLog(unittest.TestCase):
         hang. Every one of these must instead fall back to the documented
         default (12) and complete the rotation cleanly: RC=0, content
         landed at .1, and -- the specific regression this guards -- no
-        hook.log.rotating.<pid> orphan left behind."""
-        for bad_keep in ("0", "08", "012", "abc", "999999999", "-1", "1001"):
+        hook.log.rotating.<pid> orphan left behind. (KEEP=1001 gets its
+        own dedicated test below, with a sharper observable than this
+        loop's -- a single rotation here can't distinguish "fell back to
+        12" from "used 1001 literally", since both land the same content
+        at .1.)"""
+        for bad_keep in ("0", "08", "012", "abc", "999999999", "-1"):
             with self.subTest(keep=bad_keep):
-                hook_log = self.home / "hook.log"
-                hook_log.write_text("first\n" * 100)
-                proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10", MEMCONTINUUM_LOG_KEEP=bad_keep)
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-                self.assertIn("RC=0", proc.stdout, proc.stdout)
-                self.assertEqual((self.home / "hook.log.1").read_text(), "first\n" * 100)
-                self.assertEqual(
-                    list(self.home.glob("hook.log.rotating.*")), [],
-                    f"KEEP={bad_keep!r} must not strand a .rotating.<pid> orphan",
-                )
-                for p in self.home.iterdir():
-                    p.unlink()
+                # round-2 review NIT: this cleanup must run even when a
+                # subTest's own asserts above raise -- unittest's subTest
+                # catches the failure and moves on to the NEXT bad_keep
+                # value, but a bare (non-finally) cleanup below the asserts
+                # would then never run for the failing iteration, leaving
+                # its leftover files to poison every iteration after it.
+                try:
+                    hook_log = self.home / "hook.log"
+                    hook_log.write_text("first\n" * 100)
+                    proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10", MEMCONTINUUM_LOG_KEEP=bad_keep)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn("RC=0", proc.stdout, proc.stdout)
+                    self.assertEqual((self.home / "hook.log.1").read_text(), "first\n" * 100)
+                    self.assertEqual(
+                        list(self.home.glob("hook.log.rotating.*")), [],
+                        f"KEEP={bad_keep!r} must not strand a .rotating.<pid> orphan",
+                    )
+                finally:
+                    for p in self.home.iterdir():
+                        p.unlink()
+
+    def test_keep_1001_falls_back_to_twelve_via_prune_probe(self):
+        """KEEP=1001 sits just outside the documented [1, 1000] range and
+        must fall back to 12 -- pinned via the prune step's own observable
+        effect (round-2 review NIT: don't lean on the 999999999 case's
+        de-facto-hang timeout to also cover this boundary) rather than a
+        huge, slow loop of real rotations. Pre-seed .12 and .13, then
+        rotate once with KEEP=1001: if KEEP truly fell back to 12, the
+        prune loop starts at .13 (keep+1) and removes it while leaving
+        .12 (still within a 12-file bound) alone; if the literal 1001
+        were used instead, the prune loop would start at .1002 and never
+        touch either file, leaving .13 behind too."""
+        (self.home / "hook.log.12").write_text("twelve\n")
+        (self.home / "hook.log.13").write_text("thirteen\n")
+        hook_log = self.home / "hook.log"
+        hook_log.write_text("first\n" * 100)
+        proc = self._call_rotate(MEMCONTINUUM_LOG_MAX_BYTES="10", MEMCONTINUUM_LOG_KEEP="1001")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            (self.home / "hook.log.12").read_text(), "twelve\n",
+            "KEEP=1001 must fall back to 12 -- .12 must be left alone",
+        )
+        self.assertFalse(
+            (self.home / "hook.log.13").exists(),
+            "KEEP=1001 must fall back to 12 -- .13 (keep+1) must be pruned",
+        )
 
     def test_keep_leading_zero_falls_back_to_twelve_not_its_octal_value(self):
         """KEEP=012 is the specific silent-wrong-number case (round-2
@@ -5261,6 +5299,44 @@ class TestMcRotateHookLog(unittest.TestCase):
         self.assertTrue(live_orphan.exists(), "a live-pid orphan must never be touched")
         self.assertEqual(live_orphan.read_text(), "still-claiming\n")
         self.assertIn("marker-1\n", (self.home / "hook.log.1").read_text())
+
+    def test_orphan_recovery_survives_a_space_in_memcontinuum_home(self):
+        """Round-2 review MINOR: `for orphan in $(mc_rotate_orphans_oldest_first)`
+        used to word-split (and glob-expand) the command substitution's
+        output -- the only such unquoted expansion anywhere in
+        hooks/*.sh. Reproduced with the reviewer's own experiment: a
+        MEMCONTINUUM_HOME containing a space splits one real orphan path
+        into two bogus words, neither of which passes `[ -f "$orphan" ]`,
+        so recovery silently no-ops (rc=0, orphan left on disk, .1=E
+        .2=A as if the orphan never existed). Fixed via `while read` over
+        a heredoc, immune to both word-splitting and globbing -- this
+        pins the FIXED result: the orphan lands in the chain (at .2,
+        ahead of the pre-existing .1=A which shifts to .3) rather than
+        being silently skipped."""
+        space_home = Path(self.td) / "c7 with space"
+        space_home.mkdir()
+        (space_home / "hook.log.1").write_text("marker-A\n")
+        dead_pid = "999999997"
+        (space_home / f"hook.log.rotating.{dead_pid}").write_text("marker-D\n")
+        hook_log = space_home / "hook.log"
+        hook_log.write_text("marker-E\n" + ("x" * 100 + "\n") * 5)
+
+        proc = self._call_rotate(MEMCONTINUUM_HOME=str(space_home), MEMCONTINUUM_LOG_MAX_BYTES="10")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        self.assertIn("marker-E\n", (space_home / "hook.log.1").read_text())
+        self.assertIn(
+            "marker-D\n", (space_home / "hook.log.2").read_text(),
+            "the orphan must be recovered into the chain even when "
+            "MEMCONTINUUM_HOME contains a space -- a word-splitting bug "
+            "here would silently skip it instead, leaving marker-A "
+            "(not marker-D) at .2",
+        )
+        self.assertIn("marker-A\n", (space_home / "hook.log.3").read_text())
+        self.assertEqual(
+            list(space_home.glob("hook.log.rotating.*")), [],
+            "no orphan may remain on disk under its old name",
+        )
 
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores permission bits")
     def test_unwritable_home_dir_fails_open_leaves_log_alone(self):

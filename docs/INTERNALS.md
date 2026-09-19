@@ -140,13 +140,14 @@ starts. `MEMCONTINUUM_LOG_KEEP` (default 12) bounds how many rotated files
 are ever kept — no file beyond `.$MEMCONTINUUM_LOG_KEEP`, no dated archive,
 no compression, and data older than the oldest retained file is gone by
 design once retention fills up. Lowering `MEMCONTINUUM_LOG_KEEP` takes
-effect on the very next rotation: anything now beyond the new, smaller
-bound is deleted outright, not merely left unreferenced. A rotation
-interrupted by `SessionStart`'s own 2s watchdog — after hook.log has been
-claimed but before it lands at `.1` — is recovered on the next rotation
-(oldest recovered claim first, then the newest), never left a permanent,
-invisible orphan. `MEMCONTINUUM_LOG_KEEP=1` keeps only `hook.log.1`, always
-replaced in place, never a `.2`.
+effect on the very next rotation: the contiguous run of files beyond the
+new, smaller bound is deleted outright, not merely left unreferenced. A
+rotation interrupted by `SessionStart`'s own 2s watchdog — after hook.log
+has been claimed but before it lands at `.1` — is recovered on the next
+rotation (oldest recovered claim first, then the newest), never left a
+permanent, invisible orphan. `MEMCONTINUUM_LOG_KEEP=1` keeps only
+`hook.log.1`, always replaced in place, never a `.2`.
+
 Sizing: a real store's hook.log grew ~5 MB in 21 days (~240 KB/day), so
 the default `12 × 5 MiB` bound gives roughly 8-9 months of retained
 history at that rate — a bounded, documented allowance, not unlimited

@@ -298,16 +298,40 @@ mc_rotate_hook_log() {
     # a LIVE pid means another session's claim is genuinely in flight right
     # now this instant, never touch that one) and land each recovered
     # window through the exact same mc_rotate_shift_and_land primitive,
-    # oldest mtime first. Ordering property this depends on: every such
-    # orphan is strictly newer than whatever already sits at .1 (nothing
-    # ever lands at .1 except through this same claim-and-shift path, and a
-    # dead orphan's claim always predates the claim just made above) and
-    # strictly older than $tmp (claimed an instant ago) -- so processing
-    # oldest-orphan .. newest-orphan .. $tmp, each through its own single
-    # shift-and-land call, reproduces exactly the chain an uninterrupted
-    # sequence of individual rotations would have produced.
+    # oldest mtime first. Ordering property this depends on, in the common
+    # case: every such orphan is newer than whatever already sits at .1
+    # (nothing ever lands at .1 except through this same claim-and-shift
+    # path, and a dead orphan's claim ordinarily predates the claim just
+    # made above) and older than $tmp (claimed an instant ago) -- so
+    # processing oldest-orphan .. newest-orphan .. $tmp, each through its
+    # own single shift-and-land call, reproduces exactly the chain an
+    # uninterrupted sequence of individual rotations would have produced.
+    # This is best-effort ordering, not a strict guarantee (round-2 review
+    # NIT): if an earlier sweep skipped an orphan because its pid had been
+    # recycled by an unrelated live process (a live-looking pid that isn't
+    # really the original claim's), that orphan is left for a LATER
+    # rotation to recover, and it can then land ahead of windows that were
+    # actually claimed after it -- eviction order at a full retention
+    # window can end up slightly off in that narrow case. Nothing is ever
+    # lost and no stats row is miscounted either way (each line still
+    # carries and is scanned by its own timestamp, independent of which
+    # numbered file it physically sits in) -- only which specific window
+    # gets evicted first at the KEEP boundary can be affected.
     local orphan pid
-    for orphan in $(mc_rotate_orphans_oldest_first); do
+    # `while read` over a heredoc, never `for orphan in $(...)` (round-2
+    # review finding, MINOR): the bare `for ... in $(...)` form is subject
+    # to the shell's own word-splitting AND glob expansion of the command
+    # substitution's output -- the only such unquoted expansion anywhere
+    # in hooks/*.sh. A MEMCONTINUUM_HOME containing a space (reproduced:
+    # ".../c7 with space") splits one real orphan path into two bogus
+    # words, neither of which passes `[ -f "$orphan" ]`, so the orphan is
+    # silently skipped and recovery no-ops with rc=0 -- exactly the kind
+    # of silent failure this repo's fail-open rule is not supposed to
+    # excuse. `read -r` takes each line whole, no splitting, no globbing;
+    # the heredoc (not `<(...)` process substitution, not a pipe) keeps
+    # this loop running in the CURRENT shell rather than a subshell, and
+    # needs nothing beyond bash 3.2.
+    while IFS= read -r orphan; do
         [ -f "$orphan" ] || continue
         [ "$orphan" = "$tmp" ] && continue
         pid="${orphan##*.rotating.}"
@@ -316,7 +340,9 @@ mc_rotate_hook_log() {
         esac
         kill -0 "$pid" 2>/dev/null && continue
         mc_rotate_shift_and_land "$orphan" "$keep"
-    done
+    done <<EOF
+$(mc_rotate_orphans_oldest_first)
+EOF
 
     mc_rotate_shift_and_land "$tmp" "$keep" || return 0
 
