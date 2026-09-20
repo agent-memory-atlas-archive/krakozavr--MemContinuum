@@ -1401,10 +1401,39 @@ class TestF1DecisionIndexState(unittest.TestCase):
         any cap under test must never let `chain_text` exceed that cap,
         for every cap from a generous 2000 bytes down to a pathological
         10 -- the hard-cap property this function's own docstring now
-        promises ("never exceed the cap by even one byte")."""
+        promises ("never exceed the cap by even one byte").
+
+        Re-gate round 4 finding: byte-cap compliance ALONE does not prove
+        anything real survived -- a mutation that drops the current
+        link's own rendering entirely (header only, regardless of
+        budget) still trivially satisfies "len(...) <= cap" for every cap
+        here (header-only is always small). For every cap large enough to
+        hold the header PLUS at least a sliver of the current link's own
+        ruling head (`cap > header_bytes`, computed directly off the same
+        _chain_header_line production code, not hardcoded), the topic id
+        ("TOP-8888", present in the header too, but ALSO the thing this
+        assertion is checking survives end to end) AND the link's own
+        date ("2020-01-01", which appears ONLY inside the ruling head
+        line, never in the header -- the genuinely discriminating check)
+        must both still be present. Below that threshold (cap=10 here),
+        the header itself does not fit either -- round 4 also fixed that
+        case to emit an explicit marker rather than a silently truncated,
+        plausible-looking-but-wrong header; asserted here as the topic id
+        NOT appearing (a truncated header would very likely still show
+        it, since "TOP-8888" is the header's own first token)."""
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "idx.sqlite"
             self._build_single_oversized_link_fixture(db)
+            conn = memidx.open_db_noncreating(db, project=memidx.DEFAULT_PROJECT)
+            topic_row = memidx.record_row_by_path(conn, "single.md")
+            link_rows = conn.execute(
+                "SELECT * FROM links WHERE topic_path=? ORDER BY seq ASC", (topic_row["path"],)
+            ).fetchall()
+            current_link = memidx._chain_current_link(link_rows)
+            header = memidx._chain_header_line(topic_row, current_link)
+            header_bytes = len(header.encode("utf-8"))
+            conn.close()
+
             for cap in (10, 100, 500, 1660, 2000):
                 with self.subTest(cap=cap):
                     buf_out, buf_err = io.StringIO(), io.StringIO()
@@ -1422,6 +1451,11 @@ class TestF1DecisionIndexState(unittest.TestCase):
                         len(chain_text.encode("utf-8")), cap,
                         f"cap={cap} exceeded: {len(chain_text.encode('utf-8'))} bytes",
                     )
+                    if cap > header_bytes:
+                        self.assertIn("TOP-8888", chain_text, f"cap={cap}")
+                        self.assertIn("2020-01-01", chain_text, f"cap={cap} (ruling head dropped)")
+                    else:
+                        self.assertNotIn("TOP-8888", chain_text, f"cap={cap}: expected the cap-too-small marker")
 
     def test_for_path_missing_or_uninitialized_exits_3_with_named_state(self):
         # Final-fix-wave item 3: a bare `[]` under --json no longer tells a

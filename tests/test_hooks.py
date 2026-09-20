@@ -6,6 +6,7 @@ handling (the PYTHONPATH trap, env-driven project/root resolution, fail-open
 behavior) as much as its output shape.
 """
 import fcntl
+import glob
 import hashlib
 import json
 import os
@@ -1600,17 +1601,17 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        # 4.0s, not a tight bound on the 2s watchdog budget itself
-        # (matches this file's own other watchdog-adjacent timing checks,
-        # e.g. TestPostCommitReindexEmbedWorker's own `< 4.0`): a shared/
-        # loaded CI machine can add real, unrelated wall-clock noise
-        # (subprocess spin-up under contention) on top of the SHORT
-        # 0.25s state-write deadline this fix actually bounds -- the
-        # deterministic, load-independent proof that the fix landed is
-        # `outcome=search-fallback` (not `watchdog-killed`) below, not
-        # this elapsed number; isolated measurement (no other load): ~0.6-
-        # 0.9s including setUp's own reindex.
-        self.assertLess(elapsed, 4.0, f"took {elapsed:.2f}s -- the short state-write deadline must bound this")
+        # Re-gate round 4 (Opus): dropped the wall-clock `elapsed < 4.0`
+        # bound entirely -- this hook is hard-bounded to ~2.03s by its OWN
+        # watchdog regardless of what this fix does, so a 4.0s bar can
+        # NEVER fail here and was pinning nothing. The deterministic,
+        # load-independent proof that the fix landed is `outcome=search-
+        # fallback` (never `watchdog-killed`) plus `fb_state=skipped-lock`
+        # below; the one genuinely load-bearing timing pin is `fb_ms`
+        # itself (the SEARCH subprocess's own millisecond timing, off the
+        # log line, unrelated to wall-clock/CPU contention noise around
+        # the whole test process) -- fts mode measures well under 500ms
+        # even generously bounded.
         stdout = proc.stdout.strip()
         self.assertTrue(stdout, "expected an additionalContext envelope even under a held lock")
         # Exactly one JSON document: json.loads succeeds on the WHOLE
@@ -1628,22 +1629,61 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         self.assertIn("outcome=search-fallback ", line)
         self.assertIn("fb_state=skipped-lock", line)
         self.assertNotIn("watchdog-killed", line)
+        fb_ms_match = re.search(r"\bfb_ms=(\d+)", line)
+        self.assertIsNotNone(fb_ms_match, line)
+        self.assertLess(int(fb_ms_match.group(1)), 500, line)
         # The state file itself is genuinely untouched (the short-deadline
         # write really did skip, not silently succeed under a race).
         self.assertEqual(json.loads(state_file.read_text()), {})
 
-    def test_flock_held_one_second_titling_still_written_normally(self):
-        """Companion to the whole-run-held case above: a lock released
-        well before the short 0.25s deadline's own retry window closes
-        (held only 0.3s here, comfortably past that deadline but a small
-        fraction of the 2s watchdog budget) lets a LATER retry within
-        mc_update_state_json's own loop succeed almost every time in
-        practice -- but the guaranteed, deterministic case is a lock
-        released quickly: this pins that the titling write still lands
-        normally (no fb_state=skipped-lock, state file populated) when
-        contention is brief, so the short deadline is a real bound on the
-        WORST case, not a universal skip."""
-        session_id = "sess-flock-2"
+    def _wait_for_fb_started_marker(self, appear: bool, timeout: float = 5.0) -> bool:
+        """Poll for ANY `.fb-started.*` marker under this test's own
+        MEMCONTINUUM_HOME (hooks/mc-watchdog.sh's own comment: written by
+        the guarded hook for the duration of the search subprocess call
+        only) -- `appear=True` waits for one to exist, `appear=False`
+        waits for none to. The test's own process never knows the hook's
+        real (multi-hop, re-exec'd-under-the-watchdog-launcher) pid in
+        advance, so this globs rather than checking one exact name; a
+        single-hook-run test never has more than one marker at a time."""
+        pattern = str(Path(self.memtool_home) / ".fb-started.*")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            matches = glob.glob(pattern)
+            if bool(matches) == appear:
+                return True
+            time.sleep(0.005)
+        return False
+
+    def _popen_hook(self, payload_text: str, env: dict):
+        proc = subprocess.Popen(
+            [MC_BASH, str(HOOK_SCRIPT)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, env=env,
+        )
+        proc.stdin.write(payload_text)
+        proc.stdin.close()
+        # A later proc.communicate() (no `input=`) still tries to flush
+        # and close stdin unconditionally when the attribute is not None
+        # -- ValueError on an already-closed file. Already fed and
+        # closed above; nothing left for communicate() to do with it.
+        proc.stdin = None
+        return proc
+
+    def test_flock_contended_through_the_search_titling_skipped_gracefully(self):
+        """Re-gate round 4 finding: the previous version of this pair's
+        "written normally" test released its held lock at a fixed 0.05s
+        -- well before the state write even starts (~0.30-0.45s into a
+        real run) -- so it never contended at all; it passed unchanged
+        against the OLD, unfixed 2.0s deadline too. This test makes the
+        contention real and synchronized to the hook's ACTUAL progress,
+        not a guessed wall-clock delay: hold the lock until the hook's
+        own `.fb-started.*` marker (hooks/mc-watchdog.sh's own comment)
+        is OBSERVED to appear (the search subprocess has just started),
+        then hold a further ~0.7s -- comfortably past both the search
+        itself (fts mode, well under 100ms) and the whole 0.25s state-
+        write deadline that follows it -- before releasing. The titling
+        write must have genuinely given up: `fb_state=skipped-lock`, the
+        state file untouched, and the additionalContext guess unaffected."""
+        session_id = "sess-flock-3"
         state_dir = Path(self.memtool_home) / "sessions" / self.project
         state_dir.mkdir(parents=True, exist_ok=True)
         state_file = state_dir / f"{session_id}.json"
@@ -1651,22 +1691,58 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         lock_file = state_dir / f"{session_id}.json.lock"
         lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-
-        def _release_soon():
-            time.sleep(0.05)
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
-
-        releaser = threading.Thread(target=_release_soon)
-        releaser.start()
         try:
             target = str(self.repo / "src" / "needle.py")
-            proc, elapsed = run_hook(
-                self._payload(target, session_id=session_id), self._env(), timeout=8.0,
+            proc = self._popen_hook(self._payload(target, session_id=session_id), self._env())
+            self.assertTrue(
+                self._wait_for_fb_started_marker(appear=True),
+                "the .fb-started.* marker never appeared -- the search subprocess never ran",
             )
+            time.sleep(0.7)
+            stdout, stderr = proc.communicate(timeout=8.0)
         finally:
-            releaser.join()
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        self.assertEqual(proc.returncode, 0, stderr)
+        parsed = json.loads(stdout.strip())
+        self.assertIn("TOP-7001", parsed["hookSpecificOutput"]["additionalContext"])
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback ", line)
+        self.assertIn("fb_state=skipped-lock", line)
+        self.assertEqual(json.loads(state_file.read_text()), {})
+
+    def test_flock_briefly_contended_titling_still_written_normally(self):
+        """Companion to the contended case above, synchronized the SAME
+        way (not a guessed fixed delay): release the lock shortly (~0.05s)
+        after the `.fb-started.*` marker is observed to appear -- by
+        which point the (fts-mode, well under 100ms) search subprocess is
+        still running or has just finished, and the lock is free well
+        before the titling write's own first few ~20ms retry attempts
+        would exhaust its 0.25s deadline. Pins that a brief, real
+        contention window still lets the write land normally: no
+        `fb_state=skipped-lock`, the state file genuinely populated."""
+        session_id = "sess-flock-4"
+        state_dir = Path(self.memtool_home) / "sessions" / self.project
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_file = state_dir / f"{session_id}.json"
+        state_file.write_text("{}")
+        lock_file = state_dir / f"{session_id}.json.lock"
+        lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            target = str(self.repo / "src" / "needle.py")
+            proc = self._popen_hook(self._payload(target, session_id=session_id), self._env())
+            self.assertTrue(
+                self._wait_for_fb_started_marker(appear=True),
+                "the .fb-started.* marker never appeared -- the search subprocess never ran",
+            )
+            time.sleep(0.05)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        stdout, stderr = proc.communicate(timeout=8.0)
+        self.assertEqual(proc.returncode, 0, stderr)
         log_text = (Path(self.memtool_home) / "hook.log").read_text()
         line = self._last_outcome_line(log_text)
         self.assertIn("outcome=search-fallback ", line)

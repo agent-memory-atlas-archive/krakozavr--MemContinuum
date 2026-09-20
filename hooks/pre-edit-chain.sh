@@ -739,6 +739,15 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     # line, closing the stats blind spot where a kill on this branch left
     # no trace of the search having even started.
     FB_STARTED_MARKER="$MEMCONTINUUM_HOME/.fb-started.$$"
+    # Re-gate round 4 NIT: a trap, not only the explicit `rm -f` right
+    # after the search call below -- that explicit remove covers the
+    # normal (search returned, hit or miss) path, but an ABNORMAL exit
+    # between the marker's creation and that point (a crash this script
+    # itself raises, not just a watchdog SIGKILL, which no trap here can
+    # ever catch -- see hooks/mc-watchdog.sh's own marker-check instead)
+    # would otherwise leave the marker file behind. `exit 0` (finish())
+    # runs registered EXIT traps like any other exit.
+    trap '[ -n "${FB_STARTED_MARKER:-}" ] && rm -f "$FB_STARTED_MARKER" 2>/dev/null' EXIT
     : >"$FB_STARTED_MARKER" 2>/dev/null || true
     FB_MS_T0="$(mc_now_ms "$PY")"
     FALLBACK_JSON="$(PYTHONPATH= "$PY" "$MEMIDX" "${FB_ARGS[@]}" 2>/dev/null)"
@@ -770,11 +779,21 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     FB_HITS_FOR_STATE=""
     FB_REASON=""
     if [ -n "$FALLBACK_JSON" ] || [ "$FALLBACK_RC" -ne 0 ]; then
+        # Re-gate round 4 NIT: guarded (2>/dev/null, checked) -- an
+        # unguarded `source` of a MISSING/unreadable file would otherwise
+        # print its own error to stderr and, if this ran with `set -e`
+        # somewhere up the sourcing chain, abort the run before FB_REASON
+        # is ever set below. A missing lib degrades to `reason=lib-
+        # missing` (FB_HITS stays empty, so the existing no-hits finish
+        # a few lines down fires with this reason instead of "no-hits").
         # shellcheck source=mc-fallback-lib.sh
-        source "$SCRIPT_DIR/mc-fallback-lib.sh"
-        mc_fallback_parse "$PY" "$FALLBACK_RC" \
-            'No recorded decision binds this file. Nearest by search -- may be unrelated:' \
-            1 "$FALLBACK_JSON"
+        if source "$SCRIPT_DIR/mc-fallback-lib.sh" 2>/dev/null; then
+            mc_fallback_parse "$PY" "$FALLBACK_RC" \
+                'No recorded decision binds this file. Nearest by search -- may be unrelated:' \
+                1 "$FALLBACK_JSON"
+        else
+            FB_REASON="lib-missing"
+        fi
     fi
 
     FB_MS_PART=""
@@ -839,11 +858,18 @@ print(d.get("session_id", "") or "")
     if [ -n "$SESSION_ID" ] && [ -n "${FB_HITS_FOR_STATE:-}" ]; then
         # shellcheck source=memlib.sh
         source "$SCRIPT_DIR/memlib.sh"
+        # Re-gate round 4 NIT: same guard as the parse call site above --
+        # a missing/unreadable lib here degrades to `fb_state=lib-
+        # missing` instead of an unguarded `source` error (or worse,
+        # aborting the run before $FB_TEXT is ever printed).
         # shellcheck source=mc-fallback-lib.sh
-        source "$SCRIPT_DIR/mc-fallback-lib.sh"
-        STATE_FILE="$(mc_state_file_for "$PROJECT" "$SESSION_ID")"
-        if ! mc_fallback_write_state "$STATE_FILE" "$FILE_PATH" "$FB_HITS_FOR_STATE" "pre-edit-chain" 0.25; then
-            FB_STATE_PART=" fb_state=skipped-lock"
+        if source "$SCRIPT_DIR/mc-fallback-lib.sh" 2>/dev/null; then
+            STATE_FILE="$(mc_state_file_for "$PROJECT" "$SESSION_ID")"
+            if ! mc_fallback_write_state "$STATE_FILE" "$FILE_PATH" "$FB_HITS_FOR_STATE" "pre-edit-chain" 0.25; then
+                FB_STATE_PART=" fb_state=skipped-lock"
+            fi
+        else
+            FB_STATE_PART=" fb_state=lib-missing"
         fi
     fi
 

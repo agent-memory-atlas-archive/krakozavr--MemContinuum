@@ -732,8 +732,12 @@ print(d.get("cwd", "") or "")
             # call only, via mc_now_ms (hooks/mc-query-lib.sh); never set
             # (and never logged) when the call above is skipped entirely.
             # MINOR fix-round item: see pre-edit-chain.sh's identical
-            # fb-started marker comment -- same mechanism here.
+            # fb-started marker comment -- same mechanism here, including
+            # the round-4 EXIT trap (an abnormal exit between the marker's
+            # creation and the explicit `rm -f` below would otherwise
+            # leave it behind).
             FB_STARTED_MARKER="$MEMCONTINUUM_HOME/.fb-started.$$"
+            trap '[ -n "${FB_STARTED_MARKER:-}" ] && rm -f "$FB_STARTED_MARKER" 2>/dev/null' EXIT
             : >"$FB_STARTED_MARKER" 2>/dev/null || true
             FB_MS_T0="$(mc_now_ms "$PY")"
             FB_JSON_RAW="$(PYTHONPATH= "$PY" "$FB_MEMIDX" "${FB_ARGS[@]}" 2>/dev/null)"
@@ -763,11 +767,19 @@ print(d.get("cwd", "") or "")
         [ -n "$FB_JSON_RAW" ] && FB_SHOULD_PARSE=1
         [ "$FB_RAN" = "1" ] && [ "$FB_RC" -ne 0 ] && FB_SHOULD_PARSE=1
         if [ "$FB_SHOULD_PARSE" = "1" ]; then
+            # Re-gate round 4 NIT: guarded (2>/dev/null, checked) -- see
+            # hooks/pre-edit-chain.sh's identical guard for the full
+            # rationale. A missing lib degrades to `fb_reason=lib-missing`
+            # via the existing "no hits" branch below (FB_HITS stays
+            # empty since the parser never ran).
             # shellcheck source=mc-fallback-lib.sh
-            source "$SCRIPT_DIR/mc-fallback-lib.sh"
-            mc_fallback_parse "$PY" "$FB_RC" \
-                'No recorded decision binds this file. Nearest by search -- may be unrelated:' \
-                0 "$FB_JSON_RAW"
+            if source "$SCRIPT_DIR/mc-fallback-lib.sh" 2>/dev/null; then
+                mc_fallback_parse "$PY" "$FB_RC" \
+                    'No recorded decision binds this file. Nearest by search -- may be unrelated:' \
+                    0 "$FB_JSON_RAW"
+            else
+                FB_REASON="lib-missing"
+            fi
         fi
         FB_MS_PART=""
         [ -n "$FB_MS" ] && FB_MS_PART=" fb_ms=$FB_MS"

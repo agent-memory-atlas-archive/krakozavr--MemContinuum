@@ -3453,6 +3453,13 @@ def _chain_link_lines(topic_row, lr, edges_by_from) -> list[str]:
     return lines
 
 
+# Re-gate round 4: the explicit, honest marker topic_chain_lines_capped
+# emits when even the header alone does not fit `max_bytes` -- never a
+# silently-truncated header, which could otherwise look like a real (if
+# short) id/title rather than what it actually is: nothing readable.
+_CAP_TOO_SMALL_MARKER = "[decision too large for this cap]"
+
+
 def _utf8_safe_truncate(s: str, max_bytes: int) -> str:
     """The largest PREFIX of `s` whose UTF-8 encoding is at most
     `max_bytes` -- never splits a multi-byte codepoint (a plain
@@ -3961,9 +3968,14 @@ def topic_chain_lines_capped(conn, topic_row, max_bytes: int) -> list:
     header = _chain_header_line(topic_row, current_link)
     header_bytes = len(header.encode("utf-8"))
     if header_bytes >= max_bytes:
-        # The header alone does not fit -- the absolute last resort:
-        # truncate IT, on a UTF-8-safe boundary, and render nothing else.
-        return [_utf8_safe_truncate(header, max_bytes)]
+        # The header alone does not fit. Re-gate round 4 finding: silently
+        # truncating the header itself used to leave a plausible-LOOKING
+        # but wrong, incomplete id/title on the page (e.g. cap=10 against
+        # "TOP-8888 ..." renders "TOP-8888 S" -- still reads as a real,
+        # if short, topic id). An explicit, honest marker instead -- never
+        # mistaken for real (truncated) content -- itself UTF-8-safely
+        # truncated on the rare cap too tiny even for the marker text.
+        return [_utf8_safe_truncate(_CAP_TOO_SMALL_MARKER, max_bytes)]
     budget = max_bytes - header_bytes
 
     keep_ids = set()
@@ -3983,15 +3995,18 @@ def topic_chain_lines_capped(conn, topic_row, max_bytes: int) -> list:
                 current_lines = ruling_only + [ruling_marker]
             elif ruling_only_cost <= budget:
                 current_lines = ruling_only
-            elif budget >= 1:
+            else:
                 # Even the bare ruling head does not fit -- truncate ITS
-                # text (never exceed the cap by even one byte: 1 byte for
-                # the joining "\n", the rest for the truncated text).
+                # text. `budget >= 1` is guaranteed here (the header-too-
+                # big branch above already returned when header_bytes >=
+                # max_bytes, so budget = max_bytes - header_bytes is at
+                # least 1 by the time execution reaches this point --
+                # re-gate round 4: the old `elif budget >= 1` guard here
+                # was accordingly always true, dead defensive code kept
+                # alongside an unreachable "else" comment). Never exceeds
+                # the cap by even one byte: 1 byte for the joining "\n",
+                # the rest for the truncated text.
                 current_lines = [_utf8_safe_truncate(ruling_only[0], budget - 1)]
-            # else: budget < 1 -- nothing more fits after the header at
-            # all; current_lines stays [] (still counted as "kept", just
-            # rendered as nothing -- the header alone still names the
-            # topic and its current link's own id/title).
         budget -= _lines_cost(current_lines)
 
     # Priority-order candidates for the remaining budget: newest-first,
@@ -7928,6 +7943,15 @@ def _new_stats_bucket():
         "fallback_ids": Counter(),
         "fallback_modes": Counter(),
         "fallback_ms": [],
+        # Re-gate round 4: a watchdog kill on the search-fallback branch
+        # (either hook -- both hooks write the SAME `.fb-started.<pid>`
+        # marker, hooks/mc-watchdog.sh's own kill handler checks it)
+        # carries `fb_started=1` on its own `outcome=watchdog-killed`
+        # line -- counted here so a query that was IN FLIGHT when it got
+        # killed is visible somewhere, instead of vanishing with no trace
+        # at all (the old blind spot: that run logs no `search-fallback`/
+        # `-empty` line, ever).
+        "fallback_killed": 0,
     }
 
 
@@ -8252,6 +8276,16 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
         bucket["lines"] += 1
 
         outcome = fields.get("outcome", "")
+
+        # Re-gate round 4: checked BEFORE the kind-specific dispatch below
+        # -- a watchdog-killed fallback can come from either hook (pre-
+        # edit-chain.sh's own kill lines classify as kind "pre-edit" via
+        # _hook_log_line_kind's targeted check; newfile-nudge.sh's land in
+        # "other", same as every other non-pre-edit-chain watchdog kill),
+        # so this is a plain top-level field check, not folded into either
+        # kind branch.
+        if outcome == "watchdog-killed" and fields.get("fb_started") == "1":
+            bucket["fallback_killed"] += 1
 
         if kind == "sessionstart":
             session = fields.get("session")
@@ -8620,6 +8654,7 @@ def _stats_report(
             "ms_p95": fb_ms_p95,
             "outcomes": dict(fb_outcomes),
             "reasons": dict(b["fallback_reasons"]),
+            "killed": b["fallback_killed"],
         },
         "store_commits": store_commits,
         "unknown_lines": unknown_lines,
@@ -8777,8 +8812,8 @@ def cmd_stats(args) -> int:
         top_ids_txt = ", ".join(f"{t['id']}:{t['count']}" for t in fb["top_ids"]) or "(none)"
         print(f"search fallback (pre-edit-chain.sh + newfile-nudge.sh): "
               f"hits={fb['search_fallback']} empty={fb['search_fallback_empty']} "
-              f"(reasons: {reasons_txt}) modes={modes_txt} ms p50/p95={p50_txt}/{p95_txt} "
-              f"top-ids={top_ids_txt}")
+              f"killed={fb['killed']} (reasons: {reasons_txt}) modes={modes_txt} "
+              f"ms p50/p95={p50_txt}/{p95_txt} top-ids={top_ids_txt}")
         eb = result["embedding_backlog"]
         rows_txt = "unknown (db unreadable)" if eb["rows_without_fresh_vector"] is None else eb["rows_without_fresh_vector"]
         print(f"embedding backlog: pending-marker={eb['pending_marker']} "

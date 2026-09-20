@@ -143,7 +143,8 @@ q=<+-joined tokens> fb_ms=<N>`) and `search-fallback-empty`
 (`reason=no-query` / `reason=no-hits` / `reason=store-root` /
 `reason=missing` / `reason=uninitialized` / `reason=index-needs-migration`
 / `reason=quarantined` / `reason=stale` / `reason=search-failed rc=N` /
-`reason=bad-json`, plus `fb_ms=<N>` whenever the search subprocess
+`reason=bad-json` / `reason=lib-missing` — `hooks/mc-fallback-lib.sh`
+itself failed to source, plus `fb_ms=<N>` whenever the search subprocess
 actually ran). `fb_ms` is millisecond-resolution wall time of the search
 subprocess call only (`date +%s%3N`, a python `time.time()` fallback where
 `%3N` isn't supported) — the same field name on both hooks, present only
@@ -154,13 +155,20 @@ stats`'s own generic `key=value` field scan has no quote-awareness
 space. `newfile-nudge.sh`'s own outcome name for this branch never changes
 (`outcome=nudged` — `memidx.py stats`' `nf.nudged` metric already keys on
 that literal string); the fallback's own result rides along as extra
-`fb_outcome=`/`fb_hits=`/`fb_ids=`/`fb_mode=`/`fb_q=`/`fb_reason=`/`fb_ms=`
-fields on that same line instead. The 2s watchdog is unchanged and covers
-the fallback's own run too (real hybrid-mode measurements: 0.91–0.96s
-end to end, well inside budget — see `pre-edit-chain.sh`'s own header for
-the watchdog-budget accounting); on a watchdog timeout the existing
-`MC_WATCHDOG_TIMEOUT_FALLBACK` line is what the model gets, same as any
-other timeout. The fallback subprocess's own stderr is routed to
+`fb_outcome=`/`fb_hits=`/`fb_ids=`/`fb_mode=`/`fb_q=`/`fb_reason=`/`fb_ms=`/
+`fb_state=` fields on that same line instead (`fb_state=skipped-lock` /
+`fb_state=lib-missing` — see the titling paragraph below; absent when
+titling wrote normally or never applied). The 2s watchdog is unchanged and
+covers the fallback's own run too (real hybrid-mode measurements:
+0.91–0.96s end to end, well inside budget — see `pre-edit-chain.sh`'s own
+header for the watchdog-budget accounting); on a watchdog timeout the
+existing `MC_WATCHDOG_TIMEOUT_FALLBACK` line is what the model gets, same
+as any other timeout — UNLESS the search subprocess had already started
+when the kill landed: both hooks write a `.fb-started.<pid>` marker for
+that call's own duration only, and `mc-watchdog.sh`'s own kill handler
+checks for it, appending `fb_started=1` to its `outcome=watchdog-killed`
+line when present (tallied as `memidx.py stats`' `fallback.killed` count
+— see below). The fallback subprocess's own stderr is routed to
 `/dev/null`, never appended to hook.log (a stray, untimestamped line would
 otherwise break the "exactly one line per invocation" contract).
 
@@ -190,9 +198,18 @@ re-searching: each entry renders as `search surfaced <title> (<id>) for
 uses) — `pre-edit-chain.sh`'s own hook.log lines carry no `session=` field
 at all (`finish()`'s own fixed field list has none), so this state write is
 the ONLY place a title is recoverable per session; the write itself is
-sourced and paid for lazily, only on this already-rare branch. This is
-titling metadata, not a decision: the hook never binds anything, it only
-remembers what it already showed.
+sourced and paid for lazily, only on this already-rare branch, THROUGH A
+SHORT (0.25s, not the shared `mc_update_state_json`'s own 2.0s default)
+lock deadline of its own — this write runs after the search subprocess
+has already spent most of the SAME 2s watchdog budget, and a lock held
+for the whole run must never be allowed to blow that budget and lose the
+already-computed additionalContext guess to a watchdog kill. The write
+can therefore now be SKIPPED (`fb_state=skipped-lock` on the outcome
+line, above) rather than always landing — the guess itself is unaffected
+either way, only its later look-back mention is lost. `hooks/mc-fallback-
+lib.sh` failing to source at all degrades the same way (`fb_state=lib-
+missing`). This is titling metadata, not a decision: the hook never binds
+anything, it only remembers what it already showed.
 
 **No relevance floor, by design.** This channel ships on the search engine's
 existing ranking as-is (hybrid default) with no minimum-score cutoff and no

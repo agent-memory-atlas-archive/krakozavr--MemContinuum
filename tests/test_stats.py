@@ -1171,6 +1171,32 @@ class TestStatsFallbackBucket(StatsTestBase):
         self.assertIn("hits=1", out)
         self.assertIn("ms p50/p95=42ms/42ms", out)
 
+    def test_watchdog_killed_fallback_counted_as_killed(self):
+        """Re-gate round 4: a watchdog kill on the fallback branch (either
+        hook -- both write the same `.fb-started.<pid>` marker,
+        hooks/mc-watchdog.sh's own kill handler names it `fb_started=1`
+        on the outcome=watchdog-killed line it always writes) used to
+        vanish -- no `search-fallback`/`-empty` line at all, ever. Now
+        counted as `fallback.killed`, regardless of which hook it was
+        (pre-edit-chain.sh's own kill lines classify as kind "pre-edit";
+        a kill with no `hook=pre-edit-chain.sh` -- newfile-nudge.sh's own
+        shape here -- lands in "other", and must still count). A
+        watchdog kill with NO `fb_started=1` (the search never started --
+        the ordinary, pre-existing case) must NOT be counted."""
+        lines = [
+            f"{ts(1)} outcome=watchdog-killed hook=pre-edit-chain.sh fb_started=1 project=demo",
+            f"{ts(1)} outcome=watchdog-killed hook=newfile-nudge.sh fb_started=1 project=demo",
+            f"{ts(1)} outcome=watchdog-killed hook=pre-edit-chain.sh project=demo",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["fallback"]["killed"], 2)
+
+        rc, out = run_stats(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertIn("killed=2", out)
+
 
 class TestStatsPreEditTopics(StatsTestBase):
     """eval-topic-logging: `pre_edit.topics_named` (how many matched/
