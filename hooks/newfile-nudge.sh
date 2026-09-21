@@ -644,6 +644,196 @@ esac
 
 MESSAGE="New source file under ${CODE_ROOT} — confirm the code index is initialized and not stale, then run code-search; name relevant hits or say none."
 
+# --- search fallback (TOP-0133 L1) ------------------------------------
+# The same channel pre-edit-chain.sh runs on a genuine miss, mirrored here
+# for a brand-new file: nothing can be BOUND to a path that did not exist
+# a moment ago, so this hook's own existing reminder above is the only
+# signal a new file ever gets today. Appended to the SAME message (never
+# replacing it) -- the code-index reminder still fires exactly as before.
+# Skipped, silently (the reminder above still fires), for a file under
+# $MEMCONTINUUM_ROOT (the store itself -- out of scope, duplicate-
+# detection's job). The outcome logged for this whole branch stays
+# "nudged" either way (memidx.py stats' own `nf.nudged` metric already
+# keys on that literal string) -- the fallback's own result rides along as
+# extra `fb_*` fields on the SAME line, never a second outcome value.
+FB_EXTRA=""
+SKIP_FALLBACK=0
+if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+    mc_path_under_root "$FILE_PATH" "$MEMCONTINUUM_ROOT"
+    if [ $? -eq 0 ]; then
+        SKIP_FALLBACK=1
+        # MINOR fix-round item: this skip used to log nothing at all --
+        # pre-edit-chain.sh's own identical store-root skip already names
+        # itself (`search-fallback-empty reason=store-root`); this hook's
+        # own fb_* fields now match it so memidx.py stats' fallback tally
+        # sees every skip reason on both hooks, not a silent gap on this one.
+        FB_EXTRA="fb_outcome=search-fallback-empty fb_reason=store-root"
+    fi
+fi
+
+if [ "$SKIP_FALLBACK" -eq 0 ]; then
+    # shellcheck source=mc-query-lib.sh
+    source "$SCRIPT_DIR/mc-query-lib.sh"
+    FB_CWD=""
+    if [ -n "$PAYLOAD" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            FB_CWD="$(printf '%s' "$PAYLOAD" | jq -r '.cwd // empty' 2>/dev/null)"
+        else
+            FB_CWD="$(printf '%s' "$PAYLOAD" | "$PY" -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+print(d.get("cwd", "") or "")
+' 2>/dev/null)"
+        fi
+    fi
+    FB_QUERY_REL_PATH="$(mc_query_source_path "$FILE_PATH" "$FB_CWD" "${MEMCONTINUUM_STRIP_PREFIX:-}")"
+    FB_QUERY="$(mc_query_tokens "$FB_QUERY_REL_PATH")"
+    if [ -z "$FB_QUERY" ]; then
+        FB_EXTRA="fb_outcome=search-fallback-empty fb_reason=no-query"
+    else
+        FB_MODE="${MEMCONTINUUM_FALLBACK_MODE:-hybrid}"
+        case "$FB_MODE" in
+            hybrid | vector | fts) ;;
+            *) FB_MODE="hybrid" ;;
+        esac
+        FB_MEMIDX="$SCRIPT_DIR/../memidx.py"
+        FB_DB_PATH="$MEMCONTINUUM_HOME/$PROJECT.sqlite"
+        FB_QUERY_LOGGED="${FB_QUERY// /+}"
+        FB_JSON_RAW=""
+        FB_RC=1
+        FB_RAN=0
+        FB_MS=""
+        # Unlike pre-edit-chain.sh (which never reaches its own fallback
+        # without an already-confirmed-present db, see its own header),
+        # this hook has no earlier index check -- a brand-new project with
+        # no reindex run yet is the everyday case a new-file nudge fires
+        # in. Skip the `search` call ENTIRELY when the db file plainly
+        # does not exist: there is nothing it could find, and calling it
+        # anyway would spawn python only to print `search: the decision
+        # index is missing ...` on stderr -- routed to /dev/null below
+        # either way now (MINOR fix-round item: never hook.log), but
+        # skipping the whole subprocess for a db that plainly does not
+        # exist still saves the spawn for no loss (the "search-fallback-
+        # empty reason=missing" outcome below says the same thing).
+        # `--read-only`/`--root` mirror pre-edit-chain.sh's own fallback
+        # call exactly (MAJOR fix-round items a/b): this channel reads the
+        # index to answer a guess, never migrates or writes it, and a
+        # stale store is now visible instead of silently swallowed.
+        if [ -f "$FB_DB_PATH" ]; then
+            FB_ARGS=(search "$FB_QUERY" --mode "$FB_MODE" --project "$PROJECT" --db "$FB_DB_PATH" --limit 2 --json --hydrate --read-only)
+            if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+                FB_ARGS+=(--root "$MEMCONTINUUM_ROOT")
+            fi
+            # fb_ms (MAJOR fix-round item d): see pre-edit-chain.sh's
+            # identical comment -- millisecond timing of this subprocess
+            # call only, via mc_now_ms (hooks/mc-query-lib.sh); never set
+            # (and never logged) when the call above is skipped entirely.
+            # MINOR fix-round item: see pre-edit-chain.sh's identical
+            # fb-started marker comment -- same mechanism here, including
+            # the round-4 EXIT trap (an abnormal exit between the marker's
+            # creation and the explicit `rm -f` below would otherwise
+            # leave it behind).
+            FB_STARTED_MARKER="$MEMCONTINUUM_HOME/.fb-started.$$"
+            trap '[ -n "${FB_STARTED_MARKER:-}" ] && rm -f "$FB_STARTED_MARKER" 2>/dev/null' EXIT
+            : >"$FB_STARTED_MARKER" 2>/dev/null || true
+            FB_MS_T0="$(mc_now_ms "$PY")"
+            FB_JSON_RAW="$(PYTHONPATH= "$PY" "$FB_MEMIDX" "${FB_ARGS[@]}" 2>/dev/null)"
+            FB_RC=$?
+            rm -f "$FB_STARTED_MARKER" 2>/dev/null || true
+            FB_RAN=1
+            FB_MS_T1="$(mc_now_ms "$PY")"
+            case "$FB_MS_T0$FB_MS_T1" in
+                *[!0-9]*|"") ;;
+                *) FB_MS=$((FB_MS_T1 - FB_MS_T0)); [ "$FB_MS" -lt 0 ] && FB_MS=0 ;;
+            esac
+        fi
+        FB_HITS=""
+        FB_IDS=""
+        FB_TEXT=""
+        FB_HITS_FOR_STATE=""
+        FB_REASON=""
+        # Re-gate round 3, MINOR duplication: shared with hooks/pre-edit-
+        # chain.sh via mc_fallback_parse, hooks/mc-fallback-lib.sh -- see
+        # that file's own header for the full reason-vocabulary rationale.
+        # Runs whenever EITHER something reached stdout OR the subprocess
+        # ACTUALLY RAN and exited non-zero (FB_RAN, not FB_RC alone: this
+        # hook's own db-missing skip above never runs the subprocess at
+        # all and must NOT be reported as "search-failed rc=1" -- it
+        # degrades to the ordinary "no-hits" default below).
+        FB_SHOULD_PARSE=0
+        [ -n "$FB_JSON_RAW" ] && FB_SHOULD_PARSE=1
+        [ "$FB_RAN" = "1" ] && [ "$FB_RC" -ne 0 ] && FB_SHOULD_PARSE=1
+        if [ "$FB_SHOULD_PARSE" = "1" ]; then
+            # Re-gate round 4 NIT: guarded (2>/dev/null, checked) -- see
+            # hooks/pre-edit-chain.sh's identical guard for the full
+            # rationale. A missing lib degrades to `fb_reason=lib-missing`
+            # via the existing "no hits" branch below (FB_HITS stays
+            # empty since the parser never ran).
+            # shellcheck source=mc-fallback-lib.sh
+            if source "$SCRIPT_DIR/mc-fallback-lib.sh" 2>/dev/null; then
+                mc_fallback_parse "$PY" "$FB_RC" \
+                    'No recorded decision binds this file. Nearest by search -- may be unrelated:' \
+                    0 "$FB_JSON_RAW"
+            else
+                FB_REASON="lib-missing"
+            fi
+        fi
+        FB_MS_PART=""
+        [ -n "$FB_MS" ] && FB_MS_PART=" fb_ms=$FB_MS"
+        if [ -z "$FB_HITS" ] || [ "$FB_HITS" = "0" ]; then
+            [ -z "$FB_REASON" ] && FB_REASON="no-hits"
+            FB_EXTRA="fb_outcome=search-fallback-empty fb_reason=$FB_REASON fb_mode=$FB_MODE fb_q=$FB_QUERY_LOGGED$FB_MS_PART"
+        else
+            # MINOR fix-round item (label-glue unification): a blank line
+            # between the ordinary nudge message and the fallback's own
+            # label+chains block, matching the double-newline separator
+            # style pre-edit-chain.sh's additionalContext already uses
+            # throughout (label to chain_text, chain_text to chain_text) --
+            # the old single-newline join here was the one place this
+            # feature glued two blocks together differently.
+            MESSAGE="${MESSAGE}"$'\n\n'"${FB_TEXT}"
+
+            # Session-state title storage (docs/INTERNALS.md "search
+            # fallback"): same mechanism, same `search_fallbacks` state key
+            # pre-edit-chain.sh's own fallback already writes to. Re-gate
+            # round 3, MAJOR 1: the SAME short-deadline reasoning applies
+            # here too -- this hook's own final additionalContext print
+            # (OUTPUT_JSON, below) happens AFTER this state write, so a
+            # lock held for the whole run must not be allowed to eat the
+            # 2s watchdog budget this hook shares -- see hooks/pre-edit-
+            # chain.sh's own identical comment for the full rationale.
+            FB_STATE_PART=""
+            FB_SESSION_ID=""
+            if [ -n "$PAYLOAD" ]; then
+                if command -v jq >/dev/null 2>&1; then
+                    FB_SESSION_ID="$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null)"
+                else
+                    FB_SESSION_ID="$(printf '%s' "$PAYLOAD" | "$PY" -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+print(d.get("session_id", "") or "")
+' 2>/dev/null)"
+                fi
+            fi
+            if [ -n "$FB_SESSION_ID" ] && [ -n "$FB_HITS_FOR_STATE" ]; then
+                # shellcheck source=memlib.sh
+                source "$SCRIPT_DIR/memlib.sh"
+                FB_STATE_FILE="$(mc_state_file_for "$PROJECT" "$FB_SESSION_ID")"
+                if ! mc_fallback_write_state "$FB_STATE_FILE" "$FILE_PATH" "$FB_HITS_FOR_STATE" "newfile-nudge" 0.25; then
+                    FB_STATE_PART=" fb_state=skipped-lock"
+                fi
+            fi
+            FB_EXTRA="fb_outcome=search-fallback fb_hits=$FB_HITS fb_ids=$FB_IDS fb_mode=$FB_MODE fb_q=$FB_QUERY_LOGGED$FB_MS_PART$FB_STATE_PART"
+        fi
+    fi
+fi
+
 # NIT 3 fix round (Grok, duplicate JSON envelope): this used to keep its
 # own inline copy of the JSON-building python instead of calling
 # _build_additional_context, even though that helper's own comment
@@ -654,4 +844,4 @@ if [ -z "$OUTPUT_JSON" ]; then
 fi
 
 printf '%s\n' "$OUTPUT_JSON"
-finish "nudged"
+finish "nudged" "$FB_EXTRA"

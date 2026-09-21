@@ -122,7 +122,23 @@ MEMIDX="$SCRIPT_DIR/../memidx.py"
 # not sessionend-stamp.sh's tighter 1.2s: one for-path call per candidate,
 # and a miss walks every candidate, so the fuller budget still covers
 # that multi-candidate worst case), so 2s is confirmed by measurement,
-# not assumed. Sourcing this also resolves MEMCONTINUUM_HOME and MC_GUARD_PY
+# not assumed.
+#
+# Fix-round measurement update (search fallback, TOP-0133 L1): a genuine
+# MISS now also runs `memidx.py search --hydrate` on the same budget --
+# measured end to end (hook launch through the search subprocess's own
+# rc) at 0.91-0.96s for hybrid mode (its RRF fusion pays for two ranking
+# passes plus one embedding-model load/query per run; fts mode alone
+# measured well under 0.1s in the same runs, vector mode close to
+# hybrid's own cost). Still comfortably inside the 2s budget, but with
+# far less headroom than the matched-branch measurement above -- a store
+# on a slow drvfs mount (SQLite WAL locking is unreliable there; see this
+# repo's own Windows/WSL environment notes) is the candidate case worth
+# watching, and MEMCONTINUUM_FALLBACK_MODE=fts (docs/INTERNALS.md) is the
+# per-installation escape hatch for it. The shipped default stays hybrid
+# either way -- this is a per-installation override, not a default change;
+# ship on the engine's own default, let real queries decide whether that
+# should move. Sourcing this also resolves MEMCONTINUUM_HOME and MC_GUARD_PY
 # (env -> config.sh -> engine venv), so the duplicate resolution this file
 # used to carry inline is gone -- PY below reads MC_GUARD_PY directly
 # instead of re-deriving it.
@@ -519,11 +535,18 @@ done
 # --- worktree gap: reached ONLY once every existing candidate has already
 # failed for FILE_PATH itself (docs/internal/SESSION-HANDOFF-releases-0.3-
 # to-0.6.md SS"0.2.0 final" item 1) ---------------------------------------
-# pre-edit-chain.sh deliberately never sources hooks/memlib.sh (the
-# mkdir/config.sh/MC_PY cost that would add on every already-a-miss lookup
-# is exactly what this hook's own header explains it exists to avoid) --
-# so the "configured code roots" it can check a remap against are read
-# from MEMCONTINUUM_STRIP_PREFIX instead of mc_code_roots. repo-init.sh
+# THIS block never sources hooks/memlib.sh (the mkdir/config.sh/MC_PY cost
+# that would add on every already-a-miss lookup is exactly what this
+# hook's own header explains it exists to avoid) -- so the "configured
+# code roots" it can check a remap against are read from
+# MEMCONTINUUM_STRIP_PREFIX instead of mc_code_roots. MINOR fix-round
+# correction: this used to say the SCRIPT never sources memlib.sh at all
+# -- no longer true since the search fallback (TOP-0133 L1) added its own
+# session-state write further down, which lazily sources memlib.sh ONLY
+# on that already-rare branch (a genuine miss AND at least one search
+# hit) -- see that branch's own comment. This worktree-gap block, reached
+# on every miss regardless of what the fallback later does, still pays
+# nothing extra. repo-init.sh
 # renders exactly ONE STRIP_PREFIX entry per invocation (= the single code
 # root that invocation's settings.json "if" filter is already scoped to,
 # templates/code-root-filter-pair.json.tmpl), so this is a faithful reading
@@ -630,7 +653,229 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     if [ "$ANY_QUERY_SUCCEEDED" -eq 0 ]; then
         finish "query-failed"
     fi
-    finish "no-match"
+
+    # --- search fallback (TOP-0133 L1) --------------------------------
+    # `for-path` found NOTHING bound to this file -- the ONLY branch this
+    # runs on (never a match, never worktree-unwired/-unresolved, both of
+    # which already `finish`ed above before this point is ever reached).
+    # `memidx.py search` -- the one channel that can deliver a decision
+    # NOT bound to the file being edited -- is queried on the path's OWN
+    # words instead, and the nearest decisions (if any) are handed to the
+    # agent labelled as a guess, never as a match. QUERY_SRC_PATH is
+    # WT_REMAPPED (the worktree block's own main-checkout-equivalent
+    # path) whenever that block actually produced one -- never a raw
+    # `.worktrees/x/...` path's words, which name the worktree, not the
+    # file. Never runs when QUERY_SRC_PATH sits under $MEMCONTINUUM_ROOT
+    # (the store itself -- that is duplicate-detection's job, out of
+    # scope here).
+    QUERY_SRC_PATH="${WT_REMAPPED:-$FILE_PATH}"
+
+    if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+        # shellcheck source=mc-path-lib.sh
+        source "$SCRIPT_DIR/mc-path-lib.sh"
+        mc_path_under_root "$QUERY_SRC_PATH" "$MEMCONTINUUM_ROOT"
+        if [ $? -eq 0 ]; then
+            finish "search-fallback-empty" "reason=store-root"
+        fi
+    fi
+
+    # shellcheck source=mc-query-lib.sh
+    source "$SCRIPT_DIR/mc-query-lib.sh"
+    QUERY_REL_PATH="$(mc_query_source_path "$QUERY_SRC_PATH" "$CWD" "${MEMCONTINUUM_STRIP_PREFIX:-}")"
+    FALLBACK_QUERY="$(mc_query_tokens "$QUERY_REL_PATH")"
+    if [ -z "$FALLBACK_QUERY" ]; then
+        finish "search-fallback-empty" "reason=no-query"
+    fi
+
+    # MEMCONTINUUM_FALLBACK_MODE (documented in docs/INTERNALS.md): hybrid|
+    # vector|fts, else the engine's own default (hybrid) -- deliberately
+    # the SAME default `memidx.py search` itself already uses when --mode
+    # is omitted, so an unset env var changes nothing about which mode
+    # runs. An unrecognized value falls back to that same default rather
+    # than failing the whole fallback over a typo'd env var.
+    FALLBACK_MODE="${MEMCONTINUUM_FALLBACK_MODE:-hybrid}"
+    case "$FALLBACK_MODE" in
+        hybrid | vector | fts) ;;
+        *) FALLBACK_MODE="hybrid" ;;
+    esac
+
+    # ONE process (round 5 precedent: `--with-chain-text` folded a second
+    # `for-path` call away the same way) -- `--hydrate` carries each hit's
+    # own chain_text in the same JSON envelope, so no separate `chain`
+    # call per hit. `--limit 2`, no `--status`/`--authority` filter (the
+    # engine's own defaults apply). `--read-only` (MAJOR fix-round item a):
+    # this channel reads the index to answer a guess, never writes to it --
+    # a legacy/unmigrated schema is refused by name (state=upgrade-required,
+    # reason=index-needs-migration) instead of being silently migrated on
+    # open, which the pre-fix-round `open_db_noncreating` path did. `--root`
+    # is now passed WHEN KNOWN (MAJOR item b: staleness must be visible,
+    # not swallowed) -- the old "never --root, it'd be noise" comment
+    # covered a real concern (index-stale-served already reports staleness
+    # on the MATCH path above) but left the FALLBACK path unable to tell a
+    # genuinely current miss from a stale one; `_decision_warn`'s own
+    # stderr line for it is discarded below same as every other subprocess
+    # stderr (MINOR item: routed to /dev/null, never hook.log).
+    FB_ARGS=(search "$FALLBACK_QUERY" --mode "$FALLBACK_MODE" --project "$PROJECT" --db "$DB_PATH" --limit 2 --json --hydrate --read-only)
+    if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+        FB_ARGS+=(--root "$MEMCONTINUUM_ROOT")
+    fi
+    # fb_ms (MAJOR fix-round item d): millisecond-resolution timing of the
+    # search subprocess itself -- `elapsed=`'s 1-second `date +%s` floor
+    # made p50/p95 meaningless (a bounded-under-a-second call rounds to
+    # "0s" or "1s" depending only on which side of a tick boundary it
+    # started). mc_now_ms is bash-3.2-safe (see hooks/mc-query-lib.sh).
+    # Measured only around THIS call, on purpose: it is the one variable-
+    # cost step in this branch (hybrid mode's model load/embed), and
+    # timing it around the query-build/state-write steps too would just
+    # add noise from unrelated I/O. Emitted only past this point, so a
+    # `no-query`/`store-root` early-exit above (finish already called)
+    # never contributes an fb_ms sample -- stats' own p50/p95 pool is
+    # this-subprocess-ran-only by construction, not by a later filter.
+    # MINOR fix-round item: a marker naming THIS PROCESS's own pid (the
+    # watchdog launcher's `proc.pid` sees the identical value -- see
+    # hooks/mc-watchdog.sh's own comment) exists ONLY for the duration of
+    # the search subprocess call below. A watchdog kill mid-call finds it
+    # still there and logs `fb_started=1` on its own `watchdog-killed`
+    # line, closing the stats blind spot where a kill on this branch left
+    # no trace of the search having even started.
+    FB_STARTED_MARKER="$MEMCONTINUUM_HOME/.fb-started.$$"
+    # Re-gate round 4 NIT: a trap, not only the explicit `rm -f` right
+    # after the search call below -- that explicit remove covers the
+    # normal (search returned, hit or miss) path, but an ABNORMAL exit
+    # between the marker's creation and that point (a crash this script
+    # itself raises, not just a watchdog SIGKILL, which no trap here can
+    # ever catch -- see hooks/mc-watchdog.sh's own marker-check instead)
+    # would otherwise leave the marker file behind. `exit 0` (finish())
+    # runs registered EXIT traps like any other exit.
+    trap '[ -n "${FB_STARTED_MARKER:-}" ] && rm -f "$FB_STARTED_MARKER" 2>/dev/null' EXIT
+    : >"$FB_STARTED_MARKER" 2>/dev/null || true
+    FB_MS_T0="$(mc_now_ms "$PY")"
+    FALLBACK_JSON="$(PYTHONPATH= "$PY" "$MEMIDX" "${FB_ARGS[@]}" 2>/dev/null)"
+    FALLBACK_RC=$?
+    rm -f "$FB_STARTED_MARKER" 2>/dev/null || true
+    FB_MS_T1="$(mc_now_ms "$PY")"
+    FB_MS=""
+    case "$FB_MS_T0$FB_MS_T1" in
+        *[!0-9]*|"") ;;
+        *) FB_MS=$((FB_MS_T1 - FB_MS_T0)); [ "$FB_MS" -lt 0 ] && FB_MS=0 ;;
+    esac
+
+    # Query encoding for the log line (item 5): `_hook_log_fields`
+    # (memidx.py stats) splits on whitespace with no quote-awareness --
+    # `q="core scan unbound"` would truncate at the first space and spray
+    # the rest as bogus bare tokens. `+`-joined survives untouched.
+    FALLBACK_QUERY_LOGGED="${FALLBACK_QUERY// /+}"
+
+    # MAJOR fix-round item b (re-gate round 3, MINOR duplication: shared
+    # with hooks/newfile-nudge.sh via mc_fallback_parse, hooks/mc-fallback-
+    # lib.sh -- see that file's own header for the full reason-vocabulary
+    # rationale). Runs whenever EITHER something reached stdout OR the
+    # subprocess exited non-zero -- a genuine crash (rc != 0, nothing on
+    # stdout at all) still needs `reason=search-failed rc=N` named, not
+    # silently defaulting to "no-hits" the way gating on stdout alone would.
+    FB_HITS=""
+    FB_IDS=""
+    FB_TEXT=""
+    FB_HITS_FOR_STATE=""
+    FB_REASON=""
+    if [ -n "$FALLBACK_JSON" ] || [ "$FALLBACK_RC" -ne 0 ]; then
+        # Re-gate round 4 NIT: guarded (2>/dev/null, checked) -- an
+        # unguarded `source` of a MISSING/unreadable file would otherwise
+        # print its own error to stderr and, if this ran with `set -e`
+        # somewhere up the sourcing chain, abort the run before FB_REASON
+        # is ever set below. A missing lib degrades to `reason=lib-
+        # missing` (FB_HITS stays empty, so the existing no-hits finish
+        # a few lines down fires with this reason instead of "no-hits").
+        # shellcheck source=mc-fallback-lib.sh
+        if source "$SCRIPT_DIR/mc-fallback-lib.sh" 2>/dev/null; then
+            mc_fallback_parse "$PY" "$FALLBACK_RC" \
+                'No recorded decision binds this file. Nearest by search -- may be unrelated:' \
+                1 "$FALLBACK_JSON"
+        else
+            FB_REASON="lib-missing"
+        fi
+    fi
+
+    FB_MS_PART=""
+    [ -n "$FB_MS" ] && FB_MS_PART=" fb_ms=$FB_MS"
+
+    if [ -z "$FB_HITS" ] || [ "$FB_HITS" = "0" ]; then
+        [ -z "$FB_REASON" ] && FB_REASON="no-hits"
+        finish "search-fallback-empty" "reason=$FB_REASON mode=$FALLBACK_MODE q=$FALLBACK_QUERY_LOGGED$FB_MS_PART"
+    fi
+
+    # Re-gate round 3, MAJOR 1: stdout is ALWAYS emitted -- the round-2
+    # "print last, after the state write" reorder traded the two-document
+    # bug for a WORSE one: under full lock contention, mc_update_state_
+    # json's own 2.0s deadline (hooks/memlib.sh) outlives the SAME 2s
+    # watchdog budget, so the watchdog kills the whole process group
+    # before the (already-fully-computed, already-sitting-in-$FB_TEXT)
+    # guess is ever printed -- the model then reads the WATCHDOG's own
+    # generic timeout envelope ("absence of a matching decision was not
+    # established"), which is actively FALSE (a decision WAS found; it
+    # was simply never shown). The guess is the feature; the state write
+    # is garnish. Fix: the state write below now runs with a SHORT
+    # deadline (0.25s, mc_fallback_write_state's own DEADLINE_SECONDS --
+    # hooks/mc-fallback-lib.sh) instead of the default 2.0s, and $FB_TEXT
+    # is printed UNCONDITIONALLY right after, regardless of whether that
+    # write succeeded, timed out, or never ran at all (no session_id, no
+    # memlib.sh). A lock timeout here degrades to `fb_state=skipped-lock`
+    # on the outcome line -- the look-back mention of THIS hit is lost,
+    # never the hit itself. See the flock-holding fixture test in tests/
+    # test_hooks.py pinning this exact property.
+    #
+    # Session-state title storage (docs/INTERNALS.md "search fallback"):
+    # hook.log's own `ids=` field carries no title (item 5's field list is
+    # fixed) -- the look-back block (hooks/userprompt-remind.sh) needs a
+    # human-readable name per hit to render "search surfaced <title>
+    # (<id>) for <file>", so each hit is ALSO appended to this session's
+    # own state file (mc_state_file_for, the SAME per-session JSON state
+    # every write-side hook already shares -- WRITE-LOCK ruling E,
+    # hooks/memlib.sh) under `search_fallbacks`, capped at the last 20.
+    # This is the ONE state write this hook ever makes, sourced and paid
+    # for ONLY on this already-rare (a genuine miss AND at least one
+    # search hit) branch -- the store and the index stay read-only either
+    # way (see docs/INTERNALS.md's own no-write-path paragraph for the
+    # exact scope of that claim). A session_id this hook cannot resolve
+    # (missing from the payload, or memlib.sh unreachable) just skips the
+    # state write -- $FB_TEXT is printed either way.
+    SESSION_ID=""
+    if [ -n "$PAYLOAD" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            SESSION_ID="$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null)"
+        else
+            SESSION_ID="$(printf '%s' "$PAYLOAD" | "$PY" -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+print(d.get("session_id", "") or "")
+' 2>/dev/null)"
+        fi
+    fi
+    FB_STATE_PART=""
+    if [ -n "$SESSION_ID" ] && [ -n "${FB_HITS_FOR_STATE:-}" ]; then
+        # shellcheck source=memlib.sh
+        source "$SCRIPT_DIR/memlib.sh"
+        # Re-gate round 4 NIT: same guard as the parse call site above --
+        # a missing/unreadable lib here degrades to `fb_state=lib-
+        # missing` instead of an unguarded `source` error (or worse,
+        # aborting the run before $FB_TEXT is ever printed).
+        # shellcheck source=mc-fallback-lib.sh
+        if source "$SCRIPT_DIR/mc-fallback-lib.sh" 2>/dev/null; then
+            STATE_FILE="$(mc_state_file_for "$PROJECT" "$SESSION_ID")"
+            if ! mc_fallback_write_state "$STATE_FILE" "$FILE_PATH" "$FB_HITS_FOR_STATE" "pre-edit-chain" 0.25; then
+                FB_STATE_PART=" fb_state=skipped-lock"
+            fi
+        else
+            FB_STATE_PART=" fb_state=lib-missing"
+        fi
+    fi
+
+    printf '%s\n' "$FB_TEXT"
+
+    finish "search-fallback" "hits=$FB_HITS ids=$FB_IDS mode=$FALLBACK_MODE q=$FALLBACK_QUERY_LOGGED$FB_MS_PART$FB_STATE_PART"
 fi
 
 TOPIC_COUNT="$MATCHED_TOPIC_COUNT"

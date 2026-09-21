@@ -3700,6 +3700,66 @@ class TestUserPromptLookback(HookTestBase):
         # exactly one block -- one hookSpecificOutput, one question
         self.assertEqual(ctx.count("Did the conversation"), 1)
 
+    def test_search_fallback_hits_are_listed_in_the_lookback(self):
+        """search fallback (TOP-0133 L1): the look-back block reads the
+        session's own `search_fallbacks` state (written by pre-edit-
+        chain.sh/newfile-nudge.sh when their own fallback fires) and lists
+        each hit as "search surfaced <title> (<id>) for <file>" -- never
+        re-searching, never reading hook.log (ruling B: state and
+        hook.log, never the prompt)."""
+        session_id = "s-lb-fallback-listed"
+        self._start(session_id)
+        self.patch_state(
+            session_id,
+            search_fallbacks=[
+                {
+                    "file": "/repo/src/needle.py", "id": "TOP-7001",
+                    "title": "Needle handling policy", "hook": "pre-edit-chain",
+                },
+            ],
+        )
+        for _ in range(4):
+            self._fire(session_id)
+        proc, _ = self._fire(session_id)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Look-back signal", ctx)
+        self.assertIn(
+            "search surfaced Needle handling policy (TOP-7001) for /repo/src/needle.py",
+            ctx,
+        )
+
+    def test_search_fallback_listing_capped_at_eight_most_recent(self):
+        session_id = "s-lb-fallback-capped"
+        self._start(session_id)
+        self.patch_state(
+            session_id,
+            search_fallbacks=[
+                {"file": f"/repo/f{i}.py", "id": f"TOP-{i}", "title": f"Title {i}", "hook": "pre-edit-chain"}
+                for i in range(12)
+            ],
+        )
+        for _ in range(4):
+            self._fire(session_id)
+        proc, _ = self._fire(session_id)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(ctx.count("search surfaced"), 8)
+        self.assertIn("(TOP-11)", ctx)  # most recent, kept
+        self.assertNotIn("(TOP-3)", ctx)  # oldest of the 12, dropped by the cap
+
+    def test_no_search_fallback_state_means_no_extra_lines(self):
+        session_id = "s-lb-fallback-none"
+        self._start(session_id)
+        for _ in range(4):
+            self._fire(session_id)
+        proc, _ = self._fire(session_id)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("search surfaced", ctx)
+
     def test_coverage_and_thin_same_turn_coverage_wins(self):
         session_id = "s-lb-coverage-wins"
         self._start(session_id)
@@ -5529,10 +5589,21 @@ class TestMacOSPortMechanics(unittest.TestCase):
         assertion above (`elapsed < 4.0`) actually goes red without a
         working deadline -- not vacuously true regardless of the
         mechanism."""
+        # Re-gate round 3 (MAJOR 1): the literal `+ 2.0` moved into a
+        # DEFAULT for the optional DEADLINE_SECONDS argument
+        # mc_fallback_write_state's own short-deadline callers now pass
+        # explicitly -- the line under test is `_deadline = time.time() +
+        # _deadline_s` (a variable) for every caller, defaulted to 2.0
+        # only via `_deadline_s`'s own resolution a few lines above. This
+        # control still targets the SAME mechanism every default-2.0s
+        # caller (including this test's own _run_lock_contention_scenario,
+        # which calls mc_update_state_json with no 3rd argument) goes
+        # through -- hardcoding 30.0 here breaks the deadline for that
+        # caller exactly as the old literal-2.0 replacement did.
         original = MEMLIB.read_text()
-        self.assertIn("_deadline = time.time() + 2.0", original)
+        self.assertIn("_deadline = time.time() + _deadline_s", original)
         broken = original.replace(
-            "_deadline = time.time() + 2.0", "_deadline = time.time() + 30.0", 1
+            "_deadline = time.time() + _deadline_s", "_deadline = time.time() + 30.0", 1
         )
         self.assertNotEqual(broken, original)
         broken_memlib = Path(self.td) / "memlib-broken-control.sh"
@@ -6159,6 +6230,138 @@ class TestNewFileNudgeHook(unittest.TestCase):
         self.assertIn("New source file under", ctx)
         # exactly one line of additionalContext.
         self.assertEqual(len(ctx.splitlines()), 1, ctx)
+
+    def test_search_fallback_hit_appended_to_the_reminder(self):
+        """search fallback (TOP-0133 L1): the wired-file reminder above
+        stays intact; the fallback's own guess is APPENDED, never
+        replacing it. MEMCONTINUUM_FALLBACK_MODE=fts: no embedding model
+        dependency."""
+        store = Path(self.td) / "store"
+        (store / "topics").mkdir(parents=True)
+        (store / "topics" / "needle.md").write_text(
+            "---\ntype: topic\nid: TOP-7002\ntitle: Needle handling policy two\n"
+            "code_refs:\n  - somewhere/else/unrelated.py\n"
+            "links:\n"
+            '  - link: L1\n    status: active\n    '
+            'ruling: {text: "handle the needle case two", authority: owner-verbatim, source: s}\n'
+            "---\nBody.\n"
+        )
+        reindex(store, self.home / "default.sqlite")
+
+        target = self.code_root / "Sources" / "needle.swift"
+        env = self.base_env(MEMCONTINUUM_FALLBACK_MODE="fts")
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        # the ORIGINAL reminder is still there...
+        self.assertIn("New source file under", ctx)
+        self.assertIn("confirm the code index is initialized", ctx)
+        # ...with the fallback's guess appended, labelled, never as a match.
+        self.assertIn(
+            "No recorded decision binds this file. Nearest by search -- may be unrelated:",
+            ctx,
+        )
+        self.assertIn("TOP-7002", ctx)
+        self.assertIn("handle the needle case two", ctx)
+
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=nudged", log_text)
+        self.assertIn("fb_outcome=search-fallback ", log_text)
+        self.assertIn("fb_hits=1", log_text)
+        self.assertIn("fb_ids=TOP-7002", log_text)
+
+        state_file = self.home / "sessions" / "default" / "s-newfile-nudge.json"
+        state = json.loads(state_file.read_text())
+        fallbacks = state.get("search_fallbacks")
+        self.assertTrue(fallbacks)
+        self.assertEqual(fallbacks[0]["id"], "TOP-7002")
+        self.assertEqual(fallbacks[0]["hook"], "newfile-nudge")
+
+    def test_search_fallback_empty_still_leaves_reminder_one_line(self):
+        """No index at all (this class's base_env sets no project/root, so
+        the db file never exists) -- the fallback must skip cleanly
+        (no memidx.py call, see newfile-nudge.sh's own db-existence guard)
+        and the reminder stays exactly the one line it always was."""
+        target = self.code_root / "Sources" / "NoIndexYet.swift"
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(len(ctx.splitlines()), 1, ctx)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("fb_outcome=search-fallback-empty", log_text)
+        self.assertIn("fb_reason=no-hits", log_text)
+
+    def test_store_root_file_skip_now_logs_fb_reason_store_root(self):
+        """MINOR fix-round item: this skip used to log NOTHING at all
+        (FB_EXTRA stayed empty) -- now matches pre-edit-chain.sh's own
+        identical store-root skip, naming itself on the same `outcome=
+        nudged` line via fb_outcome=/fb_reason=."""
+        # The store must be NESTED under code_root -- a path outside the
+        # code root never reaches even the wired-extension gate (see
+        # test_silent_for_a_path_outside_the_code_root above), and a
+        # non-wired extension (.md) would exit at "not-indexed-extension"
+        # before ever reaching this hook's own store-root fallback skip.
+        store = self.code_root / "mem-store"
+        store.mkdir()
+        target = store / "Something.swift"
+        env = self.base_env(MEMCONTINUUM_ROOT=str(store))
+        proc, _elapsed = run_script(
+            NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("fb_outcome=search-fallback-empty", log_text)
+        self.assertIn("fb_reason=store-root", log_text)
+
+    def test_hybrid_envelope_dict_shape_is_parsed_not_treated_as_zero_hits(self):
+        """Addendum (PR #21 merged): hybrid `search --json` now ALWAYS
+        wraps hits in `{"results": [...], "fusion": ...}`, never a bare
+        list -- the hook's own JSON parser must read `results` off the
+        dict, not assume a list (or every hybrid-mode fallback would
+        silently read as zero hits). A fake memidx.py stands in for the
+        real one and returns exactly that envelope shape, argv-
+        independent, to pin the parsing itself rather than depend on a
+        real embedding model producing that shape."""
+        fake = Path(self.td) / "fake-memidx.py"
+        fake.write_text(
+            "import json, sys\n"
+            "if sys.argv[1] == 'search':\n"
+            "    print(json.dumps({\n"
+            "        'results': [{'id': 'TOP-9111', 'title': 'Envelope shape topic', "
+            "'path': 'x.md', 'chain_text': 'TOP-9111 chain text here'}],\n"
+            "        'fusion': 'rrf',\n"
+            "    }))\n"
+            "    sys.exit(0)\n"
+            "sys.exit(1)\n"
+        )
+        wrapper = Path(self.td) / "fake-py-wrapper"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            f'REAL_PY="{VENV_PYTHON}"\n'
+            'if [ "$1" = "-c" ]; then\n'
+            '    exec "$REAL_PY" "$@"\n'
+            'fi\n'
+            'shift\n'
+            f'exec "$REAL_PY" "{fake}" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+
+        target = self.code_root / "Sources" / "envelope.swift"
+        env = self.base_env(MEMCONTINUUM_PYTHON=str(wrapper))
+        # the db must exist (any content) so the hook's own db-existence
+        # guard does not skip the subprocess call entirely.
+        (self.home / "default.sqlite").write_bytes(b"")
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("TOP-9111", ctx)
+        self.assertIn("chain text here", ctx)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("fb_outcome=search-fallback ", log_text)
+        self.assertIn("fb_hits=1", log_text)
 
     def test_silent_for_an_existing_file(self):
         target = self.code_root / "Existing.swift"

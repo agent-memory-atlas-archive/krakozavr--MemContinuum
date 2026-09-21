@@ -6,6 +6,8 @@ handling (the PYTHONPATH trap, env-driven project/root resolution, fail-open
 behavior) as much as its output shape.
 """
 import fcntl
+import glob
+import hashlib
 import json
 import os
 import re
@@ -15,6 +17,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -802,6 +805,108 @@ class TestPreEditChainRootAndStaleWarning(unittest.TestCase):
         self.assertIn("--with-chain-text", for_path_calls[0], for_path_calls[0])
 
 
+class TestQueryLib(unittest.TestCase):
+    """hooks/mc-query-lib.sh (TOP-0133 L1, search fallback): the query
+    builder -- camelCase splitting, generic-stem dropping, extension
+    stripping, the 12-token cap, and the relativize-before-tokenize rule.
+    Pure bash, no python/watchdog involved -- exercised by sourcing the
+    library and calling its functions directly, same in-process-shell
+    approach a hook subprocess test would use, minus the hook's own
+    payload/watchdog machinery this file doesn't need."""
+
+    QUERY_LIB = TOOLS_DIR / "hooks" / "mc-query-lib.sh"
+
+    def _tokens(self, path: str) -> str:
+        proc = subprocess.run(
+            [MC_BASH, "-c", f'source {shlex.quote(str(self.QUERY_LIB))}; mc_query_tokens {shlex.quote(path)}'],
+            capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def _source_path(self, path: str, cwd: str, prefixes: str) -> str:
+        proc = subprocess.run(
+            [MC_BASH, "-c",
+             f'source {shlex.quote(str(self.QUERY_LIB))}; '
+             f'mc_query_source_path {shlex.quote(path)} {shlex.quote(cwd)} {shlex.quote(prefixes)}'],
+            capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def test_extension_stripped_directories_and_stem_split_generic_dropped(self):
+        self.assertEqual(self._tokens("src/core/scan/unbound.py"), "scan unbound")
+
+    def test_camel_case_boundary_split(self):
+        self.assertEqual(
+            self._tokens("SearchFallbackFooBarBazQuxLongToken.tsx"),
+            "search fallback foo bar baz qux long token",
+        )
+
+    def test_short_tokens_dropped(self):
+        # "id" (2 chars) dropped; "index" is itself a generic stem too.
+        self.assertEqual(self._tokens("a/id/x.go"), "")
+
+    def test_all_generic_stems_yields_empty(self):
+        self.assertEqual(self._tokens("src/lib/index.ts"), "")
+
+    def test_cap_at_twelve_tokens(self):
+        # 15 distinct, non-generic, non-short, non-camelCase segments.
+        segs = [f"tokenseg{i}" for i in range(15)]
+        path = "/".join(segs) + ".py"
+        result = self._tokens(path).split()
+        self.assertEqual(len(result), 12)
+        self.assertEqual(result, [f"tokenseg{i}" for i in range(12)])
+
+    def test_dedupe_preserves_first_occurrence_order(self):
+        self.assertEqual(self._tokens("scan/scan/scan_plan.py"), "scan plan")
+
+    def test_backslash_normalized_as_a_path_separator(self):
+        """MINOR fix-round item: a Windows-style backslash-separated path
+        must tokenize exactly like its forward-slash form -- not glue two
+        segments into one bogus token (the pre-fix bug: `tr` silently
+        dropped an un-escaped `\\` from its match set entirely, leaving
+        `core\\scan` as one unsplit run)."""
+        self.assertEqual(self._tokens(r"src\core\scan\unbound.py"), "scan unbound")
+        self.assertEqual(
+            self._tokens(r"src\core\scan\unbound.py"),
+            self._tokens("src/core/scan/unbound.py"),
+        )
+
+    def test_source_path_prefers_cwd_relative(self):
+        self.assertEqual(
+            self._source_path("/repo/src/core/scan/unbound.py", "/repo", ""),
+            "src/core/scan/unbound.py",
+        )
+
+    def test_source_path_falls_back_to_strip_prefix(self):
+        self.assertEqual(
+            self._source_path(
+                "/repo/src/core/scan/unbound.py", "/unrelated", "/other/:/repo/"
+            ),
+            "src/core/scan/unbound.py",
+        )
+
+    def test_source_path_falls_back_to_raw_path_when_nothing_matches(self):
+        self.assertEqual(
+            self._source_path("/random/path/file.py", "/unrelated", "/other/"),
+            "/random/path/file.py",
+        )
+
+    def test_worktree_remapped_path_strips_to_its_relative_form(self):
+        """A worktree path must never be tokenized on its OWN
+        `.worktrees/x/...` segment -- pre-edit-chain.sh's own WT_REMAPPED
+        (mc_remap_worktree_path's output, `<configured-root>/<relative>`)
+        is what gets passed here, and one of STRIP_PREFIXES (the
+        configured root itself) strips it straight down to the bare
+        relative form, exactly as if the file had been edited in the main
+        checkout."""
+        remapped = "/repo-a/src/core/scan/unbound.py"
+        rel = self._source_path(remapped, "/some/unrelated/dir", "/repo-a/")
+        self.assertEqual(rel, "src/core/scan/unbound.py")
+        self.assertEqual(self._tokens(rel), "scan unbound")
+
+
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestPreEditChainWorktreeGap(unittest.TestCase):
     """Worktree gap fix (docs/internal/SESSION-HANDOFF-releases-0.3-to-0.6.md
@@ -916,7 +1021,16 @@ class TestPreEditChainWorktreeGap(unittest.TestCase):
         """requirement 1: a lookup on a path already inside a configured
         root pays no extra `git` call. A fake `git` that both leaves a
         marker AND fails outright proves both halves at once: if it were
-        ever invoked, either the marker or a crash would show it."""
+        ever invoked, either the marker or a crash would show it.
+
+        Search-fallback (TOP-0133 L1): this branch no longer `finish`es
+        plain `no-match` (see pre-edit-chain.sh) -- it now runs the
+        fallback search (a python subprocess, never git), which the
+        assertions below allow for without weakening the git-call proof
+        this test actually exists for. src/core/scan/unbound.py's own
+        query words ("scan unbound", "src"/"core" dropped as generic)
+        find nothing in SCHEMA_FIXTURE_ROOT, so this stays a deterministic
+        zero-hit fallback."""
         fake_git_dir = Path(self.tmp) / "fake-git-bin-noop"
         fake_git_dir.mkdir()
         marker = Path(self.tmp) / "git-was-called"
@@ -932,7 +1046,8 @@ class TestPreEditChainWorktreeGap(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "")
         self.assertFalse(marker.exists(), "git must not be invoked for a path already under a configured root")
         log_text = (Path(self.memtool_home) / "hook.log").read_text()
-        self.assertIn("outcome=no-match", self._last_outcome_line(log_text))
+        self.assertIn("outcome=search-fallback-empty", self._last_outcome_line(log_text))
+        self.assertIn("reason=no-hits", self._last_outcome_line(log_text))
 
     def test_git_failure_on_worktree_gives_unresolved_not_crash(self):
         fake_git_dir = Path(self.tmp) / "fake-git-bin-fail"
@@ -1075,15 +1190,621 @@ class TestPreEditChainWorktreeGap(unittest.TestCase):
 
     def test_ordinary_checkout_of_unwired_repo_outcome_unchanged(self):
         """Requirement 5: a plain (non-worktree) checkout of a repo that
-        was never wired must keep today's plain `no-match` outcome, never
-        a new worktree-* one -- this is repo_b's OWN main checkout, not
-        repo_b_wt."""
+        was never wired must keep today's plain no-match-BRANCH outcome
+        (now the search-fallback channel, TOP-0133 L1 -- `no-match` itself
+        no longer `finish`es this branch, see pre-edit-chain.sh), never a
+        new worktree-* one -- this is repo_b's OWN main checkout, not
+        repo_b_wt. Search-fallback (TOP-0133 L1): this path's own query
+        words include this TEST RUN's tmpdir name (no STRIP_PREFIX/cwd
+        strips repo_b's path, so the raw absolute path is tokenized -- see
+        mc-query-lib.sh's own fallback-to-raw-path rule), which can
+        legitimately hit SCHEMA_FIXTURE_ROOT's own content (it mentions
+        this engine by name) -- so stdout is no longer pinned empty; only
+        the OUTCOME's kind is, deliberately widened to both fallback
+        outcomes rather than one exact string."""
         main_path = str(self.repo_b / "src" / "other.py")
         proc, _ = run_hook(self._payload(main_path), self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        outcome_line = self._last_outcome_line(log_text)
+        self.assertNotIn("outcome=worktree-unwired", outcome_line)
+        self.assertNotIn("outcome=worktree-unresolved", outcome_line)
+        self.assertTrue(
+            "outcome=search-fallback " in outcome_line or "outcome=search-fallback-empty " in outcome_line,
+            outcome_line,
+        )
+
+    def test_in_root_worktree_miss_logs_a_clean_query_no_worktree_or_branch_tokens(self):
+        """TESTS item (coordinator fix round): an in-root worktree MISS
+        (mirrors test_in_root_worktree_gets_same_chain_as_main's own
+        fixture, but at a path with no code_ref -- a genuine miss that
+        reaches the search fallback) must query on the path's own words
+        via QUERY_SRC_PATH=WT_REMAPPED, never the raw `.worktrees/feat/`
+        segment or the `wt-in-root` branch name. `src/core/scan/scan_
+        unbound.py` tokenizes to exactly "scan unbound" once `src`/`core`
+        (both generic stems) are dropped and `scan_unbound`'s `_` splits
+        -- asserted as an EXACT match on the logged `q=` field, not merely
+        the absence of "worktrees" (a weaker check a raw-path
+        implementation could still pass by accident)."""
+        in_root_wt = self.repo_a / ".worktrees" / "feat"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "wt-in-root", str(in_root_wt)],
+            cwd=self.repo_a, check=True,
+        )
+        miss_path = in_root_wt / "src" / "core" / "scan" / "scan_unbound.py"
+        miss_path.parent.mkdir(parents=True, exist_ok=True)
+        miss_path.write_text("# unbound\n")
+        proc, _ = run_hook(
+            self._payload(str(miss_path), cwd=str(self.repo_a)),
+            self._env(MEMCONTINUUM_FALLBACK_MODE="fts"),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        outcome_line = self._last_outcome_line(log_text)
+        self.assertNotIn("outcome=worktree-unwired", outcome_line)
+        self.assertNotIn("outcome=worktree-unresolved", outcome_line)
+        self.assertIn("q=scan+unbound", outcome_line)
+        # Scoped to the q= FIELD specifically, not the whole line -- the
+        # line's own `file=` field legitimately carries the real,
+        # absolute edited path (`.worktrees/feat/...` included, exactly
+        # as it should); this checks that the QUERY built off that path
+        # -- not the raw path itself -- is scrubbed of those segments.
+        q_match = re.search(r"\bq=(\S*)", outcome_line)
+        self.assertIsNotNone(q_match, outcome_line)
+        self.assertEqual(q_match.group(1), "scan+unbound")
+        self.assertNotIn("worktrees", q_match.group(1))
+        self.assertNotIn("wt-in-root", q_match.group(1))
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPreEditChainSearchFallback(unittest.TestCase):
+    """search fallback (TOP-0133 L1): on pre-edit-chain.sh's own genuine
+    no-match branch, `memidx.py search --hydrate` is queried on the
+    path's own words and the nearest decision (if any) is injected,
+    labelled as a guess. Fixture: ONE topic (TOP-7001, "Needle handling
+    policy") whose code_refs point somewhere ELSE entirely (so `for-path`
+    never matches the miss file), but whose title/ruling text contains
+    "needle" -- exactly the word the miss file's own path tokenizes to --
+    so FTS finds it. MEMCONTINUUM_FALLBACK_MODE=fts throughout: no
+    embedding model dependency, deterministic, fast."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="memcontinuum-hook-fallback-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.memtool_home = str(Path(self.tmp) / "memcontinuum-home")
+        os.makedirs(self.memtool_home, exist_ok=True)
+        self.project = "hookfallbacktest"
+
+        self.store = Path(self.tmp) / "store"
+        (self.store / "topics").mkdir(parents=True)
+        # F5's family collapse means a query word shared with the link's
+        # own ruling text (e.g. "needle") surfaces the LINK row, whose
+        # `snippet` falls back to that SAME ruling text -- indistinguishable
+        # from chain_text and useless as a no-snippet mutation check. "needle"
+        # here appears ONLY in the title (for-path's own code_refs never
+        # match the miss file, so this is unreachable any other way) and the
+        # BODY -- the ruling text uses a wholly different word ("widget"), so
+        # the match routes through the TOPIC row, whose `snippet` (body
+        # prose) is then genuinely, checkably different from chain_text
+        # (title + ruling only, never body prose).
+        (self.store / "topics" / "needle.md").write_text(
+            "---\ntype: topic\nid: TOP-7001\ntitle: Needle handling policy\n"
+            "code_refs:\n  - somewhere/else/unrelated.py\n"
+            "links:\n"
+            '  - link: L1\n    status: active\n    '
+            'ruling: {text: "handle the widget case", authority: owner-verbatim, source: s}\n'
+            "---\nBody prose mentioning needle handling in detail, at length.\n"
+        )
+        args = type(
+            "Args", (), dict(
+                root=str(self.store), project=self.project,
+                db=str(Path(self.memtool_home) / f"{self.project}.sqlite"),
+                full=True, no_embed=True,
+            ),
+        )()
+        memidx.cmd_reindex(args)
+
+        self.repo = Path(self.tmp) / "repo"
+        (self.repo / "src").mkdir(parents=True)
+
+    def _env(self, **overrides):
+        env = clean_env(
+            MEMCONTINUUM_HOME=self.memtool_home,
+            MEMCONTINUUM_PROJECT=self.project,
+            MEMCONTINUUM_PYTHON=VENV_PYTHON,
+            MEMCONTINUUM_STRIP_PREFIX=str(self.repo) + "/",
+            MEMCONTINUUM_FALLBACK_MODE="fts",
+        )
+        env.update(overrides)
+        return env
+
+    def _payload(self, file_path, cwd="/some/unrelated", session_id="sess-fb-1"):
+        return json.dumps({
+            "hook_event_name": "PreToolUse", "tool_name": "Edit",
+            "cwd": cwd, "session_id": session_id,
+            "tool_input": {"file_path": file_path},
+        })
+
+    def _last_outcome_line(self, log_text):
+        matching = [l for l in log_text.splitlines() if "outcome=" in l]
+        self.assertTrue(matching, log_text)
+        return matching[-1]
+
+    def test_miss_with_hit_label_and_chain_never_snippet(self):
+        target = str(self.repo / "src" / "needle.py")
+        proc, _ = run_hook(self._payload(target), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout.strip(), "expected additionalContext, got nothing")
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        # Exact label, byte-for-byte, at the very start -- a mutated label
+        # (reworded, retitled, moved) fails this immediately.
+        label = "No recorded decision binds this file. Nearest by search -- may be unrelated:"
+        self.assertTrue(ctx.startswith(label + "\n\n"), ctx)
+        # The hit's own chain text (rationale) is present...
+        self.assertIn("TOP-7001", ctx)
+        self.assertIn("handle the widget case", ctx)
+        # ...but the SNIPPET field (record_row's body prose, a DIFFERENT
+        # field cmd_search also returns) must never appear -- a code
+        # change that swapped chain_text for snippet in the injection
+        # would still "have content" but fail this specific check. Genuinely
+        # mutation-tested (not just asserted): temporarily making the
+        # fallback inject `snippet` instead of/alongside `chain_text` was
+        # verified to fail this exact assertion before this fix shipped.
+        self.assertNotIn("Body prose mentioning needle handling in detail, at length", ctx)
+
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback ", line)
+        self.assertIn("hits=1", line)
+        self.assertIn("ids=TOP-7001", line)
+        self.assertIn("mode=fts", line)
+        self.assertNotIn("outcome=no-match", line)
+
+        # Session-state title storage: the look-back channel's own data
+        # source (see TestUserPromptLookback in tests/test_write_hooks.py).
+        state_file = Path(self.memtool_home) / "sessions" / self.project / "sess-fb-1.json"
+        state = json.loads(state_file.read_text())
+        fallbacks = state.get("search_fallbacks")
+        self.assertTrue(fallbacks)
+        self.assertEqual(fallbacks[0]["id"], "TOP-7001")
+        self.assertEqual(fallbacks[0]["title"], "Needle handling policy")
+        self.assertEqual(fallbacks[0]["file"], target)
+        self.assertEqual(fallbacks[0]["hook"], "pre-edit-chain")
+
+    def test_zero_hit_empty_outcome_no_injection(self):
+        target = str(self.repo / "src" / "zzznohitzzz.py")
+        proc, _ = run_hook(self._payload(target), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "")
         log_text = (Path(self.memtool_home) / "hook.log").read_text()
-        self.assertIn("outcome=no-match", self._last_outcome_line(log_text))
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback-empty", line)
+        self.assertIn("reason=no-hits", line)
+
+    def test_no_query_after_filtering_empty_outcome(self):
+        # "src"/"lib"/"index" are ALL generic stems -- nothing survives.
+        target = str(self.repo / "src" / "lib" / "index.ts")
+        Path(target).parent.mkdir(parents=True, exist_ok=True)
+        proc, _ = run_hook(self._payload(target), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback-empty", line)
+        self.assertIn("reason=no-query", line)
+
+    def test_store_root_file_skipped_with_reason_logged(self):
+        target = str(self.store / "topics" / "unrelated-new.md")
+        # MEMCONTINUUM_STRIP_PREFIX cleared: irrelevant to the store-root
+        # skip itself, and leaving it set would route this miss through
+        # the worktree-gap block first (this sandbox's ambient /tmp/.git
+        # makes that block's own git resolution environment-dependent --
+        # see the accepted test_outside_scope_edit_pays_no_git_call
+        # failure elsewhere in this suite) -- unset, that block never
+        # activates, keeping this test about the store-root check alone.
+        proc, _ = run_hook(
+            self._payload(target),
+            self._env(MEMCONTINUUM_ROOT=str(self.store), MEMCONTINUUM_STRIP_PREFIX=""),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback-empty", line)
+        self.assertIn("reason=store-root", line)
+
+    def test_match_never_runs_the_fallback(self):
+        """A real for-path match must never reach the fallback at all --
+        no `search-fallback`/`search-fallback-empty` outcome, and no extra
+        memidx invocation beyond the one `for-path` call (reusing the
+        argv-recording python-shim pattern TestPreEditChainRootAndStale-
+        Warning already established, rather than reimplementing it)."""
+        (self.store / "topics" / "matcher.md").write_text(
+            "---\ntype: topic\nid: TOP-8001\ntitle: Matcher topic\n"
+            "code_refs:\n  - src/matched.py\n"
+            "links:\n"
+            '  - link: L1\n    status: active\n    '
+            'ruling: {text: "r", authority: owner-verbatim, source: s}\n'
+            "---\nBody.\n"
+        )
+        args = type(
+            "Args", (), dict(
+                root=str(self.store), project=self.project,
+                db=str(Path(self.memtool_home) / f"{self.project}.sqlite"),
+                full=True, no_embed=True,
+            ),
+        )()
+        memidx.cmd_reindex(args)
+
+        argv_log = Path(self.tmp) / "argv.jsonl"
+        wrapper = memidx_wrapper_python(
+            self.tmp, "argv-recorder",
+            f'ARGV_LOG = "{argv_log}"\n'
+            'import json\n'
+            'with open(ARGV_LOG, "a") as _f:\n'
+            '    _f.write(json.dumps(sys.argv[1:]))\n'
+            '    _f.write(chr(10))\n',
+        )
+        target = str(self.repo / "src" / "matched.py")
+        env = self._env(MEMCONTINUUM_PYTHON=str(wrapper))
+        proc, _ = run_hook(self._payload(target), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout.strip())
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertNotIn("search-fallback", log_text)
+        calls = [json.loads(line) for line in argv_log.read_text().splitlines() if line.strip()]
+        search_calls = [c for c in calls if c and c[0] == "search"]
+        self.assertEqual(search_calls, [], "a match must never invoke `search`")
+
+    def test_no_write_path_store_and_index_untouched(self):
+        """Item 7, scope corrected (re-gate round 3, MAJOR 2): the fixture
+        index here is ALREADY current/stamped (setUp's own cmd_reindex),
+        so the sha staying unchanged across 50 runs proves the FALLBACK
+        SEARCH itself adds no write -- it does NOT prove the whole hook
+        run never writes the index. The same hook's own earlier `for-path`
+        lookup (unchanged by this feature) still opens the index the
+        ordinary rw way and CAN migrate/stamp a schema behind the current
+        generation before the fallback ever runs -- see
+        test_search_read_only_refuses_legacy_schema_without_writing in
+        tests/test_memidx.py for that direct, isolated proof, and
+        test_for_path_miss_still_migrates_before_the_fallback_runs below
+        for the same claim exercised through this actual hook. 50 fallback
+        runs against a fixture store that is a git repo -- `git status
+        --short` stays empty and the index file's sha256 is unchanged.
+        The one write this hook makes (session state, see
+        test_miss_with_hit_label_and_chain_never_snippet) lives under
+        MEMCONTINUUM_HOME/sessions/, never under the store or the index."""
+        for cmd in (
+            ["git", "init", "-q"],
+            ["git", "config", "user.email", "t@t.local"],
+            ["git", "config", "user.name", "t"],
+        ):
+            subprocess.run(cmd, cwd=self.store, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=self.store, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=self.store, check=True)
+
+        db_path = Path(self.memtool_home) / f"{self.project}.sqlite"
+        sha_before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+        target = str(self.repo / "src" / "needle.py")
+        for _ in range(50):
+            proc, _ = run_hook(
+                self._payload(target), self._env(MEMCONTINUUM_ROOT=str(self.store)),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        sha_after = hashlib.sha256(db_path.read_bytes()).hexdigest()
+        self.assertEqual(sha_before, sha_after, "the index must never be written by the fallback")
+        status = subprocess.run(
+            ["git", "status", "--short"], cwd=self.store, capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(status.stdout.strip(), "", "the store must never be written by the fallback")
+
+    def test_for_path_miss_still_migrates_before_the_fallback_runs(self):
+        """Re-gate round 3, MAJOR 2, exercised end to end through the real
+        hook (not just memidx.py directly): a schema behind the current
+        generation, ALSO missing its db_meta project stamp, gets that
+        stamp written by this SAME hook run's own earlier `for-path`
+        lookup (unchanged, pre-existing, correct behavior -- a match must
+        keep seeing a migrated schema) -- the sha genuinely changes --
+        while the fallback's own `--read-only` search, reached moments
+        later in the SAME run, still correctly refuses with reason=
+        index-needs-migration (the project-stamp guard and the
+        generation-number stamp are different db_meta keys; only a real
+        `reindex` bumps the latter, so for-path's own migration guards
+        never silently paper over a stale generation number)."""
+        db_path = Path(self.memtool_home) / f"{self.project}.sqlite"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE db_meta SET value='1' WHERE key='index_generation'")
+        conn.execute("DELETE FROM db_meta WHERE key='project'")
+        conn.commit()
+        conn.close()
+        sha_before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+        target = str(self.repo / "src" / "needle.py")
+        proc, _ = run_hook(self._payload(target), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+        sha_after = hashlib.sha256(db_path.read_bytes()).hexdigest()
+        self.assertNotEqual(sha_before, sha_after, "for-path's own rw open must still stamp the project row")
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute("SELECT value FROM db_meta WHERE key='project'").fetchone()
+        conn.close()
+        self.assertEqual(row[0], self.project)
+
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback-empty", line)
+        self.assertIn("reason=index-needs-migration", line)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_search_crash_names_search_failed_rc_not_no_hits(self):
+        """MAJOR fix-round item b, pinning: a `search` subprocess that
+        exits non-zero with NOTHING on stdout (a genuine crash, not a
+        JSON refusal envelope) used to collapse into `reason=no-hits`
+        (the old gate only ran the reason parser when stdout was
+        non-empty) -- now names `reason=search-failed rc=N`."""
+        wrapper = memidx_wrapper_python(
+            self.tmp, "crash-search",
+            'if sys.argv[1:2] == ["search"]:\n'
+            '    sys.exit(7)\n',
+        )
+        target = str(self.repo / "src" / "needle.py")
+        proc, _ = run_hook(self._payload(target), self._env(MEMCONTINUUM_PYTHON=str(wrapper)))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback-empty", line)
+        self.assertIn("reason=search-failed rc=7", line)
+        self.assertNotIn("reason=no-hits", line)
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_flock_held_whole_run_still_emits_the_fallbacks_own_document_fast(self):
+        """BLOCKER + re-gate round 3, MAJOR 1, pinning (docstring corrected
+        to state what THIS code actually does -- the round-2 version's own
+        claim, "printed LAST after the state write gives up per its own
+        [2.0s] deadline", was true of the SYMPTOM (one document) but false
+        about WHICH document: with a 2.0s state-write deadline racing the
+        SAME 2s watchdog budget, the watchdog usually wins, killing the
+        run and replacing stdout with ITS OWN generic timeout envelope --
+        the already-computed guess is silently discarded and the model is
+        told something false ("absence... not established") about a
+        decision that was in fact found).
+        Fixed by giving the state write a SHORT deadline (0.25s,
+        mc_fallback_write_state) instead of the default 2.0s: hold the
+        session-state file's own flock in THIS test process for the WHOLE
+        run -- the hook must still finish well under the 2s watchdog
+        budget, stdout must be exactly one document, and it must be the
+        FALLBACK's OWN additionalContext (the label text is asserted
+        present, not merely "some JSON with hookSpecificOutput" -- the
+        watchdog's own fallback envelope has neither), with `outcome=
+        search-fallback` (not `watchdog-killed`) and `fb_state=
+        skipped-lock` naming the skipped titling write."""
+        session_id = "sess-flock-1"
+        state_dir = Path(self.memtool_home) / "sessions" / self.project
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_file = state_dir / f"{session_id}.json"
+        state_file.write_text("{}")
+        lock_file = state_dir / f"{session_id}.json.lock"
+        lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            target = str(self.repo / "src" / "needle.py")
+            proc, elapsed = run_hook(
+                self._payload(target, session_id=session_id), self._env(), timeout=8.0,
+            )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # Re-gate round 4 (Opus): dropped the wall-clock `elapsed < 4.0`
+        # bound entirely -- this hook is hard-bounded to ~2.03s by its OWN
+        # watchdog regardless of what this fix does, so a 4.0s bar can
+        # NEVER fail here and was pinning nothing. The deterministic,
+        # load-independent proof that the fix landed is `outcome=search-
+        # fallback` (never `watchdog-killed`) plus `fb_state=skipped-lock`
+        # below; the one genuinely load-bearing timing pin is `fb_ms`
+        # itself (the SEARCH subprocess's own millisecond timing, off the
+        # log line, unrelated to wall-clock/CPU contention noise around
+        # the whole test process) -- fts mode measures well under 500ms
+        # even generously bounded.
+        stdout = proc.stdout.strip()
+        self.assertTrue(stdout, "expected an additionalContext envelope even under a held lock")
+        # Exactly one JSON document: json.loads succeeds on the WHOLE
+        # stdout, and there is exactly one line.
+        parsed = json.loads(stdout)
+        ctx = parsed["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(
+            ctx.startswith("No recorded decision binds this file. Nearest by search -- may be unrelated:"),
+            "stdout must be the FALLBACK's own document, not the watchdog's generic timeout envelope",
+        )
+        self.assertIn("TOP-7001", ctx)
+        self.assertEqual(len(stdout.splitlines()), 1, stdout)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback ", line)
+        self.assertIn("fb_state=skipped-lock", line)
+        self.assertNotIn("watchdog-killed", line)
+        fb_ms_match = re.search(r"\bfb_ms=(\d+)", line)
+        self.assertIsNotNone(fb_ms_match, line)
+        self.assertLess(int(fb_ms_match.group(1)), 500, line)
+        # The state file itself is genuinely untouched (the short-deadline
+        # write really did skip, not silently succeed under a race).
+        self.assertEqual(json.loads(state_file.read_text()), {})
+
+    def _wait_for_fb_started_marker(self, appear: bool, timeout: float = 5.0) -> bool:
+        """Poll for ANY `.fb-started.*` marker under this test's own
+        MEMCONTINUUM_HOME (hooks/mc-watchdog.sh's own comment: written by
+        the guarded hook for the duration of the search subprocess call
+        only) -- `appear=True` waits for one to exist, `appear=False`
+        waits for none to. The test's own process never knows the hook's
+        real (multi-hop, re-exec'd-under-the-watchdog-launcher) pid in
+        advance, so this globs rather than checking one exact name; a
+        single-hook-run test never has more than one marker at a time."""
+        pattern = str(Path(self.memtool_home) / ".fb-started.*")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            matches = glob.glob(pattern)
+            if bool(matches) == appear:
+                return True
+            time.sleep(0.005)
+        return False
+
+    def _popen_hook(self, payload_text: str, env: dict):
+        proc = subprocess.Popen(
+            [MC_BASH, str(HOOK_SCRIPT)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, env=env,
+        )
+        proc.stdin.write(payload_text)
+        proc.stdin.close()
+        # A later proc.communicate() (no `input=`) still tries to flush
+        # and close stdin unconditionally when the attribute is not None
+        # -- ValueError on an already-closed file. Already fed and
+        # closed above; nothing left for communicate() to do with it.
+        proc.stdin = None
+        return proc
+
+    def test_flock_contended_through_the_search_titling_skipped_gracefully(self):
+        """Re-gate round 4 finding: the previous version of this pair's
+        "written normally" test released its held lock at a fixed 0.05s
+        -- well before the state write even starts (~0.30-0.45s into a
+        real run) -- so it never contended at all; it passed unchanged
+        against the OLD, unfixed 2.0s deadline too. This test makes the
+        contention real and synchronized to the hook's ACTUAL progress,
+        not a guessed wall-clock delay: hold the lock until the hook's
+        own `.fb-started.*` marker (hooks/mc-watchdog.sh's own comment)
+        is OBSERVED to appear (the search subprocess has just started),
+        then hold a further ~0.7s -- comfortably past both the search
+        itself (fts mode, well under 100ms) and the whole 0.25s state-
+        write deadline that follows it -- before releasing. The titling
+        write must have genuinely given up: `fb_state=skipped-lock`, the
+        state file untouched, and the additionalContext guess unaffected."""
+        session_id = "sess-flock-3"
+        state_dir = Path(self.memtool_home) / "sessions" / self.project
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_file = state_dir / f"{session_id}.json"
+        state_file.write_text("{}")
+        lock_file = state_dir / f"{session_id}.json.lock"
+        lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            target = str(self.repo / "src" / "needle.py")
+            proc = self._popen_hook(self._payload(target, session_id=session_id), self._env())
+            self.assertTrue(
+                self._wait_for_fb_started_marker(appear=True),
+                "the .fb-started.* marker never appeared -- the search subprocess never ran",
+            )
+            time.sleep(0.7)
+            stdout, stderr = proc.communicate(timeout=8.0)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        self.assertEqual(proc.returncode, 0, stderr)
+        parsed = json.loads(stdout.strip())
+        self.assertIn("TOP-7001", parsed["hookSpecificOutput"]["additionalContext"])
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback ", line)
+        self.assertIn("fb_state=skipped-lock", line)
+        self.assertEqual(json.loads(state_file.read_text()), {})
+
+    def test_flock_briefly_contended_titling_still_written_normally(self):
+        """Companion to the contended case above, synchronized the SAME
+        way (not a guessed fixed delay): release the lock shortly (~0.05s)
+        after the `.fb-started.*` marker is observed to appear -- by
+        which point the (fts-mode, well under 100ms) search subprocess is
+        still running or has just finished, and the lock is free well
+        before the titling write's own first few ~20ms retry attempts
+        would exhaust its 0.25s deadline. Pins that a brief, real
+        contention window still lets the write land normally: no
+        `fb_state=skipped-lock`, the state file genuinely populated."""
+        session_id = "sess-flock-4"
+        state_dir = Path(self.memtool_home) / "sessions" / self.project
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_file = state_dir / f"{session_id}.json"
+        state_file.write_text("{}")
+        lock_file = state_dir / f"{session_id}.json.lock"
+        lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            target = str(self.repo / "src" / "needle.py")
+            proc = self._popen_hook(self._payload(target, session_id=session_id), self._env())
+            self.assertTrue(
+                self._wait_for_fb_started_marker(appear=True),
+                "the .fb-started.* marker never appeared -- the search subprocess never ran",
+            )
+            time.sleep(0.05)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        stdout, stderr = proc.communicate(timeout=8.0)
+        self.assertEqual(proc.returncode, 0, stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback ", line)
+        self.assertNotIn("fb_state=skipped-lock", line)
+        state = json.loads(state_file.read_text())
+        self.assertTrue(state.get("search_fallbacks"))
+
+    @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+    def test_ten_identical_misses_dedup_to_two_state_entries(self):
+        """MAJOR fix-round item e, pinning: the SAME miss (one file, one
+        hit id) run 10 times must leave exactly ONE entry for that
+        (file, id) pair in session state, not 10 -- and running it
+        against a SECOND file adds exactly one more (2 total), not 11."""
+        session_id = "sess-dedup-1"
+        target_a = str(self.repo / "src" / "needle.py")
+        for _ in range(10):
+            proc, _ = run_hook(self._payload(target_a, session_id=session_id), self._env())
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        target_b = str(self.repo / "src" / "needle_utils.py")
+        proc, _ = run_hook(self._payload(target_b, session_id=session_id), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        state_file = Path(self.memtool_home) / "sessions" / self.project / f"{session_id}.json"
+        state = json.loads(state_file.read_text())
+        fallbacks = state.get("search_fallbacks")
+        self.assertEqual(len(fallbacks), 2, fallbacks)
+        files = sorted(f["file"] for f in fallbacks)
+        self.assertEqual(files, sorted([target_a, target_b]))
+
+    def test_hybrid_envelope_dict_shape_is_parsed_not_treated_as_zero_hits(self):
+        """Addendum (PR #21 merged): hybrid `search --json` now ALWAYS
+        wraps hits in `{"results": [...], "fusion": ...}`, never a bare
+        list -- this hook's own JSON parser must read `results` off the
+        dict, not assume a list. `memidx.cmd_search` itself is
+        monkeypatched (via memidx_wrapper_python's body-injection) to
+        print exactly that envelope shape, argv-independent, pinning the
+        PARSING rather than depending on a real embedding model to
+        produce it."""
+        wrapper = memidx_wrapper_python(
+            self.tmp, "envelope-shape-search",
+            'import json as _json\n'
+            'def _fake_cmd_search(args):\n'
+            '    print(_json.dumps({\n'
+            '        "results": [{"id": "TOP-9222", "title": "Envelope shape topic", '
+            '"path": "x.md", "chain_text": "TOP-9222 chain text here"}],\n'
+            '        "fusion": "rrf",\n'
+            '    }))\n'
+            '    return 0\n'
+            'memidx.cmd_search = _fake_cmd_search\n',
+        )
+        target = str(self.repo / "src" / "envelope.py")
+        proc, _ = run_hook(self._payload(target), self._env(MEMCONTINUUM_PYTHON=str(wrapper)))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("TOP-9222", ctx)
+        self.assertIn("chain text here", ctx)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        line = self._last_outcome_line(log_text)
+        self.assertIn("outcome=search-fallback ", line)
+        self.assertIn("hits=1", line)
 
 
 class TestF6RenderedTimeout(unittest.TestCase):
@@ -1512,6 +2233,17 @@ class TestPreEditChainOracleParity(unittest.TestCase):
         self.assertIn("line one\\nline two", new_proc.stdout)
 
     def test_no_match(self):
+        """Search-fallback (TOP-0133 L1) is an EXPECTED divergence from the
+        frozen oracle here, the same documented-divergence pattern
+        test_match_with_two_topics_gets_a_real_topic_count already
+        established for the topic-count fix: the oracle predates this
+        feature and still `finish`es plain `no-match`; the current script
+        instead runs the fallback search on the path's own words
+        ("near anything" -- /nowhere/near/anything.py, cwd /nowhere) and
+        finds nothing in SCHEMA_FIXTURE_ROOT, so BOTH scripts still agree
+        on empty stdout (no chain, no fallback content either) -- only the
+        logged outcome NAME differs, and only in the direction this
+        feature intends."""
         project = "oracle-nomatch"
         home = self._new_home(project)
         self._reindex(SCHEMA_FIXTURE_ROOT, project, home / f"{project}.sqlite")
@@ -1523,8 +2255,8 @@ class TestPreEditChainOracleParity(unittest.TestCase):
         self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
         self.assertEqual(new_proc.stdout.strip(), oracle_proc.stdout.strip())
         self.assertEqual(new_proc.stdout.strip(), "")
-        self.assertEqual(new_outcome, oracle_outcome)
-        self.assertEqual(new_outcome, "no-match")
+        self.assertEqual(oracle_outcome, "no-match")
+        self.assertEqual(new_outcome, "search-fallback-empty")
 
     def test_stale_index_with_root(self):
         project = "oracle-stale"
@@ -1770,12 +2502,19 @@ class TestPreEditChainTopicsLogging(unittest.TestCase):
         self.assertIn("topics=TOP-9001,TOP-9002", line)
 
     def test_no_match_never_logs_a_topics_field(self):
+        """Search-fallback (TOP-0133 L1): this branch's `finish` outcome is
+        now `search-fallback-empty` (the fixture's single topic has no
+        content overlapping "near"/"anything", the fallback query for
+        /nowhere/near/anything.py) -- `topics=` is a pre-edit-chain match/
+        index-stale-served-only field either way, so the real assertion
+        this test exists for (no topics= field on a non-match) still
+        holds."""
         project = "topics-none"
         home = self._build_home(project, ["TOP-9001"])
         proc, _elapsed = self._run(home, project, payload=self._nonmatching_payload())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         line = self._last_outcome_line(home)
-        self.assertIn("outcome=no-match", line)
+        self.assertIn("outcome=search-fallback-empty", line)
         self.assertNotIn("topics=", line)
 
     def test_other_failure_outcomes_never_log_a_topics_field(self):

@@ -1058,6 +1058,146 @@ class TestStatsPreCommitBucket(StatsTestBase):
         self.assertEqual(pcm["outcomes"]["skipped:engine-failure"], 1)
 
 
+class TestStatsFallbackBucket(StatsTestBase):
+    """search fallback: `stats` tallies outcome=search-fallback/-empty
+    (pre-edit-chain.sh, kind "pre-edit") and fb_outcome=... (newfile-
+    nudge.sh, kind "newfile-nudge", its own base outcome staying
+    "nudged") into ONE merged `fallback` block -- see
+    memidx.py's _tally_fallback_fields."""
+
+    def test_pre_edit_hit_and_empty_lines_are_tallied(self):
+        lines = [
+            f"{ts(1)} outcome=search-fallback elapsed=1s hits=2 "
+            "ids=alpha,beta mode=hybrid q=core+scan fb_ms=850 project=demo file=/a.py",
+            f"{ts(1)} outcome=search-fallback-empty elapsed=0s "
+            "reason=no-hits mode=fts q=zzz fb_ms=120 project=demo file=/b.py",
+            # MAJOR fix-round item d: `no-query`/`store-root` never reach
+            # the search subprocess at all, so their own lines carry NO
+            # fb_ms= field -- these two must NOT contribute to the ms
+            # pool below (excluded by construction, not a report-time
+            # filter -- see _tally_fallback_fields).
+            f"{ts(1)} outcome=search-fallback-empty elapsed=0s "
+            "reason=no-query project=demo file=/c.py",
+            f"{ts(1)} outcome=search-fallback-empty elapsed=0s "
+            "reason=store-root project=demo file=/d.py",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        fb = out["fallback"]
+        self.assertEqual(fb["search_fallback"], 1)
+        self.assertEqual(fb["search_fallback_empty"], 3)
+        self.assertEqual(fb["reasons"], {"no-hits": 1, "no-query": 1, "store-root": 1})
+        self.assertEqual(fb["hit_count_distribution"], {"2": 1})
+        self.assertEqual(fb["modes_seen"], {"hybrid": 1, "fts": 1})
+        self.assertIn({"id": "alpha", "count": 1}, fb["top_ids"])
+        self.assertIn({"id": "beta", "count": 1}, fb["top_ids"])
+        # fb_ms is tallied for every line that actually ran the search
+        # subprocess (hit or empty -- it measures the channel's real
+        # cost), but the no-query/store-root lines above never set it:
+        # only [850, 120] contribute, sorted [120, 850] -- nearest-rank
+        # p50 is the 1st of 2 (120), p95 the 2nd (850).
+        self.assertEqual(fb["ms_p50"], 120)
+        self.assertEqual(fb["ms_p95"], 850)
+
+    def test_newfile_nudge_fallback_rides_on_the_nudged_outcome(self):
+        """newfile-nudge.sh never renames its own outcome -- memidx.py
+        stats' `nf.nudged` metric must still see "nudged", with the
+        fallback's own result read from the separate fb_* fields."""
+        lines = [
+            f"{ts(1)} newfile-nudge outcome=nudged fb_outcome=search-fallback "
+            "fb_hits=1 fb_ids=gamma fb_mode=hybrid fb_q=new+file fb_ms=95 "
+            "project=demo file=/e.swift",
+            f"{ts(1)} newfile-nudge outcome=nudged fb_outcome=search-fallback-empty "
+            "fb_reason=no-hits fb_mode=hybrid fb_q=nope fb_ms=60 "
+            "project=demo file=/f.swift",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["newfile_nudge"]["nudged"], 2)
+        fb = out["fallback"]
+        self.assertEqual(fb["search_fallback"], 1)
+        self.assertEqual(fb["search_fallback_empty"], 1)
+        self.assertEqual(fb["reasons"], {"no-hits": 1})
+        self.assertIn({"id": "gamma", "count": 1}, fb["top_ids"])
+        # fb_ms= is read UNPREFIXED regardless of which hook produced the
+        # line (MAJOR fix-round item d) -- both these fb_-prefixed lines
+        # still contribute [95, 60], sorted [60, 95].
+        self.assertEqual(fb["ms_p50"], 60)
+        self.assertEqual(fb["ms_p95"], 95)
+
+    def test_no_fallback_lines_yields_empty_block_not_a_crash(self):
+        self.write_log([f"{ts(1)} outcome=matched elapsed=0s project=demo file=/x.py"])
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        fb = out["fallback"]
+        self.assertEqual(fb["search_fallback"], 0)
+        self.assertEqual(fb["search_fallback_empty"], 0)
+        self.assertEqual(fb["hit_count_distribution"], {})
+        self.assertEqual(fb["top_ids"], [])
+        self.assertIsNone(fb["ms_p50"])
+
+    def test_no_query_and_store_root_never_contribute_to_the_ms_pool(self):
+        """MAJOR fix-round item d, isolated: EVERY fallback line here is
+        a no-query/store-root early exit (no search subprocess ever
+        ran) -- the ms pool must stay empty (None p50/p95), not read a
+        missing fb_ms= as 0."""
+        lines = [
+            f"{ts(1)} outcome=search-fallback-empty elapsed=0s "
+            "reason=no-query project=demo file=/a.py",
+            f"{ts(1)} outcome=search-fallback-empty elapsed=0s "
+            "reason=store-root project=demo file=/b.py",
+            f"{ts(1)} newfile-nudge outcome=nudged fb_outcome=search-fallback-empty "
+            "fb_reason=store-root project=demo file=/c.swift",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        fb = out["fallback"]
+        self.assertEqual(fb["search_fallback_empty"], 3)
+        self.assertIsNone(fb["ms_p50"])
+        self.assertIsNone(fb["ms_p95"])
+
+    def test_text_mode_prints_a_fallback_line(self):
+        lines = [
+            f"{ts(1)} outcome=search-fallback elapsed=1s hits=1 "
+            "ids=alpha mode=hybrid q=core fb_ms=42 project=demo file=/a.py",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertIn("search fallback", out)
+        self.assertIn("hits=1", out)
+        self.assertIn("ms p50/p95=42ms/42ms", out)
+
+    def test_watchdog_killed_fallback_counted_as_killed(self):
+        """Re-gate round 4: a watchdog kill on the fallback branch (either
+        hook -- both write the same `.fb-started.<pid>` marker,
+        hooks/mc-watchdog.sh's own kill handler names it `fb_started=1`
+        on the outcome=watchdog-killed line it always writes) used to
+        vanish -- no `search-fallback`/`-empty` line at all, ever. Now
+        counted as `fallback.killed`, regardless of which hook it was
+        (pre-edit-chain.sh's own kill lines classify as kind "pre-edit";
+        a kill with no `hook=pre-edit-chain.sh` -- newfile-nudge.sh's own
+        shape here -- lands in "other", and must still count). A
+        watchdog kill with NO `fb_started=1` (the search never started --
+        the ordinary, pre-existing case) must NOT be counted."""
+        lines = [
+            f"{ts(1)} outcome=watchdog-killed hook=pre-edit-chain.sh fb_started=1 project=demo",
+            f"{ts(1)} outcome=watchdog-killed hook=newfile-nudge.sh fb_started=1 project=demo",
+            f"{ts(1)} outcome=watchdog-killed hook=pre-edit-chain.sh project=demo",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["fallback"]["killed"], 2)
+
+        rc, out = run_stats(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertIn("killed=2", out)
+
+
 class TestStatsPreEditTopics(StatsTestBase):
     """eval-topic-logging: `pre_edit.topics_named` (how many matched/
     index-stale-served runs actually named the topics they injected),

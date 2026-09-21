@@ -1,5 +1,6 @@
 import contextlib
 import fcntl
+import hashlib
 import io
 import os
 import shutil
@@ -1172,6 +1173,289 @@ class TestF1DecisionIndexState(unittest.TestCase):
             results = json.loads(buf_out.getvalue())
             self.assertTrue(len(results) >= 0)  # proves it queried at all, not the refusal envelope
             self.assertNotIsInstance(json.loads(buf_out.getvalue()), dict)  # not the {"state":..} refusal shape
+
+    def test_search_hydrate_adds_chain_text_reusing_topic_chain_lines(self):
+        """search-fallback: --hydrate adds a chain_text field to each JSON
+        hit, holding the SAME rendering topic_chain_lines/chain_lines
+        already produce for that topic's own chain (`chain --topic`,
+        `for-path --with-chain-text`) -- one implementation, not a fourth
+        copy. Without --hydrate, no hit carries the field at all (today's
+        bare shape is unchanged)."""
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            reindex(FIXTURES / "schema", db, no_embed=True)
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="hidden files",
+                                           mode="fts", status=[], type=[], area=None, topic=None,
+                                           authority=None, limit=10, json=True, hydrate=True))
+            self.assertEqual(rc, 0)
+            results = json.loads(buf_out.getvalue())
+            self.assertTrue(results)
+            hit = results[0]
+            self.assertIn("chain_text", hit)
+            self.assertIn(hit["id"], hit["chain_text"])
+            # Cross-check against the exact same rendering `chain` itself
+            # produces for that topic -- not merely "some text came back".
+            conn = memidx.open_db_noncreating(db, project=memidx.DEFAULT_PROJECT)
+            topic_row = memidx.record_row_by_path(conn, hit["path"])
+            expected = "\n".join(memidx.topic_chain_lines(conn, topic_row))
+            conn.close()
+            self.assertEqual(hit["chain_text"], expected)
+
+            buf_out2 = io.StringIO()
+            with contextlib.redirect_stdout(buf_out2), contextlib.redirect_stderr(io.StringIO()):
+                memidx.cmd_search(ns(project=memidx.DEFAULT_PROJECT, db=str(db), query="hidden files",
+                                      mode="fts", status=[], type=[], area=None, topic=None,
+                                      authority=None, limit=10, json=True))
+            results_no_hydrate = json.loads(buf_out2.getvalue())
+            self.assertNotIn("chain_text", results_no_hydrate[0])
+
+    def test_search_read_only_refuses_legacy_schema_without_writing(self):
+        """MAJOR fix-round item a, pinning: `--read-only` must never
+        migrate a legacy schema to answer a query. Discriminating
+        fixture: `index_errors` DROPPED -- the ordinary rw path
+        (open_db_noncreating -> ensure_index_errors_table, an idempotent
+        `CREATE TABLE IF NOT EXISTS` that is a real write the moment the
+        table is actually missing) recreates it on open; `--read-only`
+        must refuse instead (state=upgrade-required, reason=index-needs-
+        migration) and leave the file byte-for-byte unchanged across 10
+        consecutive calls. A control assertion (project rule: a fix's
+        test must fail on the un-fixed code) proves the fixture really
+        is discriminating -- the SAME db opened the ordinary rw way DOES
+        write."""
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            reindex(FIXTURES / "schema", db, no_embed=True)
+            conn = sqlite3.connect(str(db))
+            conn.execute("DROP TABLE index_errors")
+            conn.commit()
+            conn.close()
+            sha_before = hashlib.sha256(db.read_bytes()).hexdigest()
+
+            for _ in range(10):
+                buf_out, buf_err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                    rc = memidx.cmd_search(ns(
+                        project=memidx.DEFAULT_PROJECT, db=str(db), query="hidden files",
+                        mode="fts", status=[], type=[], area=None, topic=None, authority=None,
+                        limit=10, json=True, hydrate=True, read_only=True,
+                    ))
+                self.assertEqual(rc, 1)
+                envelope = json.loads(buf_out.getvalue())
+                self.assertEqual(envelope, {
+                    "state": "upgrade-required", "reason": "index-needs-migration", "results": [],
+                })
+                self.assertIn("needs migration", buf_err.getvalue())
+                self.assertIn("--read-only", buf_err.getvalue())
+
+            sha_after = hashlib.sha256(db.read_bytes()).hexdigest()
+            self.assertEqual(sha_before, sha_after, "--read-only must never migrate a legacy schema")
+
+            # Control: the same file, opened the ordinary rw way, really
+            # does write (proves the fixture is discriminating).
+            conn = memidx.open_db_noncreating(db, project=memidx.DEFAULT_PROJECT)
+            conn.close()
+            sha_rw = hashlib.sha256(db.read_bytes()).hexdigest()
+            self.assertNotEqual(sha_before, sha_rw, "control: the rw path must actually write on a legacy schema")
+
+    def test_search_read_only_current_schema_returns_real_hits(self):
+        """--read-only on an ordinary, fully-migrated index behaves
+        exactly like the rw path -- rc=0, real results, no refusal."""
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            reindex(FIXTURES / "schema", db, no_embed=True)
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_search(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), query="hidden files",
+                    mode="fts", status=[], type=[], area=None, topic=None, authority=None,
+                    limit=10, json=True, hydrate=True, read_only=True,
+                ))
+            self.assertEqual(rc, 0)
+            results = json.loads(buf_out.getvalue())
+            self.assertTrue(results)
+            self.assertIn("chain_text", results[0])
+
+    def _build_link_fixture(self, db: Path, n_links: int, project: str = memidx.DEFAULT_PROJECT):
+        """A synthetic topic with `n_links` links, each carrying a long
+        ruling_text -- built directly via SQL (no markdown authoring
+        needed) so the byte-cap tests below control the exact size."""
+        conn = memidx.open_db(db, project=project)
+        now = time.time()
+        conn.execute(
+            "INSERT INTO records (path, sha256, mtime, size, project, id, title, type, status, "
+            "area, topic, body, source_path) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("synth.md", "deadbeef", now, 100, project, "TOP-9999", "Synthetic capped topic",
+             "topic", "active", "a", "t", "body text", "synth.md"),
+        )
+        # The `fts` virtual table is populated explicitly by reindex's own
+        # build_record path, never by a trigger -- a raw INSERT into
+        # `records` alone (as this synthetic fixture does, to control the
+        # exact byte size) leaves it unsearchable without this.
+        conn.execute(
+            "INSERT INTO fts (path, project, title, body, ruling_text) VALUES (?,?,?,?,?)",
+            ("synth.md", project, "Synthetic capped topic", "body text",
+             " ".join("ruling text " * 20 for _ in range(1))),
+        )
+        for i in range(n_links):
+            conn.execute(
+                "INSERT INTO links (topic_path, project, link, seq, date, kind, status, "
+                "ruling_text, ruling_authority) VALUES (?,?,?,?,?,?,?,?,?)",
+                ("synth.md", project, f"L{i + 1}", i + 1, "2020-01-01", "ruling",
+                 "active" if i == n_links - 1 else "historical",
+                 "ruling text " * 20 + f" link {i + 1}", "owner-ratified"),
+            )
+        conn.commit()
+        conn.close()
+
+    def test_hydrate_max_bytes_caps_a_sixteen_link_topic_with_marker(self):
+        """MAJOR fix-round item c, pinning: a 16-link topic hydrated with
+        no cap measures well past 2000 bytes -- capped at the default,
+        chain_text stays under the cap and carries the omission marker."""
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            self._build_link_fixture(db, 16)
+            conn = memidx.open_db_noncreating(db, project=memidx.DEFAULT_PROJECT)
+            topic_row = memidx.record_row_by_path(conn, "synth.md")
+            uncapped = "\n".join(memidx.topic_chain_lines(conn, topic_row))
+            conn.close()
+            self.assertGreater(len(uncapped.encode("utf-8")), 2000, "fixture must exceed the default cap")
+
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_search(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), query="ruling",
+                    mode="fts", status=[], type=[], area=None, topic=None, authority=None,
+                    limit=10, json=True, hydrate=True, hydrate_max_bytes=2000,
+                ))
+            self.assertEqual(rc, 0)
+            results = json.loads(buf_out.getvalue())
+            self.assertTrue(results)
+            chain_text = results[0]["chain_text"]
+            self.assertLessEqual(len(chain_text.encode("utf-8")), 2000)
+            self.assertIn("omitted", chain_text)
+            self.assertIn("L16", chain_text)   # current link always kept in full
+
+    def test_hydrate_max_bytes_no_marker_when_under_cap(self):
+        """A 2-link topic fits comfortably under the default cap -- no
+        marker, and the capped render is BYTE-IDENTICAL to the uncapped
+        topic_chain_lines (the oracle-parity property topic_chain_lines_
+        capped's own docstring promises)."""
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            self._build_link_fixture(db, 2)
+            conn = memidx.open_db_noncreating(db, project=memidx.DEFAULT_PROJECT)
+            topic_row = memidx.record_row_by_path(conn, "synth.md")
+            uncapped = "\n".join(memidx.topic_chain_lines(conn, topic_row))
+            conn.close()
+
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_search(ns(
+                    project=memidx.DEFAULT_PROJECT, db=str(db), query="ruling",
+                    mode="fts", status=[], type=[], area=None, topic=None, authority=None,
+                    limit=10, json=True, hydrate=True, hydrate_max_bytes=2000,
+                ))
+            self.assertEqual(rc, 0)
+            results = json.loads(buf_out.getvalue())
+            chain_text = results[0]["chain_text"]
+            self.assertNotIn("omitted", chain_text)
+            self.assertEqual(chain_text, uncapped)
+
+    def _build_single_oversized_link_fixture(self, db: Path, project: str = memidx.DEFAULT_PROJECT):
+        """ONE link, deliberately larger than any cap this test exercises
+        (a 5000-char ruling AND a 5000-char rationale) -- the round-2
+        fixture's own ~240-byte links could never expose the "current
+        link kept whole regardless of budget" bug (MAJOR fix-round item
+        c, re-gate round 3): a single link smaller than every cap under
+        test never needs the degrade path at all."""
+        conn = memidx.open_db(db, project=project)
+        now = time.time()
+        conn.execute(
+            "INSERT INTO records (path, sha256, mtime, size, project, id, title, type, status, "
+            "area, topic, body, source_path) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("single.md", "deadbeef", now, 100, project, "TOP-8888", "Single link topic",
+             "topic", "active", "a", "t", "body text", "single.md"),
+        )
+        conn.execute(
+            "INSERT INTO fts (path, project, title, body, ruling_text) VALUES (?,?,?,?,?)",
+            ("single.md", project, "Single link topic", "body text", "x" * 5000),
+        )
+        conn.execute(
+            "INSERT INTO links (topic_path, project, link, seq, date, kind, status, "
+            "ruling_text, ruling_authority, rationale_text, rationale_authority) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            ("single.md", project, "L1", 1, "2020-01-01", "ruling", "active",
+             "x" * 5000, "owner-ratified", "y" * 5000, "agent-inference"),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_hydrate_max_bytes_hard_cap_never_exceeded_single_oversized_link(self):
+        """Re-gate round 3, MAJOR 3, pinning: the round-2 cap was SOFT --
+        the current link was rendered in full regardless of budget, and
+        the marker/broken-assumptions lines were appended AFTER budgeting
+        (measured on the real bug: cap 1660 rendered 1691, caps 500/100/10
+        all rendered the same 665 bytes). A single link far larger than
+        any cap under test must never let `chain_text` exceed that cap,
+        for every cap from a generous 2000 bytes down to a pathological
+        10 -- the hard-cap property this function's own docstring now
+        promises ("never exceed the cap by even one byte").
+
+        Re-gate round 4 finding: byte-cap compliance ALONE does not prove
+        anything real survived -- a mutation that drops the current
+        link's own rendering entirely (header only, regardless of
+        budget) still trivially satisfies "len(...) <= cap" for every cap
+        here (header-only is always small). For every cap large enough to
+        hold the header PLUS at least a sliver of the current link's own
+        ruling head (`cap > header_bytes`, computed directly off the same
+        _chain_header_line production code, not hardcoded), the topic id
+        ("TOP-8888", present in the header too, but ALSO the thing this
+        assertion is checking survives end to end) AND the link's own
+        date ("2020-01-01", which appears ONLY inside the ruling head
+        line, never in the header -- the genuinely discriminating check)
+        must both still be present. Below that threshold (cap=10 here),
+        the header itself does not fit either -- round 4 also fixed that
+        case to emit an explicit marker rather than a silently truncated,
+        plausible-looking-but-wrong header; asserted here as the topic id
+        NOT appearing (a truncated header would very likely still show
+        it, since "TOP-8888" is the header's own first token)."""
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "idx.sqlite"
+            self._build_single_oversized_link_fixture(db)
+            conn = memidx.open_db_noncreating(db, project=memidx.DEFAULT_PROJECT)
+            topic_row = memidx.record_row_by_path(conn, "single.md")
+            link_rows = conn.execute(
+                "SELECT * FROM links WHERE topic_path=? ORDER BY seq ASC", (topic_row["path"],)
+            ).fetchall()
+            current_link = memidx._chain_current_link(link_rows)
+            header = memidx._chain_header_line(topic_row, current_link)
+            header_bytes = len(header.encode("utf-8"))
+            conn.close()
+
+            for cap in (10, 100, 500, 1660, 2000):
+                with self.subTest(cap=cap):
+                    buf_out, buf_err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                        rc = memidx.cmd_search(ns(
+                            project=memidx.DEFAULT_PROJECT, db=str(db), query="single",
+                            mode="fts", status=[], type=[], area=None, topic=None, authority=None,
+                            limit=10, json=True, hydrate=True, hydrate_max_bytes=cap,
+                        ))
+                    self.assertEqual(rc, 0)
+                    results = json.loads(buf_out.getvalue())
+                    self.assertTrue(results)
+                    chain_text = results[0]["chain_text"]
+                    self.assertLessEqual(
+                        len(chain_text.encode("utf-8")), cap,
+                        f"cap={cap} exceeded: {len(chain_text.encode('utf-8'))} bytes",
+                    )
+                    if cap > header_bytes:
+                        self.assertIn("TOP-8888", chain_text, f"cap={cap}")
+                        self.assertIn("2020-01-01", chain_text, f"cap={cap} (ruling head dropped)")
+                    else:
+                        self.assertNotIn("TOP-8888", chain_text, f"cap={cap}: expected the cap-too-small marker")
 
     def test_for_path_missing_or_uninitialized_exits_3_with_named_state(self):
         # Final-fix-wave item 3: a bare `[]` under --json no longer tells a

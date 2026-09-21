@@ -582,15 +582,22 @@ print("MOVED_ROOTS=" + shlex.quote("\n".join(moved_lines)))
 ' "$state_file" 2>>"$MC_LOG"
 }
 
-# mc_update_state_json STATE_FILE PY_TRANSFORM
+# mc_update_state_json STATE_FILE PY_TRANSFORM [DEADLINE_SECONDS]
 #
 # The one shared "lock + atomic-rename JSON update" primitive. Everything --
 # acquiring the lock, loading the existing state, running the transform, and
 # the atomic write -- happens inside ONE python process (macOS port: no
 # `flock`/`timeout` binary involved anywhere). That process:
 #   1. opens STATE_FILE.lock and takes a real fcntl.flock(LOCK_EX), retried
-#      non-blocking every ~20ms up to a 2s deadline -- exits 97 (mapped to
+#      non-blocking every ~20ms up to DEADLINE_SECONDS (default 2.0, every
+#      pre-existing caller's own unchanged behavior) -- exits 97 (mapped to
 #      outcome=lock-timeout below) if the deadline passes without the lock.
+#      Re-gate round 3, MAJOR 1: a caller whose OWN total budget is tight
+#      (the search fallback's titling write, running under the SAME 2s
+#      watchdog its query already spent most of) passes a short
+#      DEADLINE_SECONDS instead of eating the full 2.0s default -- see
+#      hooks/mc-fallback-lib.sh's own mc_fallback_write_state, the ONE
+#      caller that does this today.
 #   2. loads STATE_FILE (or {} if missing/corrupt/unreadable) into `state`.
 #   3. runs PY_TRANSFORM (spliced in verbatim at column 0, exactly as
 #      before) against it -- it may read any MC_*-prefixed env var the
@@ -620,12 +627,13 @@ print("MOVED_ROOTS=" + shlex.quote("\n".join(moved_lines)))
 mc_update_state_json() {
     local state_file="$1"
     local py_transform="$2"
+    local deadline_s="${3:-2.0}"
     local state_dir
     state_dir="$(dirname "$state_file")"
     mkdir -p "$state_dir" 2>/dev/null || { mc_log "outcome=state-dir-failed dir=$state_dir"; return 1; }
 
     local rc
-    env PYTHONPATH= "$MC_PY" -c "
+    env PYTHONPATH= MC_DEADLINE_S="$deadline_s" "$MC_PY" -c "
 import atexit, fcntl, io, json, os, sys, time
 
 state_file = sys.argv[1]
@@ -636,7 +644,11 @@ try:
 except OSError:
     sys.exit(98)
 
-_deadline = time.time() + 2.0
+try:
+    _deadline_s = float(os.environ.get('MC_DEADLINE_S', '2.0') or '2.0')
+except ValueError:
+    _deadline_s = 2.0
+_deadline = time.time() + _deadline_s
 _locked = False
 while True:
     try:
