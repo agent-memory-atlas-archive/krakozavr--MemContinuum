@@ -2071,7 +2071,7 @@ Topic-chain rules:
 | a `standing:` entry names a link id not in that topic | error |
 | a `standing:` entry's link is not `status: active` | error — even a valid successor does not clear it; the supersession and the pointer's own update/removal must land in the same commit |
 | a `standing:` entry's link's `ruling.authority` is not `owner-verbatim`/`owner-ratified` | error |
-| a `standing:` entry's link's `ruling.text` contains a CR or LF (a YAML block scalar, most often) | error — projected verbatim into an agent's context, unframed; flatten it to one line |
+| a `standing:` entry's link's `ruling.text` contains a raw CR or LF (a YAML block scalar, most often) | error — flatten it to one line. Any OTHER line/paragraph separator (U+2028, U+2029, NEL, a tab) is not an error here — `standing_line` collapses it to one space at projection time |
 | the store-wide `standing:` set (every topic's pointers together, in the projection's own order) exceeds 24 links or 4,800 bytes (UTF-8) of the complete digest (header, every line, and the newlines joining them) | error (corpus-wide; names every topic whose pointer sits past whichever line is crossed first) |
 
 Concept-record rules (`type: concept` files). `--code-root` is repeatable —

@@ -184,8 +184,10 @@ copied inline.
 - a `standing:` entry whose link is not `status: active` → error, even when the link was superseded
   by a valid successor — the supersession and the pointer update (or removal) must land together
 - a `standing:` entry whose link's `ruling.authority` is not `owner-verbatim`/`owner-ratified` → error
-- a `standing:` entry whose link's `ruling.text` contains a line break → error; a multi-line ruling
-  is projected verbatim into an agent's context, unframed — flatten it to one line
+- a `standing:` entry whose link's `ruling.text` contains a raw CR or LF → error; flatten it to one
+  line. Any OTHER line/paragraph separator (U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR,
+  U+0085 NEL, a tab) is not an error here — `memidx.py standing` collapses it to one space at
+  projection time, so it still reaches an agent's context as a single physical line
 - the store-wide `standing:` set — every topic's pointers, together — exceeding 24 links or 4,800
   bytes (UTF-8) of the complete digest `memidx.py standing` would emit (header, every line, and the
   newlines joining them), whichever line is crossed first → error, naming every topic whose pointer

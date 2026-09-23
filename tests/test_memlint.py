@@ -2775,7 +2775,7 @@ class TestStandingDigest(unittest.TestCase):
         errors, _ = self._lint({"topics/t.md": topic})
         self.assertTrue(
             any(
-                "standing link" in e and "'L1'" in e and "line break" in e
+                "standing link" in e and "'L1'" in e and "CR or LF" in e
                 for e in errors
             ),
             errors,
@@ -2784,7 +2784,23 @@ class TestStandingDigest(unittest.TestCase):
     def test_single_line_ruling_text_on_a_standing_link_is_unaffected(self):
         topic = _standing_topic("TOP-9508", ["L2"], ruling_text="a perfectly ordinary one-line ruling")
         errors, _ = self._lint({"topics/t.md": topic})
-        self.assertFalse(any("line break" in e for e in errors), errors)
+        self.assertFalse(any("CR or LF" in e for e in errors), errors)
+
+    def test_other_unicode_separators_are_not_rejected_by_lint(self):
+        """Fix-round MINOR (Grok): lint rejects only a raw CR/LF -- every
+        other Unicode line/paragraph separator (U+2028, U+2029, NEL) is
+        left to `standing_line`'s own runtime collapse, not an error here.
+        A YAML double-quoted scalar can carry these via a \\u escape
+        without ever looking like a block scalar."""
+        topic = (
+            "---\ntype: topic\nid: TOP-9509\ntitle: Unicode separator topic\narea: testing\n"
+            "current: L1\nstanding: [L1]\nlinks:\n"
+            "  - link: L1\n    date: 2026-01-01\n    status: active\n    kind: adopted\n"
+            '    ruling: {text: "first\\u2028second", authority: owner-verbatim, source: s}\n'
+            "    recorded_by: agent\n    recorded_at: 2026-01-01\n---\n\nBody.\n"
+        )
+        errors, _ = self._lint({"topics/t.md": topic})
+        self.assertFalse(any("CR or LF" in e for e in errors), errors)
 
     def _cap_topics(self, n: int, chars_each: int = 10) -> dict:
         files = {}
@@ -2831,6 +2847,48 @@ class TestStandingDigest(unittest.TestCase):
         self.assertEqual(len(cap_errors), 1, errors)
         self.assertIn("bytes", cap_errors[0])
         self.assertIn("TOP-2000", cap_errors[0])
+
+    def _find_cyrillic_n_for_exact_bytes(self, target_bytes):
+        """Same construction as test_memidx.py's runtime twin -- solves
+        for (pad, n) such that a single standing line's complete digest is
+        EXACTLY target_bytes, using 2-byte Cyrillic (U+0424) steps plus an
+        optional 1-byte ASCII pad for parity."""
+        def digest_bytes(pad, n):
+            line = memidx.standing_line("TOP-2010", "L2", "owner-verbatim", pad + "Ф" * n)
+            return len(memidx.standing_digest_text([line]).encode("utf-8"))
+
+        for pad in ("", "."):
+            zero = digest_bytes(pad, 0)
+            remainder = target_bytes - zero
+            if remainder >= 0 and remainder % 2 == 0:
+                n = remainder // 2
+                if digest_bytes(pad, n) == target_bytes:
+                    return pad, n
+        raise AssertionError(f"could not construct an exact {target_bytes}-byte fixture")
+
+    def test_lint_cap_boundary_is_exact_bytes_not_characters(self):
+        """Fix-round TESTS (both reviewers): the lint-time twin of the
+        runtime boundary test -- a wrong char-counting implementation
+        would let a Cyrillic set roughly twice the byte size it claims
+        pass as clean. Exactly STANDING_CAP_BYTES must lint clean;
+        STANDING_CAP_BYTES + 1 must be the ONE cap error, naming the
+        topic."""
+        cap = memidx.STANDING_CAP_BYTES
+
+        pad_ok, n_ok = self._find_cyrillic_n_for_exact_bytes(cap)
+        topic_ok = _standing_topic("TOP-2010", ["L2"], ruling_text=pad_ok + "Ф" * n_ok, link_authority="owner-verbatim")
+        errors, _ = self._lint({"topics/t.md": topic_ok})
+        self.assertFalse(
+            any("exceeds the store-wide cap" in e for e in errors),
+            f"exactly {cap} bytes must lint clean: {errors}",
+        )
+
+        pad_over, n_over = self._find_cyrillic_n_for_exact_bytes(cap + 1)
+        topic_over = _standing_topic("TOP-2010", ["L2"], ruling_text=pad_over + "Ф" * n_over, link_authority="owner-verbatim")
+        errors, _ = self._lint({"topics/t.md": topic_over})
+        cap_errors = [e for e in errors if "exceeds the store-wide cap" in e]
+        self.assertEqual(len(cap_errors), 1, f"{cap + 1} bytes must be the one cap error: {errors}")
+        self.assertIn("TOP-2010", cap_errors[0])
 
     def test_under_cap_on_both_axes_is_clean(self):
         files = self._cap_topics(memlint.STANDING_CAP_LINKS, chars_each=10)

@@ -1843,7 +1843,36 @@ def cmd_reindex(args) -> int:
                         )
                         migrated = True
                     else:
-                        if generation < CURRENT_INDEX_GENERATION:
+                        # Fix-round MAJOR (Grok + Codex Terra, both
+                        # independently, Grok measured): a generation AHEAD
+                        # of this engine's own CURRENT_INDEX_GENERATION used
+                        # to fall straight through -- no `>` branch existed
+                        # -- and the ordinary reindex below then re-stamped
+                        # the OLDER (this engine's own) generation number,
+                        # silently dropping whatever column only the newer
+                        # generation populates (a real reproduction: a
+                        # generation-7 db with a future-only column comes
+                        # back at generation 6, that column NULLed, after
+                        # one `--auto` pass -- exactly what post-commit-
+                        # reindex.sh runs on every store commit). Refused
+                        # HERE, on this read-only probe connection, strictly
+                        # BEFORE `open_db` below ever runs a migration guard
+                        # -- mirrors `open_code_db`'s own CodeIndexTooNew
+                        # refusal for the code index, and `standing`'s own
+                        # generation-ahead refusal (`_classify_index_state`)
+                        # for readers; this is the write path's own version
+                        # of the same rule. No write of any kind happens on
+                        # this branch -- the probe connection never left
+                        # SELECT statements, and returns before `open_db`.
+                        if generation > CURRENT_INDEX_GENERATION:
+                            print(
+                                f"reindex: index generation {generation} is newer than this "
+                                f"engine ({CURRENT_INDEX_GENERATION}); refusing to touch it -- "
+                                "upgrade the engine, or point --db at a different file",
+                                file=sys.stderr,
+                            )
+                            return 2
+                        elif generation < CURRENT_INDEX_GENERATION:
                             migrated = True
         except sqlite3.OperationalError:
             pass

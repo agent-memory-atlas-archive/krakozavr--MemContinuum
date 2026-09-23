@@ -5793,6 +5793,69 @@ class TestStandingCommand(unittest.TestCase):
             self.assertEqual(payload["reason"], "over-cap")
             self.assertEqual(payload["lines"], [], "over cap must refuse, never truncate")
 
+    def _find_cyrillic_n_for_exact_bytes(self, target_bytes):
+        """Solves for (pad, n) such that the complete digest of ONE line
+        (topic TOP-9670 link L1, owner-verbatim, `pad + "Ф" * n` as the
+        ruling text) is EXACTLY `target_bytes` -- a Cyrillic char (U+0424)
+        is 2 UTF-8 bytes, so a plain char-counting implementation would
+        compute a smaller total than a byte-counting one for the same
+        text, and only the byte-correct boundary test below can catch
+        that confusion. `pad` (a single ASCII "." or "") fixes parity when
+        the fixed (non-Cyrillic) prefix/suffix bytes and target_bytes
+        differ by an odd number -- Cyrillic-only steps move by 2 bytes at
+        a time and can never land on an odd offset alone."""
+        def digest_bytes(pad, n):
+            line = memidx.standing_line("TOP-9670", "L1", "owner-verbatim", pad + "Ф" * n)
+            return len(memidx.standing_digest_text([line]).encode("utf-8"))
+
+        for pad in ("", "."):
+            zero = digest_bytes(pad, 0)
+            remainder = target_bytes - zero
+            if remainder >= 0 and remainder % 2 == 0:
+                n = remainder // 2
+                if digest_bytes(pad, n) == target_bytes:
+                    return pad, n
+        raise AssertionError(f"could not construct an exact {target_bytes}-byte fixture")
+
+    def test_runtime_cap_boundary_is_exact_bytes_not_characters(self):
+        """Fix-round TESTS (both reviewers): pins the EXACT byte boundary,
+        not merely "way over" -- a wrong implementation that counts
+        CHARACTERS instead of UTF-8 bytes would, for Cyrillic text, compute
+        roughly half the real byte total and let a set through that is
+        actually well past the cap (each Cyrillic char is 2 bytes, 1
+        character). At exactly STANDING_CAP_BYTES it must serve; at
+        STANDING_CAP_BYTES + 1 it must refuse."""
+        cap = memidx.STANDING_CAP_BYTES
+
+        pad_ok, n_ok = self._find_cyrillic_n_for_exact_bytes(cap)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "t.md", _standing_topic(
+                "TOP-9670", "L1", ["L1"], text=pad_ok + "Ф" * n_ok,
+            ))
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            rc, out = self._run(db, root=root)
+            payload = json.loads(out)
+            self.assertEqual(payload.get("bytes"), cap, payload)
+            self.assertEqual(rc, 0, f"exactly {cap} bytes must serve: {out}")
+
+        pad_over, n_over = self._find_cyrillic_n_for_exact_bytes(cap + 1)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "t.md", _standing_topic(
+                "TOP-9670", "L1", ["L1"], text=pad_over + "Ф" * n_over,
+            ))
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+            rc, out = self._run(db, root=root)
+            self.assertEqual(rc, 1, f"{cap + 1} bytes must refuse: {out}")
+            payload = json.loads(out)
+            self.assertEqual(payload.get("bytes"), cap + 1, payload)
+            self.assertEqual(payload["reason"], "over-cap")
+
     def test_defensive_flattening_of_an_embedded_newline_at_read_time(self):
         """Fix-round MAJOR (both reviewers): `standing_line`'s own
         flattening is the SECOND layer -- this proves it holds even for a
@@ -5829,6 +5892,60 @@ class TestStandingCommand(unittest.TestCase):
             # flattened pointer) -- never 3, which a raw embedded newline
             # would have produced.
             self.assertEqual(len(plain.splitlines()), 2, plain)
+
+    def test_flattener_handles_every_separator_not_just_lf(self):
+        """Fix-round TESTS (both reviewers): pins that `standing_line`
+        handles every line/paragraph separator memlint's own CR/LF-only
+        lint rule does NOT reject -- \\r\\n, U+2028 LINE SEPARATOR, U+2029
+        PARAGRAPH SEPARATOR, U+0085 NEL, and a bare tab -- each collapsing
+        to a single physical line, not merely bare \\n (which the earlier
+        defensive-flattening test above already covers end to end)."""
+        separators = {
+            "CRLF": "\r\n",
+            "LS (U+2028)": " ",
+            "PS (U+2029)": " ",
+            "NEL (U+0085)": "",
+            "TAB": "\t",
+        }
+        for name, sep in separators.items():
+            with self.subTest(separator=name):
+                line = memidx.standing_line("TOP-9671", "L1", "owner-verbatim", f"first{sep}second")
+                self.assertEqual(len(line.splitlines()), 1, repr(line))
+                self.assertNotIn("\n", line)
+                self.assertNotIn("\r", line)
+                self.assertIn("first second", line)
+
+    def test_hash_changes_with_one_byte_and_is_stable_across_runs(self):
+        """Fix-round TESTS (both reviewers): the hash is neither a
+        constant nor insensitive to content -- changing a single byte of
+        a single line changes it, and re-running against unchanged
+        content reproduces the identical hash (the dedupe rule depends on
+        both halves being true)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "t.md", _standing_topic(
+                "TOP-9672", "L1", ["L1"], text="the original sentence",
+            ))
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+
+            _, out_a = self._run(db, root=root)
+            _, out_b = self._run(db, root=root)
+            hash_a = json.loads(out_a)["hash"]
+            hash_b = json.loads(out_b)["hash"]
+            self.assertEqual(hash_a, hash_b, "identical content across two runs must hash identically")
+
+            conn = sqlite3.connect(str(db))
+            conn.execute(
+                "UPDATE links SET ruling_text=? WHERE link='L1'",
+                ("the original sentencd",),  # one byte changed: e -> d
+            )
+            conn.commit(); conn.close()
+
+            _, out_c = self._run(db, root=root)
+            hash_c = json.loads(out_c)["hash"]
+            self.assertNotEqual(hash_a, hash_c, "a one-byte content change must change the hash")
 
 
 class TestStandingReadOnlyAndGenerationGuard(unittest.TestCase):
@@ -5941,6 +6058,58 @@ class TestStandingReadOnlyAndGenerationGuard(unittest.TestCase):
             self.assertEqual(
                 memidx.decision_index_state_readonly(db, memidx.DEFAULT_PROJECT), "upgrade-required"
             )
+
+
+class TestReindexRefusesAGenerationAheadIndex(unittest.TestCase):
+    """Fix-round MAJOR (Grok + Codex Terra, independently, Grok measured):
+    the WRITE-side half of the old-engine ping-pong -- `cmd_reindex` had no
+    `>` branch at all; every successful run unconditionally re-stamped
+    CURRENT_INDEX_GENERATION, silently downgrading a generation-ahead
+    index and dropping whatever column only that newer generation
+    populates. Grok's own reproduction, reused verbatim: build with this
+    engine, force the stamp to generation 7, add a `future_only` column
+    with a real value, then `reindex --no-embed --auto`."""
+
+    def test_future_only_fixture_is_refused_generation_and_column_intact(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            _write_record(root / "topics" / "t.md", _standing_topic("TOP-9730", "L1", ["L1"]))
+            db = Path(td) / "idx.sqlite"
+            with contextlib.redirect_stdout(io.StringIO()):
+                reindex(root, db, no_embed=True)
+
+            conn = sqlite3.connect(str(db))
+            conn.execute(
+                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', '7')"
+            )
+            conn.execute("ALTER TABLE records ADD COLUMN future_only TEXT")
+            conn.execute("UPDATE records SET future_only='KEEP' WHERE type='topic'")
+            conn.commit()
+            conn.close()
+
+            sha_before = hashlib.sha256(db.read_bytes()).hexdigest()
+
+            args = ns(root=str(root), db=str(db), project=memidx.DEFAULT_PROJECT,
+                      full=False, no_embed=True, auto=True)
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = memidx.cmd_reindex(args)
+            self.assertNotEqual(rc, 0, buf_out.getvalue() + buf_err.getvalue())
+            self.assertIn("newer than this engine", buf_err.getvalue())
+
+            sha_after = hashlib.sha256(db.read_bytes()).hexdigest()
+            self.assertEqual(sha_before, sha_after, "a refused reindex must write nothing at all")
+
+            conn = sqlite3.connect(str(db))
+            gen = conn.execute(
+                "SELECT value FROM db_meta WHERE key='index_generation'"
+            ).fetchone()[0]
+            future_only = conn.execute(
+                "SELECT future_only FROM records WHERE type='topic'"
+            ).fetchone()[0]
+            conn.close()
+            self.assertEqual(gen, "7", "generation must stay exactly as it was, never downgraded")
+            self.assertEqual(future_only, "KEEP", "a column only the newer generation populates must survive")
 
 
 if __name__ == "__main__":

@@ -231,6 +231,13 @@ if "hash" in obj:
     except OSError:
         pass
     print("ok - %d %s %d" % (obj.get("links", 0), obj.get("hash", "-"), obj.get("bytes", 0)))
+elif "reason" in obj:
+    # Fix-round MINOR (Grok): the over-cap envelope carries "reason":
+    # "over-cap" and no "state" at all -- falling into the generic
+    # obj.get("state", "unknown") branch below used to report this as
+    # `standing=skipped-unknown`, losing the one piece of information
+    # (the store is over its own cap) an operator most needs to see.
+    print("refused %s 0 - 0" % obj.get("reason", "unknown"))
 else:
     print("refused %s 0 - 0" % obj.get("state", "unknown"))
 ' "$json_out" "$text_tmp" >"$meta_tmp" 2>>"$MC_LOG"
@@ -280,8 +287,62 @@ print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "addit
 # nudge exactly ONCE per session (a state flag, compare-and-set inside
 # ONE locked transform, same race-safety shape as the hash write) --
 # never a repeat nag on every subsequent SessionStart in the same run.
-STANDING_UPGRADE_HINT_TEXT="Standing decisions unavailable: the decision index needs a reindex -- run memcontinuum-update.sh --apply"
 STANDING_HINT_CTX=""
+STANDING_UPGRADE_FACT_FALLBACK="Standing decisions unavailable this session: the decision index generation does not match this engine's."
+
+# mc_standing_upgrade_fact -- prints ONE line, a FACT stated to the human,
+# never a verb addressed to the model. Fix-round MINOR (both reviewers):
+# the previous wording ("run memcontinuum-update.sh --apply") was an
+# IMPERATIVE sitting inside additionalContext, against this hook's own
+# "never an imperative" rule (see the header comment above) -- an agent
+# with shell access could simply run it, and --apply walks and re-renders
+# every wired project, not just this one. Reads the real generation
+# numbers itself (mode=ro, no write -- STANDING_STATUS alone only carries
+# the state name, never the numbers) so the fact names them, and says
+# which direction the mismatch runs: a BEHIND index has a real repair
+# (`memcontinuum-update.sh --apply` reindexes it, stated as a fact about
+# what that command does, not a command aimed at the reader); an AHEAD
+# index has no repair this hook can name -- reindexing it here would only
+# be refused by the write-side generation guard, so the fact says what is
+# true (this checkout is older) and stops there.
+mc_standing_upgrade_fact() {
+    local gen_tmp
+    gen_tmp="$(mktemp 2>/dev/null)" || { printf '%s' "$STANDING_UPGRADE_FACT_FALLBACK"; return; }
+    env PYTHONPATH= "$MC_PY" -c '
+import sqlite3, sys
+
+sys.path.insert(0, sys.argv[2])
+import memidx
+
+db = sys.argv[1]
+g = None
+try:
+    conn = sqlite3.connect("file:" + db + "?mode=ro", uri=True)
+    row = conn.execute("SELECT value FROM db_meta WHERE key=" + chr(39) + "index_generation" + chr(39)).fetchone()
+    conn.close()
+    if row is not None:
+        g = int(row[0])
+except Exception:
+    g = None
+c = memidx.CURRENT_INDEX_GENERATION
+print((str(g) if g is not None else "?") + " " + str(c))
+' "$MC_DB_PATH" "$(dirname "$MC_MEMIDX")" >"$gen_tmp" 2>>"$MC_LOG"
+    local gen cur
+    read -r gen cur <"$gen_tmp" 2>/dev/null
+    rm -f "$gen_tmp" 2>/dev/null
+
+    if [ -z "${gen:-}" ] || [ "$gen" = "?" ]; then
+        printf '%s' "$STANDING_UPGRADE_FACT_FALLBACK"
+        return
+    fi
+    if [ "$gen" -lt "$cur" ] 2>/dev/null; then
+        printf 'Standing decisions unavailable this session: the decision index predates this engine (generation %s < %s); memcontinuum-update.sh --apply repairs it.' "$gen" "$cur"
+    elif [ "$gen" -gt "$cur" ] 2>/dev/null; then
+        printf 'Standing decisions unavailable this session: the decision index is newer than this engine (generation %s > %s); this checkout is older than whatever last reindexed it.' "$gen" "$cur"
+    else
+        printf '%s' "$STANDING_UPGRADE_FACT_FALLBACK"
+    fi
+}
 
 mc_maybe_upgrade_hint() {
     STANDING_HINT_CTX=""
@@ -310,7 +371,7 @@ print(json.dumps(state))
     fi
     rm -f "$hint_tmp" 2>/dev/null
     if [ "$verdict" = "new" ]; then
-        STANDING_HINT_CTX="$STANDING_UPGRADE_HINT_TEXT"
+        STANDING_HINT_CTX="$(mc_standing_upgrade_fact)"
     fi
 }
 

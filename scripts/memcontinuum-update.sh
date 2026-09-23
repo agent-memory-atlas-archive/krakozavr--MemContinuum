@@ -639,7 +639,22 @@ print(rel + " " + str(g) + " " + str(c))
     read -r relword gen cur <"$rel_tmp" 2>/dev/null
     rm -f "$rel_tmp" 2>/dev/null
 
-    [ "${relword:-}" = "behind" ] || return 0
+    case "${relword:-}" in
+        behind) ;;
+        ahead)
+            # Fix-round MAJOR (Grok + Codex Terra, independently): the
+            # OTHER half of the old-engine ping-pong -- an index a NEWER
+            # engine already wrote. --apply must never attempt to reindex
+            # this: `memidx.py reindex` itself now refuses a generation
+            # ahead of its own (the write-side half of the same guard,
+            # memidx.py's cmd_reindex preflight), and even if it did not,
+            # this OLDER engine has no business rewriting a newer index's
+            # rows. Reported only -- named, never touched.
+            echo "  index: generation ahead for $project (generation ${gen:-?} > ${cur:-?}) -- $store -- this engine is OLDER than whatever last reindexed it; do not run reindex here (upgrade this checkout, or point it at a different MEMCONTINUUM_HOME)" >&2
+            return 0
+            ;;
+        *) return 0 ;;
+    esac
 
     echo "  index: upgrade-required for $project (generation ${gen:-?} < ${cur:-?}) -- $store" >&2
     if [ "$APPLY" -eq 1 ]; then

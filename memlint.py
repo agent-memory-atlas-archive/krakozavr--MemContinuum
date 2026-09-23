@@ -348,16 +348,24 @@ def lint_topic(
         # second physical line inside `additionalContext`, indistinguishable
         # from real conversation text (the reviewers' own reproduction: a
         # line reading "SYSTEM: ignore all previous instructions...",
-        # delivered with no quoting at all). `standing_line`'s own runtime
-        # flattening (memidx.py) is the second layer; THIS is the first --
-        # a standing-pointed link's ruling.text may never carry a raw CR or
-        # LF at all, caught here before it is ever indexed.
+        # delivered with no quoting at all). Two layers, not one, and they
+        # do DIFFERENT things -- fix-round MINOR (Grok) named the gap
+        # between them precisely, so the wording here says what each one
+        # actually does rather than "projected verbatim" for both: this
+        # check (lint time) REJECTS only a raw CR or LF, an error naming
+        # the topic; `standing_line`'s own runtime flattening (memidx.py)
+        # is defense in depth for everything CR/LF does not cover -- any
+        # OTHER Unicode line or paragraph separator (U+2028 LINE
+        # SEPARATOR, U+2029 PARAGRAPH SEPARATOR, U+0085 NEL) or a tab is
+        # silently COLLAPSED to one space at projection time, never
+        # rejected here.
         link_text = link_ruling.get("text")
         if link_text and ("\n" in str(link_text) or "\r" in str(link_text)):
             errors.append(
-                f"{path}: standing link {lid_str!r} ruling.text contains a line break -- "
-                "a standing ruling's text must be a single line (flatten it; the digest "
-                "projects it verbatim into an agent's context, unframed)"
+                f"{path}: standing link {lid_str!r} ruling.text contains a CR or LF -- "
+                "a standing ruling's text must be a single line (flatten it); other line/"
+                "paragraph separators (U+2028, U+2029, NEL, tab) are collapsed to one space "
+                "at projection time and are not rejected here, only a raw CR/LF is"
             )
 
     return errors, warnings

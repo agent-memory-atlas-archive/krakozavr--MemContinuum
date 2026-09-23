@@ -676,6 +676,30 @@ class TestUpdateIndexUpgradeRequired(UpdateTestBase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("upgrade-required", proc.stderr)
 
+    def test_generation_ahead_is_named_and_never_reindexed(self):
+        """Fix-round MAJOR (Grok + Codex Terra, independently): the OTHER
+        direction of the ping-pong -- an index a NEWER engine already
+        wrote. Check mode must NAME it (previously silent unless behind),
+        and --apply must never attempt to reindex it -- memidx.py reindex
+        itself now refuses a generation ahead of its own, and this older
+        engine has no business rewriting a newer index's rows regardless."""
+        db = self._build_index_at_generation(memidx.CURRENT_INDEX_GENERATION + 1)
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(
+            f"index: generation ahead for proj (generation "
+            f"{memidx.CURRENT_INDEX_GENERATION + 1} > {memidx.CURRENT_INDEX_GENERATION})",
+            proc.stderr,
+        )
+
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("index reindexed", proc.stdout)
+        conn = sqlite3.connect(str(db))
+        gen = conn.execute("SELECT value FROM db_meta WHERE key='index_generation'").fetchone()[0]
+        conn.close()
+        self.assertEqual(gen, str(memidx.CURRENT_INDEX_GENERATION + 1), "must never be touched")
+
 
 class TestStoreFormStaleVsMismatch(UpdateTestBase):
     """Symlink-review round 1, findings 6+7: a registry row's store=
