@@ -30,6 +30,7 @@ code_refs:                  # the decision→code link — three forms, freely m
   - src/app/summary/*.py              # an fnmatch GLOB
   - src/core/scan/scan_plan.py#hidden_count   # PATH#SYMBOL — a qualified symbol name as the chunkers report it
 tags: []
+standing: [L4]               # optional — this topic's OWN link ids that are true of the whole project, always (§7)
 ```
 
 A prefix and a glob keep serving retrieval exactly as before — `for-path`/`unmapped` match either
@@ -38,6 +39,16 @@ WITH a chunker only `path#symbol` refs take part in marker verification (§8.3):
 never be checked against a ref that names no symbol. A file whose language has no chunker at all
 has no symbol to check against in the first place, so any code_refs form naming the file takes
 part instead (§8.3).
+
+`standing:` is never derived and never a per-link flag — a topic names its own standing links
+explicitly, on the topic, the same way `code_refs` names its own paths. Nothing here decides
+membership by absence (a topic with no `code_refs` is not thereby standing, and one with `code_refs`
+is not thereby excluded) — a topic is standing only for the links it lists. `memlint.py` requires
+every pointed link to exist in this topic, be `status: active`, and carry `ruling.authority`
+`owner-verbatim` or `owner-ratified` (§7) — a pointer to a superseded link is an error, on purpose,
+so the supersession and the pointer update land in the same commit. `memidx.py standing` projects
+the whole store's standing links, ordered and capped (§7); `sessionstart-remind.sh` delivers that
+projection at the start of a session, unprompted, before any edit.
 
 ## 3. Link (one ruling) — fields, and authority PER FIELD
 
@@ -169,6 +180,18 @@ copied inline.
 - `current` not equal to the newest link with `status: active` → error (names the correct value)
 - a topic in area `processing/*` or `deletion/*` with no `code_refs` → warning
 - any `status` / `authority` / `kind` value outside the five/five/five enumerated above → error
+- a `standing:` entry naming a link id not in that topic → error
+- a `standing:` entry whose link is not `status: active` → error, even when the link was superseded
+  by a valid successor — the supersession and the pointer update (or removal) must land together
+- a `standing:` entry whose link's `ruling.authority` is not `owner-verbatim`/`owner-ratified` → error
+- a `standing:` entry whose link's `ruling.text` contains a raw CR or LF → error; flatten it to one
+  line. Any OTHER line/paragraph separator (U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR,
+  U+0085 NEL, a tab) is not an error here — `memidx.py standing` collapses it to one space at
+  projection time, so it still reaches an agent's context as a single physical line
+- the store-wide `standing:` set — every topic's pointers, together — exceeding 24 links or 4,800
+  bytes (UTF-8) of the complete digest `memidx.py standing` would emit (header, every line, and the
+  newlines joining them), whichever line is crossed first → error, naming every topic whose pointer
+  sits past that line
 - frontmatter that does not parse (unreadable, not UTF-8, unterminated, malformed YAML on a
   canonical record), or a typed field in the wrong shape (`links` not a list of mappings, a link
   missing its `link` id, `ruling`/`rationale`/`invariant` not a mapping, a list field carrying a
@@ -200,7 +223,7 @@ own status; it is immutable once set, exactly like `superseded_by`. A
 lifecycle move must be the only change on the link; bundled with any body
 edit, both get their own error. A link removed, or a topic file deleted or
 renamed, is an error naming the path. New links, and changes to `current`,
-`title`, `tags`, `code_refs`, or the body text, are free. A store's own git
+`title`, `tags`, `code_refs`, `standing`, or the body text, are free. A store's own git
 `pre-commit` hook (`hooks/pre-commit-append-only.sh`, wired by
 `scripts/repo-init.sh` the same way `post-commit-reindex.sh` is) runs this on
 every commit and blocks the ones that fail it; the same check can run again in

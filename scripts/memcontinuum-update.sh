@@ -578,6 +578,103 @@ mc_update_resolve_python() {
     return 1
 }
 
+# mc_update_check_index PROJECT STORE -- fix-round MAJOR (both reviewers):
+# a CURRENT_INDEX_GENERATION bump is not self-healing. unmapped's self-heal
+# fires only on "stale" (real on-disk drift), never "upgrade-required" (a
+# generation gap); this command's own rendering checks above never touch
+# the decision index at all; a hook or template change stales no render
+# fingerprint either. The only things that actually reindex a project's
+# index are a store commit (post-commit-reindex.sh) or a manual `reindex`.
+# A project with no store commit after a bump would sit at
+# `standing=skipped-upgrade-required` (hooks/sessionstart-remind.sh)
+# forever, silently -- this is the tool whose job is "keep the system
+# honest", so it reports the gap in --dry-run/--machine and closes it under
+# --apply. Fails open exactly like every other python-dependent check in
+# this script (mc_update_store_hooks_state et al.): no python resolved, or
+# the project has no index yet at all, prints nothing and blocks nothing --
+# a project that has never been reindexed is `memidx.py check`'s own
+# question, not this one's.
+mc_update_check_index() {
+    local project="$1" store="$2"
+    local py db
+    py="$(mc_update_resolve_python)" || return 0
+    db="$MEMCONTINUUM_HOME/$project.sqlite"
+    [ -f "$db" ] || return 0
+
+    # A small, self-contained probe (not `memidx.py standing`, which only
+    # ever reports the STATE name -- this needs the raw generation numbers
+    # too, to print "generation G < C" rather than a bare state word) --
+    # opened read-only (mode=ro): this check must never be the thing that
+    # migrates a schema it is only trying to REPORT on.
+    local rel_tmp
+    rel_tmp="$(mktemp 2>/dev/null)" || return 0
+    PYTHONPATH= "$py" -c '
+import sqlite3, sys
+
+sys.path.insert(0, sys.argv[3])
+import memidx
+
+db, project = sys.argv[1], sys.argv[2]
+try:
+    conn = sqlite3.connect("file:" + db + "?mode=ro", uri=True)
+    row = conn.execute("SELECT value FROM db_meta WHERE key=" + chr(39) + "index_generation" + chr(39)).fetchone()
+    conn.close()
+except Exception:
+    print("unreadable - -")
+    raise SystemExit
+if row is None:
+    print("no-stamp - -")
+    raise SystemExit
+try:
+    g = int(row[0])
+except (TypeError, ValueError):
+    print("corrupt - -")
+    raise SystemExit
+c = memidx.CURRENT_INDEX_GENERATION
+rel = "behind" if g < c else ("ahead" if g > c else "current")
+print(rel + " " + str(g) + " " + str(c))
+' "$db" "$project" "$ENGINE_ROOT" >"$rel_tmp" 2>/dev/null
+
+    local relword gen cur
+    read -r relword gen cur <"$rel_tmp" 2>/dev/null
+    rm -f "$rel_tmp" 2>/dev/null
+
+    case "${relword:-}" in
+        behind) ;;
+        ahead)
+            # Fix-round MAJOR (Grok + Codex Terra, independently): the
+            # OTHER half of the old-engine ping-pong -- an index a NEWER
+            # engine already wrote. --apply must never attempt to reindex
+            # this: `memidx.py reindex` itself now refuses a generation
+            # ahead of its own (the write-side half of the same guard,
+            # memidx.py's cmd_reindex preflight), and even if it did not,
+            # this OLDER engine has no business rewriting a newer index's
+            # rows. Reported only -- named, never touched.
+            echo "  index: generation ahead for $project (generation ${gen:-?} > ${cur:-?}) -- $store -- this engine is OLDER than whatever last reindexed it; do not run reindex here (upgrade this checkout, or point it at a different MEMCONTINUUM_HOME)" >&2
+            return 0
+            ;;
+        *) return 0 ;;
+    esac
+
+    echo "  index: upgrade-required for $project (generation ${gen:-?} < ${cur:-?}) -- $store" >&2
+    if [ "$APPLY" -eq 1 ]; then
+        if [ -n "$store" ] && [ -d "$store" ]; then
+            if PYTHONPATH= "$py" "$MEMIDX" reindex --root "$store" --project "$project" \
+                >/dev/null 2>>"$SBOX_APPLY_LOG"; then
+                echo "  OK $project: index reindexed (generation $gen -> $cur)"
+            else
+                echo "  ERROR: $project: reindex failed -- see $SBOX_APPLY_LOG" >&2
+                WALK_RC=1
+            fi
+        else
+            echo "  ERROR: $project: cannot reindex -- store $store is not a readable directory" >&2
+            WALK_RC=1
+        fi
+    else
+        echo "  fix: re-run with --apply to reindex, or by hand: PYTHONPATH= $py $MEMIDX reindex --root $store --project $project" >&2
+    fi
+}
+
 # mc_update_artifact_state DEST IS_FOREIGN STAMP_LINE -- shared
 # missing/foreign/stale/ok determination for a rendered artifact whose
 # identity check the caller has already done (a rules file's fixed first
@@ -1667,6 +1764,11 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
         [ "$APPLY" -eq 1 ] && WALK_RC=1
         continue
     fi
+
+    # Fix-round MAJOR (both reviewers): once per project row (never once
+    # per claude-dir -- a project with two claude-dirs must not print this
+    # twice), independent of every rendering check below.
+    mc_update_check_index "$PROJECT" "$STORE"
 
     LEGACY=0
     CLAUDE_DIRS_EXPLICIT=0

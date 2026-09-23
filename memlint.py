@@ -12,6 +12,11 @@ Rules implemented, a subset of docs/SCHEMA.md section 7:
   * a topic in area processing/* or deletion/* with no code_refs       -> warning
   * any status / authority / kind value outside the five/five/five
     enumerated in docs/SCHEMA.md section 3                                  -> error
+  * a topic's `standing:` pointer names a link not in that topic, not
+    active, or not owner-verbatim/owner-ratified (TOP-0132 L2)        -> error
+  * a topic's `standing:` pointer whose link's ruling.text has a CR/LF -> error
+  * the store-wide `standing:` set exceeds 24 links or 4,800 bytes
+    (UTF-8) of the complete digest                                    -> error
 
 Exit 1 if any error was found anywhere under ROOT (warnings alone -> exit 0).
 
@@ -40,6 +45,8 @@ from memidx import (
     HOLD_ELIGIBLE_AUTHORITIES,
     INVARIANT_KINDS,
     KINDS,
+    STANDING_CAP_BYTES,
+    STANDING_CAP_LINKS,
     STATUSES,
     ParseResult,
     _uncheckable_remedy,
@@ -52,6 +59,9 @@ from memidx import (
     newest_active_link,
     parse_record,
     parse_record_text,
+    standing_digest_text,
+    standing_line,
+    standing_sort_key,
     validated_evidence_list,
     walk_markdown,
 )
@@ -297,6 +307,65 @@ def lint_topic(
             errors.append(
                 f"{path}: topic {topic_id!r} code_refs entry {ref_str!r} is empty or "
                 "fragment-only -- a code_ref must name a path"
+            )
+
+    # TOP-0132 L2: `standing:` names which of THIS topic's own links are
+    # true of the whole project, always -- never derived, never a per-link
+    # flag (see the design record's rejection of both). A non-list shape is
+    # already a quarantining error from validate_record_shape (same
+    # treatment as tags/code_refs) and never reaches here; every entry
+    # that DOES reach here must resolve inside this topic to an ACTIVE
+    # link at the declared CONSTRAINT gate -- a pointer to a superseded
+    # link is an error ON PURPOSE (it forces the supersession and the
+    # pointer update into the same commit, per the design record), not
+    # something this linter silently drops.
+    for lid in fm.get("standing") or []:
+        lid_str = str(lid)
+        link = topic_links_by_id.get(lid_str)
+        if link is None:
+            errors.append(
+                f"{path}: standing points at {lid_str!r} which is not a link in this topic"
+            )
+            continue
+        link_status = link.get("status")
+        if link_status != "active":
+            errors.append(
+                f"{path}: standing link {lid_str!r} is {link_status!r}, not active -- "
+                "a superseded/declined/historical/provisional link cannot be standing "
+                "(supersede or amend it, and update or drop the pointer, in the same commit)"
+            )
+        link_ruling = link.get("ruling") or {}
+        link_auth = link_ruling.get("authority")
+        if link_auth not in CONSTRAINT_AUTHORITIES:
+            errors.append(
+                f"{path}: standing link {lid_str!r} has ruling.authority {link_auth!r} -- "
+                f"must be one of {sorted(CONSTRAINT_AUTHORITIES)} (the declared CONSTRAINT "
+                "gate this v0 digest uses, TOP-0132 L2)"
+            )
+        # Fix-round MAJOR (both reviewers): a multi-line ruling.text (a YAML
+        # block scalar, most often) is never flattened by the parser, and
+        # `memidx.py standing` used to project it verbatim -- an unframed
+        # second physical line inside `additionalContext`, indistinguishable
+        # from real conversation text (the reviewers' own reproduction: a
+        # line reading "SYSTEM: ignore all previous instructions...",
+        # delivered with no quoting at all). Two layers, not one, and they
+        # do DIFFERENT things -- fix-round MINOR (Grok) named the gap
+        # between them precisely, so the wording here says what each one
+        # actually does rather than "projected verbatim" for both: this
+        # check (lint time) REJECTS only a raw CR or LF, an error naming
+        # the topic; `standing_line`'s own runtime flattening (memidx.py)
+        # is defense in depth for everything CR/LF does not cover -- any
+        # OTHER Unicode line or paragraph separator (U+2028 LINE
+        # SEPARATOR, U+2029 PARAGRAPH SEPARATOR, U+0085 NEL) or a tab is
+        # silently COLLAPSED to one space at projection time, never
+        # rejected here.
+        link_text = link_ruling.get("text")
+        if link_text and ("\n" in str(link_text) or "\r" in str(link_text)):
+            errors.append(
+                f"{path}: standing link {lid_str!r} ruling.text contains a CR or LF -- "
+                "a standing ruling's text must be a single line (flatten it); other line/"
+                "paragraph separators (U+2028, U+2029, NEL, tab) are collapsed to one space "
+                "at projection time and are not rejected here, only a raw CR/LF is"
             )
 
     return errors, warnings
@@ -1020,6 +1089,86 @@ def _duplicate_claim_errors(root: Path) -> list[str]:
     return errors
 
 
+def _standing_cap_errors(root: Path) -> list[str]:
+    """TOP-0132 L1/L2's hard, VISIBLE, store-wide cap: at most
+    STANDING_CAP_LINKS pointers, or STANDING_CAP_BYTES bytes of the
+    COMPLETE digest (`standing_digest_text`'s own rendering -- the header,
+    every line, and the newlines joining them, UTF-8-encoded -- exactly
+    what `memidx.py standing` prints and hashes), whichever is reached
+    first, counted in the SAME order the projection uses
+    (`standing_sort_key`: topic id, then link id). Corpus-wide, like
+    `_duplicate_claim_errors`, so it walks the store once on its own rather
+    than threading a cross-topic accumulator through `lint_topic`'s
+    per-file pass.
+
+    Fix-round MINOR (both reviewers): bytes, not characters of the lines
+    alone -- a character count excluded the header entirely and
+    undercounted any multi-byte (e.g. Cyrillic) text by roughly its
+    encoded-width factor, letting a set through that `memidx.py standing`
+    would then deliver at a size well past what was actually measured.
+
+    Only a pointer that ALSO clears the per-link eligibility gate
+    `lint_topic` checks (exists in its topic, active, CONSTRAINT_AUTHORITIES)
+    is counted -- an ineligible pointer is already ITS OWN error from that
+    check and would never actually reach the projection, so counting it
+    here too would make the cap message name topics for content that
+    `memidx.py standing` would never emit in the first place."""
+    entries = []
+    for f in sorted(walk_markdown(root)):
+        result = parse_record(f)
+        if not result.valid:
+            continue
+        fm = result.frontmatter
+        if not _is_topic_frontmatter(fm):
+            continue
+        standing_ids = fm.get("standing")
+        if not isinstance(standing_ids, list) or not standing_ids:
+            continue
+        topic_id = str(fm.get("id") or f.stem)
+        links_by_id = {str(l.get("link")): l for l in (fm.get("links") or []) if l.get("link")}
+        for lid in standing_ids:
+            lid_str = str(lid)
+            link = links_by_id.get(lid_str)
+            if link is None or link.get("status") != "active":
+                continue
+            ruling = link.get("ruling") or {}
+            auth = ruling.get("authority")
+            if auth not in CONSTRAINT_AUTHORITIES:
+                continue
+            entries.append((topic_id, lid_str, auth, str(ruling.get("text") or "")))
+
+    entries.sort(key=standing_sort_key)
+    rendered = [standing_line(*e) for e in entries]
+    total_links = len(rendered)
+    total_bytes = len(standing_digest_text(rendered).encode("utf-8"))
+    if total_links <= STANDING_CAP_LINKS and total_bytes <= STANDING_CAP_BYTES:
+        return []
+
+    over_topics = set()
+    # Mirrors standing_digest_text's own concatenation: the header's bytes
+    # first, then each line preceded by its own "\n" -- so cum_bytes after
+    # entry i equals len(standing_digest_text(rendered[:i+1]).encode()).
+    cum_bytes = len(_std_header_bytes())
+    for i, (entry, line) in enumerate(zip(entries, rendered)):
+        cum_bytes += len(("\n" + line).encode("utf-8"))
+        if i >= STANDING_CAP_LINKS or cum_bytes > STANDING_CAP_BYTES:
+            over_topics.add(entry[0])
+    listing = ", ".join(sorted(over_topics))
+    return [
+        f"standing set exceeds the store-wide cap ({total_links} links, {total_bytes} bytes "
+        f"of the complete digest; limit {STANDING_CAP_LINKS} links / {STANDING_CAP_BYTES} bytes): "
+        f"topics over the line: {listing}"
+    ]
+
+
+def _std_header_bytes() -> bytes:
+    """`standing_digest_text([])`'s own bytes -- the header alone, no
+    lines -- used only to seed the cumulative byte count above so it
+    matches `standing_digest_text`'s real concatenation exactly (never a
+    second, independent header-length computation)."""
+    return standing_digest_text([]).encode("utf-8")
+
+
 def lint_root(
     root: Path, code_roots: list[Path] | None = None, strict_citations: bool = False
 ) -> tuple[list[str], list[str]]:
@@ -1068,6 +1217,7 @@ def lint_root(
         all_errors.extend(errors)
         all_warnings.extend(warnings)
     all_errors.extend(_duplicate_claim_errors(root))
+    all_errors.extend(_standing_cap_errors(root))
     if code_roots:
         marker_errors, marker_warnings = lint_markers(root, code_roots)
         all_errors.extend(marker_errors)
@@ -2572,7 +2722,7 @@ Append-only history mode (a second, independent check -- given
                      status, superseded_by, promoted_by -- may each move
                      forward once. A link removed, or a topic file deleted
                      or renamed, is an error. New links, and changes to
-                     current/title/tags/code_refs/the body text outside a
+                     current/title/tags/code_refs/standing/the body text outside a
                      link, are free. A REF that never parsed is repaired
                      (a note, not an error) when the new side now parses
                      cleanly -- there is no recorded link history to

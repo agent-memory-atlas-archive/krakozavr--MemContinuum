@@ -8,15 +8,19 @@ subprocess, HOME and MEMCONTINUUM_HOME sandboxed to fresh temp dirs per
 test, nothing here ever touches the real machine's ~/.claude or
 ~/.memcontinuum.
 """
+import contextlib
+import io
 import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
@@ -596,6 +600,105 @@ class TestUpdateWalkStaleAndOk(UpdateTestBase):
         rows = self.table_rows(proc.stdout)
         self.assertEqual(len(rows), 1, rows)  # only the one wired repo from setUp
         self.assertNotIn(declined_repo, proc.stdout)
+
+
+class TestUpdateIndexUpgradeRequired(UpdateTestBase):
+    """Fix-round MAJOR (both reviewers): a CURRENT_INDEX_GENERATION bump is
+    not self-healing -- neither `unmapped`'s self-heal (fires only on
+    on-disk drift, never a generation gap) nor anything else here ever
+    reindexes a project's decision index on its own. This command is the
+    one whose job is "keep the system honest": check mode names the gap
+    once per project row, and --apply closes it."""
+
+    def _build_index_at_generation(self, gen):
+        db = Path(self.home) / ".memcontinuum" / "proj.sqlite"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        topics = Path(self.store) / "topics" / "testing"
+        topics.mkdir(parents=True, exist_ok=True)
+        (topics / "t.md").write_text(
+            "---\ntype: topic\nid: TOP-8001\ntitle: T\narea: testing\ncurrent: L1\n"
+            "links:\n  - link: L1\n    date: 2026-01-01\n    status: active\n"
+            "    kind: adopted\n"
+            "    ruling: {text: \"x\", authority: owner-verbatim, source: s}\n"
+            "    recorded_by: agent\n    recorded_at: 2026-01-01\n---\n\nBody.\n"
+        )
+        args = SimpleNamespace(
+            root=self.store, db=str(db), project="proj", full=False, no_embed=True,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = memidx.cmd_reindex(args)
+        assert rc == 0
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_generation', ?)",
+            (str(gen),),
+        )
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_check_mode_reports_the_gap(self):
+        self._build_index_at_generation(memidx.CURRENT_INDEX_GENERATION - 1)
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(
+            f"index: upgrade-required for proj (generation "
+            f"{memidx.CURRENT_INDEX_GENERATION - 1} < {memidx.CURRENT_INDEX_GENERATION})",
+            proc.stderr,
+        )
+        # Never auto-applied by a bare check: the fixture's own index must
+        # still be stamped at the old generation.
+        conn = sqlite3.connect(str(Path(self.home) / ".memcontinuum" / "proj.sqlite"))
+        gen = conn.execute("SELECT value FROM db_meta WHERE key='index_generation'").fetchone()[0]
+        conn.close()
+        self.assertEqual(gen, str(memidx.CURRENT_INDEX_GENERATION - 1))
+
+    def test_apply_reindexes_it(self):
+        db = self._build_index_at_generation(memidx.CURRENT_INDEX_GENERATION - 1)
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("index reindexed", proc.stdout)
+        conn = sqlite3.connect(str(db))
+        gen = conn.execute("SELECT value FROM db_meta WHERE key='index_generation'").fetchone()[0]
+        conn.close()
+        self.assertEqual(gen, str(memidx.CURRENT_INDEX_GENERATION))
+
+    def test_current_generation_index_is_silent(self):
+        self._build_index_at_generation(memidx.CURRENT_INDEX_GENERATION)
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("upgrade-required", proc.stderr)
+
+    def test_no_index_at_all_is_silent(self):
+        """A project that has never been reindexed is `memidx.py check`'s
+        own question, not this one's -- fails open, prints nothing."""
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("upgrade-required", proc.stderr)
+
+    def test_generation_ahead_is_named_and_never_reindexed(self):
+        """Fix-round MAJOR (Grok + Codex Terra, independently): the OTHER
+        direction of the ping-pong -- an index a NEWER engine already
+        wrote. Check mode must NAME it (previously silent unless behind),
+        and --apply must never attempt to reindex it -- memidx.py reindex
+        itself now refuses a generation ahead of its own, and this older
+        engine has no business rewriting a newer index's rows regardless."""
+        db = self._build_index_at_generation(memidx.CURRENT_INDEX_GENERATION + 1)
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(
+            f"index: generation ahead for proj (generation "
+            f"{memidx.CURRENT_INDEX_GENERATION + 1} > {memidx.CURRENT_INDEX_GENERATION})",
+            proc.stderr,
+        )
+
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("index reindexed", proc.stdout)
+        conn = sqlite3.connect(str(db))
+        gen = conn.execute("SELECT value FROM db_meta WHERE key='index_generation'").fetchone()[0]
+        conn.close()
+        self.assertEqual(gen, str(memidx.CURRENT_INDEX_GENERATION + 1), "must never be touched")
 
 
 class TestStoreFormStaleVsMismatch(UpdateTestBase):
