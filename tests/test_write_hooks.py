@@ -5373,6 +5373,41 @@ Body prose about widget regression throttling handling in detail.
     def test_cross_session_message_prefix_never_searches(self):
         self._assert_non_user_no_search("s-pq-nonuser-crosssess", self.CROSS_SESSION_PROMPT)
 
+    AGENT_MESSAGE_PROMPT_NO_PREAMBLE = (
+        '<agent-message from="a1">\n' + MATCH_PROMPT
+    )
+
+    def test_agent_message_prefix_without_preamble_never_searches(self):
+        """`<agent-message` is matched independently of any English
+        preamble -- it is its own entry in the tuple, not just a substring
+        the "Another Claude session sent a message" sentence happens to
+        contain -- so a prompt that opens directly with the tag (no
+        preamble at all) must still be recognised. Deleting
+        `<agent-message` from the tuple fails this test."""
+        self._assert_non_user_no_search(
+            "s-pq-nonuser-agentmsg-bare", self.AGENT_MESSAGE_PROMPT_NO_PREAMBLE
+        )
+
+    # -- new framing markers (TOP-0133 L3, widened) --------------------------
+
+    NEW_MACHINE_PREFIX_PROMPTS = {
+        "peer-working-colon": (
+            "Another Claude session sent a message while you were working:\n"
+            + MATCH_PROMPT
+        ),
+        "peer-session-working-colon": (
+            "A peer session sent a message while you were working:\n"
+            + MATCH_PROMPT
+        ),
+        "system-reminder": "<system-reminder>\n" + MATCH_PROMPT,
+        "system-notification": "[SYSTEM NOTIFICATION - NOT USER INPUT]\n" + MATCH_PROMPT,
+    }
+
+    def test_widened_machine_framing_prefixes_never_search(self):
+        for label, prompt_text in self.NEW_MACHINE_PREFIX_PROMPTS.items():
+            with self.subTest(marker=label):
+                self._assert_non_user_no_search(f"s-pq-nonuser-{label}", prompt_text)
+
     def test_leading_whitespace_before_marker_still_recognised(self):
         """The classification checks `text.lstrip().startswith(...)` --
         leading whitespace/newlines (as a JSON string can legitimately
@@ -5383,16 +5418,18 @@ Body prose about widget regression throttling handling in detail.
         )
 
     def test_mid_sentence_mention_of_marker_text_still_searches(self):
-        """A human prompt that merely MENTIONS "task-notification" or
-        "agent-message" mid-sentence is a prefix miss (the marker text is
-        not at the very start) -- it must still search normally, same as
-        any other human prompt, and hit TOP-8001 on MATCH_PROMPT's own
-        words."""
+        """A human prompt that merely MENTIONS the literal marker tag
+        `<task-notification>` mid-sentence is a prefix miss (the marker
+        text is not at the very start) -- it must still search normally,
+        same as any other human prompt, and hit TOP-8001 on MATCH_PROMPT's
+        own words. The fixture embeds the marker WITH its angle brackets so
+        a substring-based implementation (`"<task-notification>" in text`
+        instead of a prefix check) fails this test loudly."""
         session_id = "s-pq-nonuser-midsentence"
         self.seed_ledger(session_id, [])
         prompt_text = (
             self.MATCH_PROMPT
-            + " -- similar to that task-notification and agent-message issue from before"
+            + " -- similar to that <task-notification> and <agent-message> issue from before"
         )
         payload = self.user_prompt_payload(session_id, prompt_text=prompt_text)
         proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())

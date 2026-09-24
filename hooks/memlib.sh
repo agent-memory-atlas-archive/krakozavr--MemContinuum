@@ -406,11 +406,13 @@ mc_state_file_for() {
 # this machine carry "prompt", never "user_input"). Before tokenizing
 # anything (TOP-0133 L3), the lstripped text is checked against
 # mc_text._MACHINE_PROMPT_PREFIXES -- Claude Code delivers subagent
-# hand-back reports, background-task notifications, and cross-session
-# messages through this SAME event, framed with a fixed prefix
-# (`<task-notification>`, `Another Claude session sent a message:`,
-# `<agent-message`, `<cross-session-message`); a prefix match (never
-# substring) there sets PROMPT_SOURCE=machine and skips tokenizing
+# hand-back reports, background-task notifications, cross-session
+# messages, and harness-injected system framing through this SAME event,
+# framed with a fixed prefix (`<task-notification>`, `Another Claude
+# session sent a message` (with or without a trailing colon),
+# `A peer session sent a message`, `<agent-message`,
+# `<cross-session-message`, `<system-reminder>`, `[SYSTEM NOTIFICATION`);
+# a prefix match (never substring) there sets PROMPT_SOURCE=machine and skips tokenizing
 # entirely (PROMPT_TERMS stays empty). Otherwise PROMPT_SOURCE=human and
 # the text is tokenized with the SAME content-term vocabulary memidx.py's
 # own `_content_terms` uses
