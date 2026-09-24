@@ -194,6 +194,29 @@ DELIVERY_CLOSE_DONE=""
 # so referencing either one inside finish() is always safe.
 PQ_TEXT=""
 PQ_EMITTED=""
+
+# pq_mark_delivered (fix round 1, TOP-0133 L2, MAJOR): the ONE place the
+# search_fallbacks state write for a prompt-query hit happens -- called at
+# each of the three points that actually print the guess (the coverage/
+# nudge-only printf, the look-back printf, and finish()'s own standalone
+# branch), always AFTER that printf, never before. The old placement
+# (right after the search, long before any of those three points) wrote
+# the hit to state while `delivery_open` was still true; a redelivery of
+# the same prompt_id killed in that window read as a RETRY (not a
+# duplicate), re-ran the query with the now-already-written id excluded,
+# and surfaced a SECOND topic for one prompt (or `already-surfaced` with
+# nothing to show, swallowing the guess for good) -- Grok's fixture.
+# Sets PQ_EMITTED (so finish() never double-prints) and performs the
+# state append together, so the two can never drift apart. FB_HITS_FOR_STATE
+# is only non-empty once a hit actually survived the exclusion filter, and
+# is left untouched by everything between the search and this call.
+pq_mark_delivered() {
+    PQ_EMITTED=1
+    if [ -n "${SESSION_ID:-}" ] && [ -n "${FB_HITS_FOR_STATE:-}" ]; then
+        mc_fallback_write_state "$STATE_FILE" "prompt" "$FB_HITS_FOR_STATE" "userprompt" 0.25
+    fi
+}
+
 finish() {
     local outcome="$1"
     local extra="${2:-}"
@@ -202,18 +225,21 @@ finish() {
     # own re-gate round 3, MAJOR 1: the close write's own lock deadline
     # could still lose an already-computed guess to the watchdog if this
     # ran after it). Guarded by PQ_EMITTED so this never double-prints --
-    # every one of the three merge points below sets PQ_EMITTED itself
-    # the moment it actually splices PQ_TEXT into its own envelope, so by
-    # the time finish("injected"/"lookback-injected"/"nudge-only") runs
-    # here, PQ_EMITTED is already set and this block is a no-op for those
-    # three outcomes; it only ever fires for a turn that would otherwise
-    # print nothing at all. On a real print, the outcome token itself
-    # becomes "prompt-query-only" (Addendum C: a standalone guess is not
-    # a nudge -- this must never sit silently under whatever the turn's
-    # own would-be outcome was, e.g. "no-evidence"), and `extra` is
-    # dropped (it described the turn's own now-superseded silent reason).
+    # every one of the three merge points below calls pq_mark_delivered
+    # itself the moment it actually splices PQ_TEXT into its own envelope,
+    # so by the time finish("injected"/"lookback-injected"/"nudge-only")
+    # runs here, PQ_EMITTED is already set and this block is a no-op for
+    # those three outcomes; it only ever fires for a turn that would
+    # otherwise print nothing at all. On a real print, the outcome token
+    # itself becomes "prompt-query-only" (Addendum C: a standalone guess
+    # is not a nudge -- this must never sit silently under whatever the
+    # turn's own would-be outcome was, e.g. "no-evidence"), and `extra`
+    # is dropped (it described the turn's own now-superseded silent
+    # reason). pq_mark_delivered (fix round 1, MAJOR) runs ONLY after the
+    # printf that actually delivered the guess -- never before -- so the
+    # search_fallbacks state write happens exactly once, exactly when the
+    # guess it titles was actually shown.
     if [ -n "$PQ_TEXT" ] && [ -z "$PQ_EMITTED" ]; then
-        PQ_EMITTED=1
         PQ_STANDALONE_JSON="$(env PYTHONPATH= "$MC_PY" -c '
 import json, sys
 print(json.dumps({
@@ -225,6 +251,7 @@ print(json.dumps({
 ' "$PQ_TEXT" 2>>"$MC_LOG")"
         if [ -n "$PQ_STANDALONE_JSON" ]; then
             printf '%s\n' "$PQ_STANDALONE_JSON"
+            pq_mark_delivered
             outcome="prompt-query-only"
             extra=""
         fi
@@ -597,9 +624,18 @@ if [ "$PQ_ON" = "1" ]; then
                 # `search surfaced <title> (<id>) for <file>` rendering
                 # names this channel's own hit correctly with no code
                 # change to that block at all. Never stores the terms.
-                if [ -n "${SESSION_ID:-}" ] && [ -n "${FB_HITS_FOR_STATE:-}" ]; then
-                    mc_fallback_write_state "$STATE_FILE" "prompt" "$FB_HITS_FOR_STATE" "userprompt" 0.25
-                fi
+                # Fix round 1 (MAJOR): NOT written here any more --
+                # FB_HITS_FOR_STATE (already set by mc_fallback_parse
+                # above) stays a plain global variable, untouched, until
+                # pq_mark_delivered() (see finish()'s own header comment)
+                # performs this write from whichever of the three actual
+                # emission points below delivers PQ_TEXT this turn. A
+                # write here, before any stdout, is exactly the ordering
+                # Grok's fixture broke: a kill landing after this append
+                # but before delivery_open closes turns the next same-
+                # prompt_id redelivery into a RETRY that re-searches with
+                # this id already excluded -- a second topic for one
+                # prompt, or a swallowed guess on a single-match store.
             fi
         fi
     fi
@@ -1027,11 +1063,15 @@ print(json.dumps({
 
     if [ $OUT_RC -eq 0 ] && [ -n "$OUTPUT_JSON" ]; then
         printf '%s\n' "$OUTPUT_JSON"
-        # TOP-0133 L2: the guess (if any) was already merged into
-        # OUTPUT_JSON above -- mark it delivered so finish() below never
-        # re-emits it standalone for THIS turn's own "injected"/
-        # "nudge-only" outcome.
-        [ -n "$PQ_TEXT" ] && PQ_EMITTED=1
+        # TOP-0133 L2 (fix round 1, MAJOR): the guess (if any) was already
+        # merged into OUTPUT_JSON above -- AFTER this printf actually
+        # delivered it, mark it delivered (finish() below never re-emits
+        # it standalone for THIS turn's own "injected"/"nudge-only"
+        # outcome) and write the search_fallbacks state entry for it, in
+        # the same call, so the two can never land on different sides of
+        # a watchdog kill. Serves both this and the nudge-only outcome --
+        # they share this one printf.
+        [ -n "$PQ_TEXT" ] && pq_mark_delivered
 
         if [ "${CANDIDATE:-0}" = "1" ]; then
             # Phase 3 (locked): commit the injection bookkeeping now that we
@@ -1198,15 +1238,24 @@ if [ -z "$LB_OUTPUT_JSON" ]; then
     finish "no-evidence"
 fi
 
-# TOP-0133 L2: the guess (if any) was already merged into LB_OUTPUT_JSON
-# above -- mark it delivered so finish() below never re-emits it
-# standalone for this turn's own "lookback-injected" outcome. Set here
-# (before the printf a few lines down, which cannot fail once
-# LB_OUTPUT_JSON is non-empty) so the flag is correct regardless of which
-# statement between here and that printf might read it.
-[ -n "$PQ_TEXT" ] && PQ_EMITTED=1
-
 printf '%s\n' "$LB_OUTPUT_JSON"
+
+# TOP-0133 L2 (fix round 1, MAJOR): the guess (if any) was already merged
+# into LB_OUTPUT_JSON above -- AFTER the printf that actually delivered
+# it, mark it delivered (finish() below never re-emits it standalone for
+# this turn's own "lookback-injected" outcome) and write the
+# search_fallbacks state entry for it, in the same call. This is also
+# what fixes the double-mention Grok measured: the old write ran right
+# after the search, long before this look-back block even read
+# search_fallbacks to render its own "search surfaced ... for prompt"
+# lines a few statements above -- an exit-3 candidate that was also
+# look-back eligible used to see the SAME hit twice in one envelope (the
+# look-back list line AND the guess itself, both computed off a state
+# file the fresh hit had already landed in). Writing only after this
+# printf means the hit cannot appear in that same turn's own look-back
+# list -- it lands in state only once this turn's own guess is already
+# on its way out, so the NEXT look-back turn is the first one to list it.
+[ -n "$PQ_TEXT" ] && pq_mark_delivered
 
 export MC_TURN_NUM="${TURN:-0}"
 export MC_NOW
