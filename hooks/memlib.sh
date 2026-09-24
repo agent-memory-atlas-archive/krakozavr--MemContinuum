@@ -387,20 +387,43 @@ mc_state_file_for() {
 # any top-level payload key (uppercased for the shell var name), plus the
 # special "tool_input.file_path" -> FILE_PATH, "_prompt_hash" -> PROMPT_HASH
 # (sha256(payload["prompt_id"])[:16] -- the raw prompt_id itself is never
-# extracted or emitted, dual-gate review finding 2), and "_top_keys_csv" ->
+# extracted or emitted, dual-gate review finding 2), "_top_keys_csv" ->
 # TOP_KEYS_CSV (sorted top-level KEY NAMES only, comma-joined, never
-# values -- the payload-shape capture addendum). Never reads
-# transcript_path, user_input, last_assistant_message, or any payload VALUE
-# beyond an explicitly requested scalar field on purpose -- callers must
-# not ask for them (docs/DESIGN.md ruling B). The payload is
+# values -- the payload-shape capture addendum), and "_prompt_terms" ->
+# PROMPT_TERMS (TOP-0133 L2, the prompt-query channel's own amendment to
+# ruling B -- see below). Never reads transcript_path, user_input, prompt,
+# or last_assistant_message beyond that one explicitly-requested,
+# terms-only derivation on purpose -- a caller must not ask for the other
+# tokens above (docs/DESIGN.md ruling B). The payload is
 # piped to this one python's stdin only -- never placed in an env var or
 # another process's argv (dual-gate review finding 1). No per-call timeout
 # here (see the file header): the calling hook's own watchdog bounds this.
+#
+# "_prompt_terms" (TOP-0133 L2, ruling B amendment): reads
+# payload["prompt"] first, payload["user_input"] as a fallback (whichever
+# is a non-empty string -- Addendum A: real UserPromptSubmit payloads on
+# this machine carry "prompt", never "user_input"), tokenizes it with the
+# SAME content-term vocabulary memidx.py's own `_content_terms` uses
+# (mc_text.py, imported via a `sys.path.insert` onto MC_ENGINE_ROOT -- an
+# env var scoped to THIS one subprocess call, never exported globally),
+# lowercases, drops stopwords, drops tokens under 3 characters, dedupes
+# (first occurrence wins), and caps at 12. Prints an EMPTY value when
+# fewer than 4 terms survive -- the "at least four content words" gate
+# lives HERE, so a caller downstream of this function never sees a
+# partial term list to second-guess. The prompt TEXT itself never leaves
+# this one python process: it is read, tokenized, and immediately
+# discarded -- only the resulting terms (never argv, env, a file, state,
+# or hook.log) are the return value. A caller must request this field only
+# when the prompt-query channel is confirmed ON (see
+# userprompt-remind.sh) -- requesting it unconditionally would defeat the
+# whole point of an opt-in channel (a caller that never asks for
+# "_prompt_terms" never triggers this branch at all, so the payload's
+# prompt/user_input keys are never even looked at).
 mc_extract_fields() {
     local payload="$1"
     shift
-    printf '%s' "$payload" | env PYTHONPATH= "$MC_PY" -c '
-import hashlib, json, sys, shlex
+    printf '%s' "$payload" | env PYTHONPATH= MC_ENGINE_ROOT="$MC_LIB_DIR/.." "$MC_PY" -c '
+import hashlib, json, os, sys, shlex
 fields = sys.argv[1:]
 try:
     d = json.load(sys.stdin)
@@ -425,6 +448,32 @@ for f in fields:
     elif f == "_top_keys_csv":
         v = ",".join(sorted(d.keys()))
         name = "TOP_KEYS_CSV"
+    elif f == "_prompt_terms":
+        name = "PROMPT_TERMS"
+        v = ""
+        _txt = d.get("prompt")
+        if not (isinstance(_txt, str) and _txt):
+            _txt = d.get("user_input")
+        if isinstance(_txt, str) and _txt:
+            try:
+                _root = os.environ.get("MC_ENGINE_ROOT") or ""
+                if _root:
+                    sys.path.insert(0, _root)
+                import mc_text
+                _seen = set()
+                _toks = []
+                for _w in mc_text._CONTENT_TOKEN_RE.findall(_txt.lower()):
+                    if _w in mc_text._STOPWORDS or len(_w) < 3 or _w in _seen:
+                        continue
+                    _seen.add(_w)
+                    _toks.append(_w)
+                    if len(_toks) >= 12:
+                        break
+                if len(_toks) >= 4:
+                    v = " ".join(_toks)
+            except Exception:
+                v = ""
+        del _txt
     else:
         v = d.get(f)
         if v is None:
