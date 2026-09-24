@@ -530,6 +530,20 @@ if state.get("standing_hash") != _new_hash:
         _i for _i in (os.environ.get("MC_STANDING_IDS", "") or "").split(",") if _i
     ]
     _verdict = "inject"
+elif "standing_ids" not in state:
+    # Fix round 1 (MAJOR, Grok): a session whose state predates this key
+    # (has standing_hash already stamped by an older engine build, but no
+    # standing_ids) would otherwise dedupe here forever, leaving the key
+    # absent -- the prompt-query exclusion set would then re-guess topics
+    # the standing digest already delivered, until the next clear/compact
+    # for this session. The hash comparison already decided nothing changed,
+    # so the digest is not re-injected (verdict stays "dedup"), but the
+    # ids it would have carried are backfilled from the SAME digest just
+    # computed (STANDING_IDS_CSV, no extra work) -- a resumed session is
+    # exactly the one a measurement channel needs to get right.
+    state["standing_ids"] = [
+        _i for _i in (os.environ.get("MC_STANDING_IDS", "") or "").split(",") if _i
+    ]
 _out = os.environ.get("MC_STANDING_VERDICT_OUT")
 if _out:
     try:
