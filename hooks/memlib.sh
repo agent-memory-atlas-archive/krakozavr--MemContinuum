@@ -406,8 +406,11 @@ mc_state_file_for() {
 # SAME content-term vocabulary memidx.py's own `_content_terms` uses
 # (mc_text.py, imported via a `sys.path.insert` onto MC_ENGINE_ROOT -- an
 # env var scoped to THIS one subprocess call, never exported globally),
-# lowercases, drops stopwords, drops tokens under 3 characters, dedupes
-# (first occurrence wins), and caps at 12. Prints an EMPTY value when
+# lowercases, drops stopwords AND conversational filler (mc_text.py's own
+# `_PROMPT_FILLER` -- fix round 1, Grok's judgement: applied here, and
+# ONLY here, never inside `_content_terms` itself), drops tokens under 3
+# characters, dedupes (first occurrence wins), and caps at 12. Prints an
+# EMPTY value when
 # fewer than 4 terms survive -- the "at least four content words" gate
 # lives HERE, so a caller downstream of this function never sees a
 # partial term list to second-guess. The prompt TEXT itself never leaves
@@ -463,7 +466,12 @@ for f in fields:
                 _seen = set()
                 _toks = []
                 for _w in mc_text._CONTENT_TOKEN_RE.findall(_txt.lower()):
-                    if _w in mc_text._STOPWORDS or len(_w) < 3 or _w in _seen:
+                    if (
+                        _w in mc_text._STOPWORDS
+                        or _w in mc_text._PROMPT_FILLER
+                        or len(_w) < 3
+                        or _w in _seen
+                    ):
                         continue
                     _seen.add(_w)
                     _toks.append(_w)

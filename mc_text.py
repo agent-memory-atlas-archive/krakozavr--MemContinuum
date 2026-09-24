@@ -32,6 +32,28 @@ until while
 """.split())
 _CONTENT_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
+# _PROMPT_FILLER (TOP-0133 L2, fix round 1 -- Grok's judgement, adopted by
+# the orchestrator; reversible): conversational filler, applied ONLY by
+# hooks/memlib.sh's `_prompt_terms` derivation -- NEVER by `_content_terms`
+# below, which memidx's own coverage scoring uses and which must stay
+# byte-identical. On an owner-shaped prompt like "please explain me the
+# level of importance", `_content_terms`'s own stopword list alone leaves
+# `please explain level importance` -- four terms, enough to open the
+# search gate -- and `memidx.fts_escape` ORs every term together, so one
+# leftover word (`please`, `explain`, ...) that happens to occur anywhere
+# in the store is a hit on its own; collecting OR-hits on boilerplate like
+# that mostly measures the tokenizer, which is exactly what the ruling's
+# "weeks of measurement" are meant to decide instead. This list is the
+# accepted, TUNABLE filter for that -- a term-side filter only, no effect
+# on FTS ranking or on what a document itself contains -- deliberately
+# free of domain words (`review`, `fix`, `search`, `hook`, `test`, ...
+# stay searchable).
+_PROMPT_FILLER = frozenset("""
+please explain want need help tell show thanks thank let lets like think
+know look see make sure just also really actually maybe something anything
+everything nothing thing things way well okay yes yeah right hmm still
+""".split())
+
 
 def _content_terms(text: str) -> set[str]:
     """INC-0115: non-stopword, length>1 tokens -- the same definition
