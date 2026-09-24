@@ -61,11 +61,19 @@
 # gets a second turn, a second cooldown of its own, or a second `unmapped`
 # call.
 #
-# This hook NEVER reads transcript_path, user_input, prompt, or
-# last_assistant_message from the payload (ruling B; the addendum extends
-# the not-read invariant to `prompt`, the alternate payload key Claude Code
-# may use for the same field) -- only session_id, agent_id, agent_type, and
-# prompt_id. prompt_id itself is never extracted, stored, or logged: only
+# This hook NEVER reads transcript_path or last_assistant_message from the
+# payload (ruling B) -- only session_id, agent_id, agent_type, prompt_id,
+# and the sorted top-level KEY NAMES (payload-shape capture, below). It
+# also never reads user_input/prompt UNLESS the opted-in prompt-query
+# channel (TOP-0133 L2, "Prompt-derived queries" below) is ON for this
+# project, in which case ruling B is amended: mc_extract_fields may read
+# payload["prompt"] (or ["user_input"] as a fallback) to derive search
+# terms, in one process, and discard the text immediately -- only the
+# resulting terms (never the text itself) ever leave that call, and only
+# when PQ_ON=1 requests the "_prompt_terms" field at all (an OFF project's
+# mc_extract_fields call stays byte-identical to the pre-L2 shape). See
+# "Prompt-derived queries" further down and docs/INTERNALS.md for the
+# full amendment. prompt_id itself is never extracted, stored, or logged: only
 # sha256(prompt_id)[:16] ever exists past the one extraction call (dual-gate
 # review finding 2), stored as `last_prompt_hash`, for dedupe only. A
 # duplicate delivery (the same prompt_id redelivered) suppresses the WHOLE
@@ -85,7 +93,8 @@
 # environment variable, so no subprocess this hook spawns (dirname/mkdir/
 # cat/env/python) ever inherits it (dual-gate review
 # finding 1, BLOCKER). Only the extracted scalar fields (session_id,
-# agent_id/agent_type presence, a prompt_id fingerprint) and the sorted
+# agent_id/agent_type presence, a prompt_id fingerprint, and -- ON turns
+# only -- the derived, terms-only PROMPT_TERMS) and the sorted
 # top-level payload KEY NAMES (never values -- the payload-shape capture
 # addendum below) ever exist past that call.
 #
@@ -179,9 +188,117 @@ source "${MC_MEMLIB_PATH:-$SCRIPT_DIR/memlib.sh}"
 
 DECIDE_TMP=""
 DELIVERY_CLOSE_DONE=""
+# TOP-0133 L2: PQ_TEXT holds the rendered guess (label + chain text) once
+# the prompt-query channel finds a hit further down this script -- empty
+# on every OFF/no-hit/excluded turn. PQ_EMITTED tracks whether that guess
+# has already ridden inside one of the three existing additionalContext
+# envelopes this hook can print (coverage, nudge-only, look-back), OR gone
+# out standalone from finish() itself -- set immediately after whichever
+# printf actually delivered it (never deferred to the state-append call;
+# see pq_mark_delivered below, fix round 1b). When a turn reaches finish()
+# with PQ_TEXT still non-empty and PQ_EMITTED still unset, the turn was
+# about to end SILENTLY (no stdout at all) with an already-computed guess
+# sitting unused -- finish() below emits it standalone rather than losing
+# it, exactly the same "the guess is the feature, never let a later step
+# lose it" precedent pre-edit-chain.sh's own fallback already set (see
+# that hook's own re-gate round 3 comment). Declared here (before the
+# first possible finish() call, under `set -u`) so referencing either one
+# inside finish() is always safe.
+PQ_TEXT=""
+PQ_EMITTED=""
+
+# pq_mark_delivered (fix round 1b, TOP-0133 L2, was MAJOR): the ONE place
+# the search_fallbacks state write for a prompt-query hit happens -- called
+# exactly once, from finish() itself, AFTER finish()'s own delivery_open
+# close write (for "injected"/"lookback-injected" that close is the
+# caller's own bookkeeping write, which already ran before finish() was
+# even invoked; for every other outcome it is finish()'s own close block a
+# few lines above the call site). Fix round 1 moved this append to after
+# the PRINTF that delivers the guess -- correct against a kill landing
+# before stdout, but a kill landing in the window between that append and
+# the SEPARATE locked write that closes delivery_open (a few lines/callers
+# away) still left delivery_open true with the hit already in
+# search_fallbacks: the redelivered prompt then read as a RETRY, re-ran
+# the search with that id excluded, and surfaced a SECOND topic for one
+# prompt -- Grok's fixture, shrunk to this one lock round-trip. Fix round
+# 1b's fix ordered this append AFTER whichever write closes delivery_open,
+# never before.
+#
+# Fix round 2 (TOP-0133 L2, Grok NIT): ordering two SEPARATE locked writes
+# still leaves a window between them in principle (a lock-wait timeout, a
+# skipped close on some future outcome branch) where this append could run
+# with delivery_open never actually closed. Since this call only ever
+# happens once PQ_EMITTED is set -- i.e. the guess is already past
+# stdout -- closing delivery_open is ALWAYS the correct thing to do here,
+# so the append transform now does it itself (CLOSE_DELIVERY=1, the same
+# locked write, never a second one): a genuinely-already-closed turn just
+# re-writes the same `false` it already had; a turn whose separate close
+# never landed gets closed right here instead. Either way, the redelivered
+# prompt_id finds delivery_open already false, reads as a plain duplicate,
+# and is suppressed -- never a second search, never a second topic. A kill
+# after this append itself (guaranteed atomic with the close, one lock)
+# now only ever loses the search_fallbacks TITLING entry (the look-back
+# list simply omits this hit one turn longer).
+#
+# Fix round 3 (TOP-0133 L2, was MAJOR, Codex final26): rounds 1b/2 above
+# ordered TWO writes relative to each other, but a kill can also land
+# BEFORE either one runs at all -- after the printf already delivered the
+# guess, but before this function (or finish()'s own close write) gets to
+# execute or complete. That leaves delivery_open true with NOTHING
+# written to search_fallbacks, so the actual guarantee against a second
+# topic no longer lives here: it lives in the RETRY check near the top of
+# the `if [ "$PQ_ON" = "1" ]` block, which skips the search outright on
+# any redelivered prompt_id that finds delivery_open still true -- see
+# that check's own comment. This ordering (append after whichever close,
+# atomic with its own close) is still correct and still worth keeping: it
+# is what makes search_fallbacks/look-back TITLING match what genuinely
+# went to stdout. It just does not, by itself, bound how many topics one
+# prompt can ever show -- the retry skip does that now, by construction.
+pq_mark_delivered() {
+    if [ -n "${SESSION_ID:-}" ] && [ -n "${FB_HITS_FOR_STATE:-}" ]; then
+        mc_fallback_write_state "$STATE_FILE" "prompt" "$FB_HITS_FOR_STATE" "userprompt" 0.25 1
+    fi
+}
+
 finish() {
     local outcome="$1"
     local extra="${2:-}"
+    # TOP-0133 L2: standalone delivery. Printed BEFORE the delivery_open
+    # close write just below (same stdout-first reasoning pre-edit-chain.sh's
+    # own re-gate round 3, MAJOR 1 established: the close write's own lock
+    # deadline could still lose an already-computed guess to the watchdog
+    # if this ran after it). Guarded by PQ_EMITTED so this never
+    # double-prints -- every one of the three merge points below sets
+    # PQ_EMITTED=1 itself the moment it actually splices PQ_TEXT into its
+    # own envelope, so by the time finish("injected"/"lookback-injected"/
+    # "nudge-only") runs here, PQ_EMITTED is already set and this block is
+    # a no-op for those three outcomes; it only ever fires for a turn that
+    # would otherwise print nothing at all. On a real print, the outcome
+    # token itself becomes "prompt-query-only" (Addendum C: a standalone
+    # guess is not a nudge -- this must never sit silently under whatever
+    # the turn's own would-be outcome was, e.g. "no-evidence"), and `extra`
+    # is dropped (it described the turn's own now-superseded silent
+    # reason). The search_fallbacks append itself no longer happens here --
+    # fix round 1b (see pq_mark_delivered's own header comment) moved it to
+    # AFTER the delivery_open close write below, run once at the bottom of
+    # this function for every outcome.
+    if [ -n "$PQ_TEXT" ] && [ -z "$PQ_EMITTED" ]; then
+        PQ_STANDALONE_JSON="$(env PYTHONPATH= "$MC_PY" -c '
+import json, sys
+print(json.dumps({
+    "hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": sys.argv[1],
+    }
+}))
+' "$PQ_TEXT" 2>>"$MC_LOG")"
+        if [ -n "$PQ_STANDALONE_JSON" ]; then
+            printf '%s\n' "$PQ_STANDALONE_JSON"
+            PQ_EMITTED=1
+            outcome="prompt-query-only"
+            extra=""
+        fi
+    fi
     # Re-gate finding (HIGH, Codex+Grok): if phase 1 opened delivery this
     # invocation (DELIVERY_OPEN, decoded from the decision file above) and
     # we are about to exit through a SILENT-but-COMPLETED outcome (not
@@ -193,7 +310,9 @@ finish() {
     # extra locked write per invocation, and skipped entirely (zero added
     # calls) whenever phase 1 never opened delivery -- the common case for
     # every payload without a prompt_id -- so this stays within the 2s
-    # budget the existing latency test enforces.
+    # budget the existing latency test enforces. Addendum C: this write
+    # touches delivery_open ONLY -- a standalone guess stamps nothing else
+    # (not last_inject_turn/time/ts, not lookback_count).
     if [ "${DELIVERY_OPEN:-0}" = "1" ] && [ -z "$DELIVERY_CLOSE_DONE" ] \
         && [ "$outcome" != "injected" ] && [ "$outcome" != "lookback-injected" ]; then
         DELIVERY_CLOSE_DONE=1
@@ -201,6 +320,22 @@ finish() {
 state["delivery_open"] = False
 print(json.dumps(state))
 ' >>"$MC_LOG" 2>&1
+    fi
+    # Fix round 1b (TOP-0133 L2, was MAJOR): the search_fallbacks append for
+    # a delivered guess happens HERE, once, AFTER the close write just
+    # above -- for "injected"/"lookback-injected" the real close already
+    # ran in the caller's own bookkeeping write before finish() was even
+    # called, so this is still "after close" for every outcome. PQ_EMITTED
+    # is the only guard needed (finish() always exits, so this function
+    # body runs at most once per invocation) -- see pq_mark_delivered's own
+    # header comment for the full reasoning. Fix round 2 (Grok NIT): the
+    # append below also sets delivery_open=False in its own locked write
+    # (pq_mark_delivered -> mc_fallback_write_state's CLOSE_DELIVERY arg),
+    # so this still ends correctly even if the close write just above (or
+    # the caller's own bookkeeping write, for "injected"/"lookback-
+    # injected") never actually landed.
+    if [ -n "$PQ_EMITTED" ]; then
+        pq_mark_delivered
     fi
     [ -n "$DECIDE_TMP" ] && rm -f "$DECIDE_TMP" 2>/dev/null
     if [ -n "$extra" ]; then
@@ -211,10 +346,44 @@ print(json.dumps(state))
     exit 0
 }
 
+# TOP-0133 L2: the opt-in switch, decided BEFORE the payload is even read
+# (a plain env check plus, at most, one `grep -qxF` against a small file --
+# no python, no state) -- see docs/INTERNALS.md "Prompt-derived queries".
+# Fix round 1 (MINOR, Grok): `-qx` alone treats $MC_PROJECT as a REGEX
+# matched against each line, not a literal string -- a project name
+# containing a regex metacharacter (a bare `.` is the common one) then
+# matches lines it should not (`grep -qx 'foo.bar'` matches a line
+# `foo-bar`). `-F` makes the match literal.
+# ON when MEMCONTINUUM_PROMPT_QUERY=1 (explicit override), or the literal
+# string "0" forces OFF and wins over the file either way; otherwise ON
+# only when $MEMCONTINUUM_HOME/prompt-query.projects exists and contains a
+# line equal to $MC_PROJECT. This is what lets the field-extraction call
+# just below skip requesting the derived-terms field ENTIRELY when OFF --
+# the byte-identical guarantee for every project that never opts in.
+PQ_ON=0
+case "${MEMCONTINUUM_PROMPT_QUERY:-}" in
+    1) PQ_ON=1 ;;
+    0) PQ_ON=0 ;;
+    *)
+        if [ -f "$MEMCONTINUUM_HOME/prompt-query.projects" ] \
+            && grep -qxF "$MC_PROJECT" "$MEMCONTINUUM_HOME/prompt-query.projects" 2>/dev/null; then
+            PQ_ON=1
+        fi
+        ;;
+esac
+
 PAYLOAD="$(cat)"
 [ -z "$PAYLOAD" ] && finish "empty-payload"
 
-eval "$(mc_extract_fields "$PAYLOAD" session_id agent_id agent_type _prompt_hash _top_keys_csv)" 2>/dev/null
+# TOP-0133 L2: "_prompt_terms" is appended to the requested field list
+# ONLY when the switch above is ON -- when OFF, this call is byte-
+# identical to the pre-L2 call (docs/DESIGN.md ruling B, unamended for
+# every project that never opts in). mc_extract_fields (hooks/memlib.sh)
+# is the ONLY place the raw prompt text is ever read; PROMPT_TERMS is the
+# one derived, terms-only value this script itself ever sees.
+MC_EXTRACT_FIELD_LIST="session_id agent_id agent_type _prompt_hash _top_keys_csv"
+[ "$PQ_ON" = "1" ] && MC_EXTRACT_FIELD_LIST="$MC_EXTRACT_FIELD_LIST _prompt_terms"
+eval "$(mc_extract_fields "$PAYLOAD" $MC_EXTRACT_FIELD_LIST)" 2>/dev/null
 unset PAYLOAD
 
 [ -z "${SESSION_ID:-}" ] && finish "no-session-id"
@@ -378,6 +547,23 @@ if (not is_dup) or retry:
 
 decision["delivery_open"] = bool(state.get("delivery_open", False))
 
+# TOP-0133 L2 / Addendum B: the prompt-query exclusion set, computed here
+# (state is already loaded under this same lock -- no extra process on
+# the common, channel-OFF path) so the query further down needs no second
+# state read of its own. Union of every id already surfaced this session
+# via a search fallback (the L1 search_fallbacks list, written by
+# pre-edit-chain.sh, newfile-nudge.sh, AND this channel itself) and every
+# topic id the standing digest already delivered this session (state own
+# standing_ids, written by sessionstart-remind.sh). Computed
+# unconditionally (cheap: two already-in-memory list reads) regardless of
+# whether the channel is ON this turn.
+_sf_ids = {
+    str(_e.get("id", "")) for _e in (state.get("search_fallbacks") or [])
+    if isinstance(_e, dict) and _e.get("id")
+}
+_standing_ids = {str(_i) for _i in (state.get("standing_ids") or []) if _i}
+decision["surfaced_ids"] = sorted(_sf_ids | _standing_ids)
+
 try:
     with open(os.environ["MC_DECIDE_OUT"], "w") as f:
         json.dump(decision, f)
@@ -393,9 +579,13 @@ fi
 
 # One shot: read every scalar the rest of this script needs out of the
 # decision file (duplicate/candidate/turn/lookback_eligible/since_turn/
-# delivery_open) --
+# delivery_open/retry) --
 # kept to a single call so the happy path doesn't add spawns on top of the
-# 2s outer budget above.
+# 2s outer budget above. RETRY (fix round 3, TOP-0133 L2, was MAJOR,
+# Codex): phase 1 already computed `retry` (a same-prompt_hash redelivery
+# while delivery_open was still true) -- exported here so the prompt-query
+# block below can skip the search entirely on a retry turn instead of
+# re-selecting. See that block's own comment for why.
 eval "$(env PYTHONPATH= "$MC_PY" -c '
 import json, sys, shlex
 with open(sys.argv[1]) as f:
@@ -407,6 +597,8 @@ out = {
     "LB_ELIGIBLE": "1" if d.get("lookback_eligible") else "0",
     "SINCE_TURN": str(d.get("since_turn", 0)),
     "DELIVERY_OPEN": "1" if d.get("delivery_open") else "0",
+    "RETRY": "1" if d.get("retry") else "0",
+    "SURFACED_IDS": ",".join(d.get("surfaced_ids") or []),
 }
 for k, v in out.items():
     print(f"{k}={shlex.quote(v)}")
@@ -414,6 +606,135 @@ for k, v in out.items():
 
 if [ "${DUPLICATE:-0}" = "1" ]; then
     finish "duplicate-delivery"
+fi
+
+# --- prompt-derived search query (TOP-0133 L2) -------------------------
+# Runs AFTER the duplicate-delivery gate and the agent gate above (a
+# subagent/persona turn already `finish`ed at the agent_id/agent_type
+# check well before this point; a redelivered prompt_id already
+# `finish`ed just above) and BEFORE any coverage-candidate work below, so
+# its own outcome (a guess, or nothing) is already known at every one of
+# the three places this hook can still print additionalContext. Guard:
+# the channel must be ON (PQ_ON, decided before the payload was even
+# read) AND PROMPT_TERMS must be non-empty (mc_extract_fields already
+# enforces the four-content-word gate; an empty value here means either
+# zero terms or 1-3 of them -- this hook cannot and need not tell those
+# apart, both log the same reason). PQ_TEXT stays "" (the channel found
+# nothing, or never ran) unless a real hit survives below.
+#
+# RETRY (fix round 3, TOP-0133 L2, was MAJOR, Codex final26): checked
+# FIRST, before even the term/root checks, and unconditionally skips the
+# search. Codex reproduced a real gap in the close/append ORDERING fix
+# (fix rounds 1b/2): a kill landing after the guess already reached
+# stdout but before EITHER close write (finish()'s own, or
+# pq_mark_delivered's atomic append+close) can still leave delivery_open
+# true with the hit's own search_fallbacks entry never written -- the
+# redelivered prompt_id then read as a RETRY, re-ran the search with
+# nothing excluded, and could surface a SECOND, different topic
+# (TOP-8002) for what is really the SAME prompt. The close/append
+# ordering those earlier rounds built still matters -- it is what keeps
+# search_fallbacks/look-back TITLING consistent with what actually went
+# out on stdout -- but it can never by itself guarantee "at most one
+# topic per prompt", because the kill window sits BEFORE either close
+# write runs at all, not between them. Skipping the search on every
+# RETRY turn closes that gap by construction instead: the first delivery
+# either reached stdout (one topic, period) or it did not (zero); a
+# retry never selects, so it can never add a second one. The cost is
+# that a retry no longer redelivers the original guess either -- an
+# acceptable trade (a lost guess, never a doubled one).
+if [ "$PQ_ON" = "1" ]; then
+    PQ_TERMS_LOGGED="${PROMPT_TERMS:-}"
+    PQ_TERMS_LOGGED="${PQ_TERMS_LOGGED// /+}"
+    if [ "${RETRY:-0}" = "1" ]; then
+        mc_log "userprompt outcome=prompt-query-empty reason=retry q=$PQ_TERMS_LOGGED session=${SESSION_ID:-}"
+    elif [ -z "${PROMPT_TERMS:-}" ]; then
+        mc_log "userprompt outcome=prompt-query-empty reason=too-few-terms q= session=${SESSION_ID:-}"
+    elif [ -z "${MEMCONTINUUM_ROOT:-}" ]; then
+        mc_log "userprompt outcome=prompt-query-empty reason=store-root-unset q=$PQ_TERMS_LOGGED session=${SESSION_ID:-}"
+    else
+        PQ_LIB_OK=1
+        # shellcheck source=mc-query-lib.sh
+        source "$SCRIPT_DIR/mc-query-lib.sh" 2>/dev/null || PQ_LIB_OK=0
+        if [ "$PQ_LIB_OK" = "1" ]; then
+            # shellcheck source=mc-fallback-lib.sh
+            source "$SCRIPT_DIR/mc-fallback-lib.sh" 2>/dev/null || PQ_LIB_OK=0
+        fi
+        if [ "$PQ_LIB_OK" != "1" ]; then
+            mc_log "userprompt outcome=prompt-query-empty reason=lib-missing q=$PQ_TERMS_LOGGED session=${SESSION_ID:-}"
+        else
+            # ONE process, mirroring pre-edit-chain.sh's own FB_ARGS
+            # exactly except `--mode fts` always (never
+            # MEMCONTINUUM_FALLBACK_MODE -- this channel never touches the
+            # embedding backend at all) and `--limit 3` (one more than
+            # L1's own `--limit 2`, since an already-surfaced hit can
+            # still consume a slot the exclusion filter below then has to
+            # skip past).
+            PQ_ARGS=(search "$PROMPT_TERMS" --mode fts --project "$MC_PROJECT" --db "$MC_DB_PATH" --limit 3 --json --hydrate --read-only)
+            if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
+                PQ_ARGS+=(--root "$MEMCONTINUUM_ROOT")
+            fi
+            # fb-started marker: same mechanism pre-edit-chain.sh/
+            # newfile-nudge.sh already use (hooks/mc-watchdog.sh's own
+            # kill handler checks for it), so a watchdog kill mid-search
+            # on this channel is visible the same way theirs already is.
+            PQ_STARTED_MARKER="$MEMCONTINUUM_HOME/.fb-started.$$"
+            trap '[ -n "${PQ_STARTED_MARKER:-}" ] && rm -f "$PQ_STARTED_MARKER" 2>/dev/null' EXIT
+            : >"$PQ_STARTED_MARKER" 2>/dev/null || true
+            PQ_MS_T0="$(mc_now_ms "$MC_PY")"
+            # Search subprocess stderr -> /dev/null, never hook.log (same
+            # reason as L1's own fallback: an untimestamped stray line
+            # would break the one-line-per-invocation contract).
+            PQ_JSON="$(env PYTHONPATH= "$MC_PY" "$MC_MEMIDX" "${PQ_ARGS[@]}" 2>/dev/null)"
+            PQ_RC=$?
+            rm -f "$PQ_STARTED_MARKER" 2>/dev/null || true
+            PQ_MS_T1="$(mc_now_ms "$MC_PY")"
+            PQ_MS=""
+            case "$PQ_MS_T0$PQ_MS_T1" in
+                *[!0-9]*|"") ;;
+                *) PQ_MS=$((PQ_MS_T1 - PQ_MS_T0)); [ "$PQ_MS" -lt 0 ] && PQ_MS=0 ;;
+            esac
+            PQ_MS_PART=""
+            [ -n "$PQ_MS" ] && PQ_MS_PART=" pq_ms=$PQ_MS"
+
+            # "the first hit whose id is not already surfaced this
+            # session": EXCLUDE_IDS is SURFACED_IDS (search_fallbacks
+            # union standing_ids, phase 1 above), MAX_HITS=1 (at most one
+            # topic per prompt).
+            mc_fallback_parse "$MC_PY" "$PQ_RC" "$MC_FB_LABEL_PROMPT" 0 "$PQ_JSON" "${SURFACED_IDS:-}" 1
+
+            if [ -z "$FB_HITS" ] || [ "$FB_HITS" = "0" ]; then
+                [ -z "$FB_REASON" ] && FB_REASON="no-hits"
+                mc_log "userprompt outcome=prompt-query-empty reason=$FB_REASON q=$PQ_TERMS_LOGGED$PQ_MS_PART session=${SESSION_ID:-}"
+            else
+                PQ_TEXT="$FB_TEXT"
+                mc_log "userprompt outcome=prompt-query hits=$FB_HITS ids=$FB_IDS q=$PQ_TERMS_LOGGED$PQ_MS_PART session=${SESSION_ID:-}"
+                # No-write property: the search call above is
+                # --read-only; the ONE state write this channel ever
+                # makes is titling, same as L1 -- FILE_PATH is the
+                # literal string "prompt" (there is no file), HOOK_NAME
+                # is "userprompt", so the look-back block's existing
+                # `search surfaced <title> (<id>) for <file>` rendering
+                # names this channel's own hit correctly with no code
+                # change to that block at all. Never stores the terms.
+                # Fix round 1 (MAJOR), refined round 1b: NOT written here
+                # any more -- FB_HITS_FOR_STATE (already set by
+                # mc_fallback_parse above) stays a plain global variable,
+                # untouched, until finish() calls pq_mark_delivered() (see
+                # both of their own header comments) once, AFTER whichever
+                # write closes delivery_open for this turn's outcome. A
+                # write here, before any stdout, is exactly the ordering
+                # Grok's original fixture broke: a kill landing after this
+                # append but before delivery_open closes turns the next
+                # same-prompt_id redelivery into a RETRY. Fix round 3
+                # (Codex final26) is what actually bounds that RETRY to
+                # never selecting a second topic -- it never reaches this
+                # search call at all (see the RETRY check near the top of
+                # this `if` block); this comment's own ordering only keeps
+                # the eventual search_fallbacks entry consistent with what
+                # stdout actually carried, never a second topic on its own.
+            fi
+        fi
+    fi
 fi
 
 # Codex 9 (BLOCKING, fix wave 1 G4): a moved HEAD is now checked on EVERY
@@ -738,7 +1059,7 @@ $NUDGE_FACT"
 
     OUTPUT_JSON="$(UNMAPPED_JSON="$UNMAPPED_JSON" CODE_CHANGED="$CODE_CHANGED" STORE_CHANGED="$STORE_CHANGED" \
         MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" MC_NUDGE_FACT_TEXT="$NUDGE_FACT_TEXT" \
-        MC_CANDIDATE="${CANDIDATE:-0}" \
+        MC_CANDIDATE="${CANDIDATE:-0}" MC_PQ_TEXT="$PQ_TEXT" \
         env PYTHONPATH= "$MC_PY" -c '
 import json, os
 
@@ -754,6 +1075,11 @@ coverage_status = unmapped_out.get("coverage_status", "unknown")
 code_changed = os.environ.get("CODE_CHANGED") == "true"
 store_changed = os.environ.get("STORE_CHANGED") == "true"
 is_candidate = os.environ.get("MC_CANDIDATE") == "1"
+# TOP-0133 L2: the prompt-query channel own already-rendered guess (label
+# + chain text), or "" on a turn it found nothing/never ran. Merged, never
+# re-derived, into whichever branch below actually emits something --
+# order is existing block first, then the guess (point 7).
+pq_text = os.environ.get("MC_PQ_TEXT") or ""
 # The commit nudge (TOP-0122 L1 rule 2a): computed just above, off the SAME
 # unmapped call this fact_line already reads -- shares this same turn
 # delivery/cooldown/dedupe rather than any nudge logic of its own.
@@ -774,10 +1100,13 @@ def yn(v):
 if not is_candidate:
     if not nudge_lines:
         raise SystemExit(3)
+    nudge_ctx = "\n".join(nudge_lines)
+    if pq_text:
+        nudge_ctx += "\n\n" + pq_text
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": "\n".join(nudge_lines),
+            "additionalContext": nudge_ctx,
         }
     }))
     raise SystemExit(0)
@@ -817,6 +1146,8 @@ ctx = fact_line
 for _nl in nudge_lines:
     ctx += "\n" + _nl
 ctx += "\n\n" + question
+if pq_text:
+    ctx += "\n\n" + pq_text
 print(json.dumps({
     "hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",
@@ -828,6 +1159,18 @@ print(json.dumps({
 
     if [ $OUT_RC -eq 0 ] && [ -n "$OUTPUT_JSON" ]; then
         printf '%s\n' "$OUTPUT_JSON"
+        # TOP-0133 L2 (fix round 1b): the guess (if any) was already merged
+        # into OUTPUT_JSON above -- this printf is what actually delivered
+        # it, so mark PQ_EMITTED now (finish() below never re-emits it
+        # standalone for THIS turn's own "injected"/"nudge-only" outcome).
+        # The search_fallbacks state append itself is deferred to finish()
+        # -- it runs AFTER whichever write closes delivery_open for this
+        # outcome (the phase-3 write a few lines below on the CANDIDATE=1
+        # branch, or finish()'s own close write on the nudge-only branch),
+        # never before -- see pq_mark_delivered's own header comment.
+        # Serves both this and the nudge-only outcome -- they share this
+        # one printf.
+        [ -n "$PQ_TEXT" ] && PQ_EMITTED=1
 
         if [ "${CANDIDATE:-0}" = "1" ]; then
             # Phase 3 (locked): commit the injection bookkeeping now that we
@@ -956,6 +1299,7 @@ sys.stdout.write("\n".join(lines))
 ' "$STATE_FILE" 2>>"$MC_LOG")"
 
 LB_OUTPUT_JSON="$(SINCE_TURN="${SINCE_TURN:-0}" MEMCONTINUUM_ROOT="${MEMCONTINUUM_ROOT:-}" HOOK_FB_LOOKBACK="$FB_LOOKBACK_LINES" \
+    MC_PQ_TEXT="$PQ_TEXT" \
     env PYTHONPATH= "$MC_PY" -c '
 import json, os
 
@@ -964,6 +1308,9 @@ Q = chr(39)
 store_root = os.environ.get("MEMCONTINUUM_ROOT") or "<store root not configured>"
 fact = f"Look-back signal — {since} user turns with no edited-file evidence."
 fb_lines = [l for l in os.environ.get("HOOK_FB_LOOKBACK", "").split(chr(10)) if l]
+# TOP-0133 L2: same already-rendered guess as the coverage/nudge envelope
+# above, merged in the same order (existing block first, then the guess).
+pq_text = os.environ.get("MC_PQ_TEXT") or ""
 question = (
     "Did the conversation since then establish any ruling, incident, "
     "rejected alternative, priority, wording choice, money decision, or "
@@ -976,6 +1323,8 @@ ctx = fact
 for fb in fb_lines:
     ctx += "\n" + fb
 ctx += "\n\n" + question
+if pq_text:
+    ctx += "\n\n" + pq_text
 print(json.dumps({
     "hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",
@@ -989,6 +1338,25 @@ if [ -z "$LB_OUTPUT_JSON" ]; then
 fi
 
 printf '%s\n' "$LB_OUTPUT_JSON"
+
+# TOP-0133 L2 (fix round 1b): the guess (if any) was already merged into
+# LB_OUTPUT_JSON above -- this printf is what actually delivered it, so
+# mark PQ_EMITTED now (finish() below never re-emits it standalone for
+# this turn's own "lookback-injected" outcome). The search_fallbacks
+# append itself is deferred to finish() -- it runs AFTER the bookkeeping
+# write just below closes delivery_open, never before -- see
+# pq_mark_delivered's own header comment. Deferring the append past this
+# printf (fix round 1) is also what fixes the double-mention Grok
+# measured: the old write ran right after the search, long before this
+# look-back block even read search_fallbacks to render its own "search
+# surfaced ... for prompt" lines a few statements above -- an exit-3
+# candidate that was also look-back eligible used to see the SAME hit
+# twice in one envelope (the look-back list line AND the guess itself,
+# both computed off a state file the fresh hit had already landed in).
+# The append landing only once this turn's own guess is already on its
+# way out (now later still: after delivery_open closes) keeps that
+# property -- the NEXT look-back turn is still the first one to list it.
+[ -n "$PQ_TEXT" ] && PQ_EMITTED=1
 
 export MC_TURN_NUM="${TURN:-0}"
 export MC_NOW

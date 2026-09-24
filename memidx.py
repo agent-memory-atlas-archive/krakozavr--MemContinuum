@@ -2913,37 +2913,13 @@ def vector_ranked(
 # of silently rotting the reasoning above.
 FTS_STEP_ASIDE_COVERAGE = 0.25
 
-_STOPWORDS = frozenset("""
-a an the is are was were be been being do does did doing have has had having
-i you he she it we they me him her us them my your his its our their this
-that these those to of in on at by for with about against between into
-through during before after above below from up down out off over under
-again further then once here there when where why how all any both each
-few more most other some such no nor not only own same so than too very
-can will just don should now what which who whom or and but if because as
-until while
-""".split())
-_CONTENT_TOKEN_RE = re.compile(r"[a-z0-9]+")
-
-
-def _content_terms(text: str) -> set[str]:
-    """INC-0115: non-stopword, length>1 tokens -- the same definition
-    tests/test_bench.py's paraphrase-independence check uses to verify a
-    paraphrase query shares no vocabulary with its target, now reused (not
-    duplicated) here to decide, at query time, whether the FTS channel's
-    own top hit actually shares any.
-
-    STATED LIMIT (not fixed here -- the owner wants real query data before
-    touching tokenization): `_CONTENT_TOKEN_RE` (`[a-z0-9]+`) drops every
-    1-character and non-ASCII token, on both the query side and the
-    document side. FTS5's own tokenizer keeps 1-character tokens (a bare
-    digit, a single letter used as an identifier), so a query anchored on
-    one -- "the 6 attempts limit", "an x coordinate" -- never puts that
-    anchor into `qtok` at all, even when FTS5 itself matched on it and the
-    document contains it verbatim. Coverage is computed only over the
-    tokens this function keeps; a short, anchor-heavy query can therefore
-    read a lower coverage than FTS5's own match actually earned it."""
-    return {w for w in _CONTENT_TOKEN_RE.findall(text.lower()) if w not in _STOPWORDS and len(w) > 1}
+# _STOPWORDS / _CONTENT_TOKEN_RE / _content_terms: moved to mc_text.py
+# (TOP-0133 L2) so hooks/memlib.sh's `_prompt_terms` field can tokenize a
+# prompt with the SAME content-term definition without importing this whole
+# ~9,000-line module from a hook one-liner. Re-exported here, not copied --
+# `memidx._content_terms is mc_text._content_terms` (see tests/test_bench.py)
+# -- every existing caller in this file keeps working unchanged.
+from mc_text import _STOPWORDS, _CONTENT_TOKEN_RE, _content_terms  # noqa: E402
 
 
 def _fts_top_hit_coverage(conn, project: str, query: str, top_fts_path: str) -> float | None:
@@ -8049,9 +8025,20 @@ UNKNOWN_STATS_PROJECT = "(unknown)"
 # terminal outcome by itself -- a turn that both injects AND nudges a
 # commit writes TWO userprompt lines for the one prompt. Five injected
 # prompts plus five commit-nudge lines used to report ten prompts.
+#
+# TOP-0133 L2: `prompt-query`/`prompt-query-empty` are the SAME kind of
+# supplemental line -- userprompt-remind.sh writes one right after the
+# query, IN ADDITION TO (never instead of) whatever this turn's own real
+# outcome line is (`injected`, `no-evidence`, `lookback-injected`, ...).
+# `prompt-query-only` is deliberately NOT here: it IS a turn's own
+# terminal outcome (parallel to `nudge-only`), the one a turn gets when
+# the guess goes out standalone with nothing else to ride on -- excluding
+# it would undercount real engagement on an opted-in project the same way
+# excluding `nudge-only` would.
 _NON_USER_PROMPT_OUTCOMES = frozenset({
     "duplicate-delivery", "agent-source", "non-user-source",
     "empty-payload", "no-session-id", "no-state", "commit-nudge",
+    "prompt-query", "prompt-query-empty",
 })
 
 _MONTH_ABBR = {
@@ -8255,6 +8242,14 @@ def _new_stats_bucket():
         # at all (the old blind spot: that run logs no `search-fallback`/
         # `-empty` line, ever).
         "fallback_killed": 0,
+        # prompt-derived search queries (TOP-0133 L2): a second, opt-in
+        # search channel off the prompt hook itself -- tallied separately
+        # from the (unrelated) search-fallback counters above, alongside
+        # them in the report (see _stats_report's own "prompt_query"
+        # block).
+        "prompt_query_outcomes": Counter(),
+        "prompt_query_reasons": Counter(),
+        "prompt_query_ms": [],
     }
 
 
@@ -8659,6 +8654,23 @@ def _scan_hook_log(log_path: Path, cutoff: datetime, now: datetime):
             fb_outcome = fields.get("fb_outcome", "")
             if fb_outcome in ("search-fallback", "search-fallback-empty"):
                 _tally_fallback_fields(bucket, fields, fb_outcome, field_prefix="fb_")
+        elif kind == "userprompt":
+            # prompt-derived search queries (TOP-0133 L2): a SEPARATE
+            # `mc_log` line userprompt-remind.sh writes right after the
+            # query, on top of (never folded into) the turn's own outcome
+            # line -- own outcome name space (prompt-query/-empty), own
+            # `reason=`/`q=`/`pq_ms=` fields, same "counted independently"
+            # discipline `_tally_fallback_fields` already gives L1's own
+            # search-fallback lines.
+            if outcome in ("prompt-query", "prompt-query-empty"):
+                bucket["prompt_query_outcomes"][outcome] += 1
+                if outcome == "prompt-query-empty":
+                    reason = fields.get("reason", "")
+                    if reason:
+                        bucket["prompt_query_reasons"][reason] += 1
+                ms_raw = fields.get("pq_ms", "")
+                if ms_raw.isascii() and ms_raw.isdigit():
+                    bucket["prompt_query_ms"].append(int(ms_raw))
         bucket["outcomes"][kind][outcome] += 1
         # userprompt: `user_prompts` is derived at report time from this
         # same outcomes["userprompt"] Counter (round 2, item 8) -- no
@@ -8859,6 +8871,17 @@ def _stats_report(
     fb_ms_p50 = _percentile(fb_ms_sorted, 50)
     fb_ms_p95 = _percentile(fb_ms_sorted, 95)
 
+    # prompt-derived search queries (TOP-0133 L2): a VIEW over
+    # prompt_query_* the same way `fallback` above is a view over
+    # fallback_* -- a second, unrelated search channel, its own report
+    # block, never merged with L1's own fallback counters.
+    pq_outcomes = b["prompt_query_outcomes"]
+    pq_hits = pq_outcomes.get("prompt-query", 0)
+    pq_empty = pq_outcomes.get("prompt-query-empty", 0)
+    pq_ms_sorted = sorted(b["prompt_query_ms"])
+    pq_ms_p50 = _percentile(pq_ms_sorted, 50)
+    pq_ms_p95 = _percentile(pq_ms_sorted, 95)
+
     flags = []
     if args.project != UNKNOWN_STATS_PROJECT:
         if nudges_total >= 3 and ledger_store == 0:
@@ -8958,6 +8981,18 @@ def _stats_report(
             "outcomes": dict(fb_outcomes),
             "reasons": dict(b["fallback_reasons"]),
             "killed": b["fallback_killed"],
+        },
+        # prompt-derived search queries (TOP-0133 L2): a second, opt-in,
+        # FTS-only channel off the prompt hook itself -- its own block,
+        # never merged with `fallback` above (a different query source,
+        # a different label, a different exclusion rule).
+        "prompt_query": {
+            "prompt_query": pq_hits,
+            "prompt_query_empty": pq_empty,
+            "ms_p50": pq_ms_p50,
+            "ms_p95": pq_ms_p95,
+            "outcomes": dict(pq_outcomes),
+            "reasons": dict(b["prompt_query_reasons"]),
         },
         "store_commits": store_commits,
         "unknown_lines": unknown_lines,
@@ -9117,6 +9152,13 @@ def cmd_stats(args) -> int:
               f"hits={fb['search_fallback']} empty={fb['search_fallback_empty']} "
               f"killed={fb['killed']} (reasons: {reasons_txt}) modes={modes_txt} "
               f"ms p50/p95={p50_txt}/{p95_txt} top-ids={top_ids_txt}")
+        pq = result["prompt_query"]
+        pq_p50_txt = "n/a" if pq["ms_p50"] is None else f"{pq['ms_p50']}ms"
+        pq_p95_txt = "n/a" if pq["ms_p95"] is None else f"{pq['ms_p95']}ms"
+        pq_reasons_txt = ", ".join(f"{r}:{c}" for r, c in sorted(pq["reasons"].items())) or "(none)"
+        print(f"prompt query (userprompt-remind.sh, opt-in): "
+              f"hits={pq['prompt_query']} empty={pq['prompt_query_empty']} "
+              f"(reasons: {pq_reasons_txt}) ms p50/p95={pq_p50_txt}/{pq_p95_txt}")
         eb = result["embedding_backlog"]
         rows_txt = "unknown (db unreadable)" if eb["rows_without_fresh_vector"] is None else eb["rows_without_fresh_vector"]
         print(f"embedding backlog: pending-marker={eb['pending_marker']} "

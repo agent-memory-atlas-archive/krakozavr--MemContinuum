@@ -1198,6 +1198,112 @@ class TestStatsFallbackBucket(StatsTestBase):
         self.assertIn("killed=2", out)
 
 
+class TestStatsPromptQueryBucket(StatsTestBase):
+    """prompt-derived search queries (TOP-0133 L2): `stats` tallies
+    userprompt-remind.sh's own supplemental `outcome=prompt-query`/
+    `prompt-query-empty` lines into a SEPARATE "prompt_query" block, never
+    merged with the (unrelated) search-fallback block above -- see
+    memidx.py's own kind == "userprompt" tally branch."""
+
+    def test_hit_and_empty_lines_are_tallied_separately_from_fallback(self):
+        lines = [
+            f"{ts(1)} userprompt outcome=prompt-query hits=1 ids=TOP-1 "
+            "q=widget+cache pq_ms=100 session=s1 project=demo",
+            f"{ts(1)} userprompt outcome=prompt-query-empty "
+            "reason=too-few-terms q= pq_ms= session=s2 project=demo",
+            f"{ts(1)} userprompt outcome=prompt-query-empty "
+            "reason=no-hits q=banana+kayak pq_ms=40 session=s3 project=demo",
+            # A pre-edit search-fallback line must never bleed into this
+            # block -- the two channels stay separate.
+            f"{ts(1)} outcome=search-fallback elapsed=1s hits=1 "
+            "ids=alpha mode=hybrid q=core fb_ms=42 project=demo file=/a.py",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        pq = out["prompt_query"]
+        self.assertEqual(pq["prompt_query"], 1)
+        self.assertEqual(pq["prompt_query_empty"], 2)
+        self.assertEqual(pq["reasons"], {"too-few-terms": 1, "no-hits": 1})
+        # pq_ms= is read from EVERY line that carries a real digit value --
+        # "too-few-terms"'s own empty pq_ms= contributes nothing (never a
+        # bogus 0), so only [100, 40] survive, sorted [40, 100].
+        self.assertEqual(pq["ms_p50"], 40)
+        self.assertEqual(pq["ms_p95"], 100)
+        self.assertEqual(pq["outcomes"], {"prompt-query": 1, "prompt-query-empty": 2})
+        # The unrelated fallback block is untouched by these lines.
+        self.assertEqual(out["fallback"]["search_fallback"], 1)
+        self.assertNotIn("prompt-query", out["fallback"]["outcomes"])
+
+    def test_supplemental_lines_excluded_from_user_prompts_but_prompt_query_only_counts(self):
+        """Codex-12-style supplemental-line discipline (TOP-0133 L2):
+        prompt-query/-empty are ADDITIONAL lines a turn's own real outcome
+        line (injected, no-evidence, lookback-injected, ...) may also
+        write -- they must never inflate user_prompts on their own.
+        prompt-query-only is the OPPOSITE case: it IS a turn's own
+        terminal outcome (parallel to nudge-only) and must count."""
+        lines = [
+            f"{ts(1)} userprompt outcome=prompt-query hits=1 ids=TOP-1 "
+            "q=widget+cache pq_ms=100 session=s1 project=demo",
+            f"{ts(1)} userprompt outcome=lookback-injected turn=1 since=1 "
+            "count=1 session=s1 project=demo",
+            f"{ts(1)} userprompt outcome=prompt-query-empty reason=no-hits "
+            "q=zzz pq_ms=10 session=s2 project=demo",
+            f"{ts(1)} userprompt outcome=no-evidence session=s2 project=demo",
+            f"{ts(1)} userprompt outcome=prompt-query-only session=s3 project=demo",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        # 5 userprompt lines - 2 supplemental (prompt-query, prompt-query-
+        # empty) = 3 real prompts (lookback-injected, no-evidence,
+        # prompt-query-only).
+        self.assertEqual(out["user_prompts"], 3)
+        self.assertEqual(out["prompt_query"]["prompt_query"], 1)
+        self.assertEqual(out["prompt_query"]["prompt_query_empty"], 1)
+
+    def test_no_prompt_query_lines_yields_empty_block_not_a_crash(self):
+        self.write_log([f"{ts(1)} userprompt outcome=no-evidence session=s1 project=demo"])
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        pq = out["prompt_query"]
+        self.assertEqual(pq["prompt_query"], 0)
+        self.assertEqual(pq["prompt_query_empty"], 0)
+        self.assertEqual(pq["reasons"], {})
+        self.assertIsNone(pq["ms_p50"])
+        self.assertIsNone(pq["ms_p95"])
+
+    def test_retry_reason_is_tallied_like_any_other(self):
+        """Fix round 3 (TOP-0133 L2, Codex final26): `reason=retry`
+        (userprompt-remind.sh, a redelivered prompt_id that skipped the
+        search outright) needs no new code here -- the `reasons` tally
+        already reads any `reason=<value>` off a `prompt-query-empty`
+        line generically. This just confirms that generic reading
+        actually covers the new value."""
+        lines = [
+            f"{ts(1)} userprompt outcome=prompt-query-empty "
+            "reason=retry q=widget+cache session=s1 project=demo",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        pq = out["prompt_query"]
+        self.assertEqual(pq["prompt_query_empty"], 1)
+        self.assertEqual(pq["reasons"], {"retry": 1})
+
+    def test_text_mode_prints_a_prompt_query_line(self):
+        lines = [
+            f"{ts(1)} userprompt outcome=prompt-query hits=1 ids=TOP-1 "
+            "q=widget+cache pq_ms=42 session=s1 project=demo",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        self.assertIn("prompt query", out)
+        self.assertIn("hits=1", out)
+        self.assertIn("ms p50/p95=42ms/42ms", out)
+
+
 class TestStatsPreEditTopics(StatsTestBase):
     """eval-topic-logging: `pre_edit.topics_named` (how many matched/
     index-stale-served runs actually named the topics they injected),

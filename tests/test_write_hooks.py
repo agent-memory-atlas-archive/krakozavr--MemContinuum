@@ -476,18 +476,32 @@ class HookTestBase(unittest.TestCase):
 
     def user_prompt_payload(
         self, session_id, source=None, agent_id=None, agent_type=None, prompt_id=None,
-        prompt_key="user_input",
+        prompt_key="prompt", prompt_text=None,
     ):
         """Real-shaped by default (fix-round 2026-08-31): a live
         UserPromptSubmit payload carries no `source` field at all -- that
         field belongs to SessionStart -- so `source` is omitted unless a
         test explicitly passes one (to prove its presence, if it ever
-        shows up again, is a no-op the hook ignores)."""
+        shows up again, is a no-op the hook ignores).
+
+        `prompt_key` defaults to "prompt" (TOP-0133 L2, Addendum A): real
+        UserPromptSubmit payloads on this machine carry the prompt under
+        `prompt`, never `user_input` -- hook.log's own `payload_keys=`
+        lines are the evidence (see docs/INTERNALS.md). A test that needs
+        the OTHER key (proving that one is equally never dereferenced)
+        passes prompt_key="user_input" explicitly.
+
+        `prompt_text` (TOP-0133 L2): the value at `prompt_key`, default a
+        sentinel string standing in for real content ("this text must
+        never be read by the hook") for every test that predates the
+        prompt-query channel and just needs SOME string there. A
+        prompt-query test passes a real (or deliberately term-poor/
+        stopword-only) sentence instead."""
         d = {
             "session_id": session_id,
             "hook_event_name": "UserPromptSubmit",
             "cwd": str(self.code_root),
-            prompt_key: "this text must never be read by the hook",
+            prompt_key: prompt_text if prompt_text is not None else "this text must never be read by the hook",
         }
         if source is not None:
             d["source"] = source
@@ -2578,6 +2592,44 @@ Body.
         log_text = (self.home / "hook.log").read_text()
         self.assertIn("standing=dedup", self._standing_line(log_text))
 
+    def test_resume_dedup_backfills_missing_standing_ids(self):
+        """Fix round 1 (MAJOR, Grok): a session whose state predates this
+        key (standing_hash already stamped by an older engine build,
+        standing_ids never written) must not leave the prompt-query
+        exclusion set silently missing the standing digest's topics
+        until clear/compact. Seed state with today's own standing_hash
+        but no standing_ids (as if an older build wrote it), then
+        resume: still dedup (nothing re-injected, an unchanged digest),
+        but standing_ids is now backfilled and correct."""
+        self._add_standing_topic()
+        session_id = "s-standing-dedup-backfill"
+        proc1, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "startup"), self.base_env()
+        )
+        self.assertTrue(proc1.stdout.strip())
+        state = self.load_state(session_id)
+        self.assertEqual(state.get("standing_ids"), ["TOP-9500"])
+
+        # Simulate a pre-existing state that predates this key: the hash
+        # is already stamped (today's own digest), standing_ids never was.
+        state.pop("standing_ids", None)
+        self.state_file(session_id).write_text(json.dumps(state))
+
+        proc2, _ = run_script(
+            SESSIONSTART_HOOK, self.session_start_payload(session_id, "resume"), self.base_env()
+        )
+        self.assertEqual(
+            proc2.stdout.strip(), "", "an unchanged digest must still dedupe silently"
+        )
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("standing=dedup", self._standing_line(log_text))
+
+        state2 = self.load_state(session_id)
+        self.assertEqual(
+            state2.get("standing_ids"), ["TOP-9500"],
+            "standing_ids must be backfilled on the dedup path",
+        )
+
     def test_clear_always_injects_even_though_a_prior_hash_exists(self):
         self._add_standing_topic()
         session_id = "s-standing-clear"
@@ -3355,23 +3407,41 @@ class TestUserPromptRemind(HookTestBase):
         script -- the point of this test is a real, running hook that still
         never touches user_input, not an absent one that trivially can't):
 
-        1. Static: the script source never references the `user_input` key
-           at all (docs/DESIGN.md ruling B forbids reading it).
+        1. Static: the script source never DEREFERENCES the payload's
+           `user_input` key -- `.get("user_input"` / `["user_input"]`
+           shapes (either python quote style). TOP-0133 L2 amends ruling B
+           (the prompt-query channel may derive query TERMS from the
+           prompt, opt-in only -- see test_never_reads_prompt_key_either
+           below), but that derivation happens ENTIRELY inside
+           hooks/memlib.sh's mc_extract_fields, behind the "_prompt_terms"
+           field NAME -- this script itself never touches the payload's
+           raw `user_input`/`prompt` VALUE, on any turn, on or off. Plain
+           substring checks would now false-positive on this script's own
+           legitimate uses of the bare word (outcome names like
+           `prompt-query`, the `prompt-query.projects` switch file, the
+           literal FILE_PATH string "prompt" passed to
+           mc_fallback_write_state) -- the dereference-shape regex is
+           precise about what ruling B actually forbids.
         2. Dynamic: with a real payload whose user_input carries a poison
-           string, the hook still runs successfully (rc=0, actually injects,
-           since evidence exists) and never leaks that string into its own
-           log.
+           string (channel OFF, the default -- prompt_key explicit here so
+           this keeps testing that exact key), the hook still runs
+           successfully (rc=0, actually injects, since evidence exists)
+           and never leaks that string into its own log.
         """
+        import re
+
         code_lines = [
             line for line in USERPROMPT_HOOK.read_text().splitlines()
             if not line.strip().startswith("#")
         ]
-        offending = [line for line in code_lines if "user_input" in line]
-        self.assertEqual(offending, [], f"script code (not comments) references user_input: {offending}")
+        deref_pattern = re.compile(r'''\.get\(\s*["']user_input["']|\[\s*["']user_input["']\s*\]''')
+        offending = [line for line in code_lines if deref_pattern.search(line)]
+        self.assertEqual(offending, [], f"script code (not comments) dereferences user_input: {offending}")
 
         session_id = "s-prompt-nouserinput"
         self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
-        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        payload = self.user_prompt_payload(session_id, prompt_key="user_input")
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.base_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(proc.stdout.strip(), "expected a real injection (evidence exists)")
 
@@ -3381,19 +3451,24 @@ class TestUserPromptRemind(HookTestBase):
 
     def test_never_reads_prompt_key_either(self):
         """Payload contract addendum (Codex): accept BOTH `user_input` and
-        `prompt` as the payload's prompt-text key -- the not-read invariant
-        must cover both names. Word-boundary regex so `prompt_id` (the
-        dedupe field this addendum adds) and `UserPromptSubmit` don't
-        false-positive."""
+        `prompt` as the payload's prompt-text key -- the not-DEREFERENCE
+        invariant must cover both names (same dereference-shape regex as
+        test_never_reads_user_input above; a bare word-boundary check on
+        `prompt` no longer works post-TOP-0133-L2 -- this script's own
+        code legitimately says `prompt-query`/`prompt-query.projects`/
+        `prompt-query-only` now). Channel OFF (the default, `base_env()`
+        sets neither MEMCONTINUUM_PROMPT_QUERY nor the projects file), so
+        this still proves the unconditional case: even a `prompt`-keyed
+        payload is never dereferenced by this script's own code."""
         import re
 
         code_lines = [
             line for line in USERPROMPT_HOOK.read_text().splitlines()
             if not line.strip().startswith("#")
         ]
-        pattern = re.compile(r"\bprompt\b")
-        offending = [line for line in code_lines if pattern.search(line)]
-        self.assertEqual(offending, [], f"script code (not comments) references bare `prompt`: {offending}")
+        deref_pattern = re.compile(r'''\.get\(\s*["'](?:user_input|prompt)["']|\[\s*["'](?:user_input|prompt)["']\s*\]''')
+        offending = [line for line in code_lines if deref_pattern.search(line)]
+        self.assertEqual(offending, [], f"script code (not comments) dereferences user_input/prompt: {offending}")
 
         session_id = "s-prompt-nopromptkey"
         self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
@@ -4389,6 +4464,981 @@ class TestUserPromptLookback(HookTestBase):
         self.assertIn("count=?", matches[0])
         self.assertNotIn("{", matches[0], "the raw decision JSON must never leak into the log line")
         self.assertNotIn("hookSpecificOutput", matches[0])
+
+
+# ---------------------------------------------------------------------------
+# 5d. userprompt-remind.sh -- prompt-derived search queries (TOP-0133 L2)
+# ---------------------------------------------------------------------------
+
+
+class TestUserPromptPromptQuery(HookTestBase):
+    """The second, opt-in search-fallback channel: the prompt hook derives
+    FTS-only query terms from the user's own prompt text, in process, and
+    discards it. Fixture: TWO topics that both match the same query words
+    (`MATCH_PROMPT` below), ranked deterministically FTS-first TOP-8001,
+    second TOP-8002 (pinned by test_setup_ranking_is_as_expected below) --
+    this is what lets a single fixture exercise both "a hit" and "the
+    first hit is already surfaced, the second is picked instead" without a
+    second store. TOP-8001 also carries a `standing:` pointer, reused by
+    the Addendum B tests. Neither topic's `code_refs` cover any file this
+    class's ledger ever touches, so pre-edit/for-path/coverage never see
+    them by accident -- only the prompt-query channel's own search call
+    can surface either one."""
+
+    MATCH_PROMPT = "please investigate the widget caching regression carefully today"
+    NO_MATCH_PROMPT = "banana pineapple coconut lighthouse trombone yesterday"
+
+    WIDGET_STANDING_TOPIC = """---
+type: topic
+id: TOP-8001
+title: Widget caching policy
+area: testing
+current: L1
+standing: [L1]
+code_refs:
+  - somewhere/else/unrelated1.py
+links:
+  - link: L1
+    date: 2026-01-01
+    status: active
+    kind: adopted
+    ruling:
+      text: "cache the widget carefully during regression"
+      authority: owner-verbatim
+      source: "test"
+    recorded_by: agent
+    recorded_at: 2026-01-01
+---
+
+Body prose about widget caching regression handling in detail.
+"""
+
+    WIDGET_SECOND_TOPIC = """---
+type: topic
+id: TOP-8002
+title: Widget request throttling
+area: testing
+current: L1
+code_refs:
+  - somewhere/else/unrelated2.py
+links:
+  - link: L1
+    date: 2026-01-01
+    status: active
+    kind: adopted
+    ruling:
+      text: "throttle widget requests carefully during regression"
+      authority: owner-verbatim
+      source: "test"
+    recorded_by: agent
+    recorded_at: 2026-01-01
+---
+
+Body prose about widget regression throttling handling in detail.
+"""
+
+    def setUp(self):
+        super().setUp()
+        _write(self.store_root / "topics" / "testing" / "widget-standing.md", self.WIDGET_STANDING_TOPIC)
+        _write(self.store_root / "topics" / "testing" / "widget-second.md", self.WIDGET_SECOND_TOPIC)
+        subprocess.run(["git", "add", "-A"], cwd=self.store_root, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "add widget topics"], cwd=self.store_root, check=True)
+        db = self.home / f"{self.project}.sqlite"
+        with contextlib.redirect_stdout(io.StringIO()):
+            reindex(self.store_root, db, project=self.project)
+
+    def pq_env(self, **overrides):
+        overrides.setdefault("MEMCONTINUUM_PROMPT_QUERY", "1")
+        overrides.setdefault("MEMCONTINUUM_FALLBACK_MODE", "fts")
+        return self.base_env(**overrides)
+
+    def _last_pq_line(self, log_text, needle="prompt-query"):
+        # Exact outcome-token match ("outcome=prompt-query " must never
+        # also match "outcome=prompt-query-only " or "-empty ") --
+        # finish()'s own outcome token can legitimately be
+        # "prompt-query-only" on the SAME line set this helper searches,
+        # so a plain substring test picks up the wrong line.
+        matching = [
+            l for l in log_text.splitlines()
+            if " outcome=" in l and l.split(" outcome=", 1)[1].split(" ", 1)[0] == needle
+        ]
+        self.assertTrue(matching, log_text)
+        return matching[-1]
+
+    def test_setup_ranking_is_as_expected(self):
+        """Not a spec requirement -- pins this fixture's own FTS ranking
+        (TOP-8001 first, TOP-8002 second on MATCH_PROMPT) so a future
+        content edit that silently flips it fails loudly here instead of
+        making test_already_surfaced_falls_through_to_second_topic below
+        fail for the wrong reason."""
+        session_id = "s-pq-ranking-pin"
+        self.seed_ledger(session_id, [])
+        proc, _ = run_script(
+            USERPROMPT_HOOK,
+            self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT),
+            self.pq_env(),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        line = self._last_pq_line(log_text)
+        self.assertIn("outcome=prompt-query ", line)
+        self.assertIn("ids=TOP-8001", line)
+
+    # -- off by default ----------------------------------------------------
+
+    def test_off_by_default_no_line_no_search_no_leak(self):
+        session_id = "s-pq-off-default"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT + " with ten real content words extra")
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertNotIn("prompt-query", log_text)
+        self.assertIn("outcome=no-evidence", log_text)
+        state_text = json.dumps(self.load_state(session_id))
+        for word in ("widget", "caching", "regression", "carefully"):
+            self.assertNotIn(word, log_text)
+            self.assertNotIn(word, state_text)
+            self.assertNotIn(word, proc.stdout)
+
+    # -- the opt-in switch ---------------------------------------------------
+
+    def test_on_via_env(self):
+        session_id = "s-pq-on-env"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Nearest recorded decision by search on this prompt's words -- may be unrelated:", ctx)
+        self.assertIn("TOP-8001", ctx)
+        self.assertIn("cache the widget carefully during regression", ctx)
+
+        state = self.load_state(session_id)
+        fallbacks = state.get("search_fallbacks")
+        self.assertTrue(fallbacks)
+        self.assertEqual(fallbacks[0]["file"], "prompt")
+        self.assertEqual(fallbacks[0]["id"], "TOP-8001")
+        self.assertEqual(fallbacks[0]["title"], "Widget caching policy")
+
+        log_text = (self.home / "hook.log").read_text()
+        line = self._last_pq_line(log_text)
+        self.assertIn("outcome=prompt-query ", line)
+        self.assertIn("hits=1", line)
+        self.assertIn("ids=TOP-8001", line)
+        self.assertIn("q=", line)
+
+        # No-write property: index sha and store git status unchanged.
+        db = self.home / f"{self.project}.sqlite"
+        sha_before = hashlib.sha256(db.read_bytes()).hexdigest()
+        proc2, _ = run_script(
+            USERPROMPT_HOOK,
+            self.user_prompt_payload(session_id + "-2", prompt_text=self.MATCH_PROMPT),
+            self.pq_env(),
+        )
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        sha_after = hashlib.sha256(db.read_bytes()).hexdigest()
+        self.assertEqual(sha_before, sha_after, "the search call must never write to the index")
+        self.assertTrue(git_is_clean(self.store_root), "the search call must never write to the store")
+
+    def test_on_via_projects_file(self):
+        (self.home / "prompt-query.projects").write_text(f"{self.project}\n")
+        session_id = "s-pq-on-file"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=prompt-query ", self._last_pq_line(log_text))
+
+    def test_projects_file_listing_a_different_project_stays_off(self):
+        (self.home / "prompt-query.projects").write_text("some-other-project\n")
+        session_id = "s-pq-off-file-other-project"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertNotIn("prompt-query", log_text)
+
+    def test_env_zero_wins_over_the_projects_file(self):
+        (self.home / "prompt-query.projects").write_text(f"{self.project}\n")
+        session_id = "s-pq-off-env-zero"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.base_env(MEMCONTINUUM_PROMPT_QUERY="0"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertNotIn("prompt-query", log_text)
+
+    # -- the four-content-word gate ------------------------------------------
+
+    def test_three_content_words_too_few_terms(self):
+        session_id = "s-pq-three-words"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text="fix urgent bug")
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        line = self._last_pq_line(log_text, "prompt-query-empty")
+        self.assertIn("outcome=prompt-query-empty reason=too-few-terms q=", line)
+
+    def test_stopwords_and_non_ascii_are_too_few_terms(self):
+        session_id_a = "s-pq-stopwords"
+        self.seed_ledger(session_id_a, [])
+        payload_a = self.user_prompt_payload(session_id_a, prompt_text="the a an is are was")
+        proc_a, _ = run_script(USERPROMPT_HOOK, payload_a, self.pq_env())
+        self.assertEqual(proc_a.returncode, 0, proc_a.stderr)
+        log_a = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=prompt-query-empty reason=too-few-terms", self._last_pq_line(log_a, "prompt-query-empty"))
+
+        session_id_b = "s-pq-nonascii"
+        self.seed_ledger(session_id_b, [])
+        payload_b = self.user_prompt_payload(session_id_b, prompt_text="проверка виджета кэширования сегодня")
+        proc_b, _ = run_script(USERPROMPT_HOOK, payload_b, self.pq_env())
+        self.assertEqual(proc_b.returncode, 0, proc_b.stderr)
+        log_b = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=prompt-query-empty reason=too-few-terms", self._last_pq_line(log_b, "prompt-query-empty"))
+
+    def test_look_back_reminder_survives_filler_with_look_removed(self):
+        """Fix round 2 (TOP-0133 L2, Grok NIT): `_PROMPT_FILLER` used to
+        include "look" -- but this store's own "look-back" (the feature
+        name) tokenizes to `look` + `back`, and `look` is the distinctive
+        half of that compound; filtering it out defeated a search for the
+        store's own feature name. "please explain the look-back reminder
+        design" tokenizes to please/explain/the/look/back/reminder/design;
+        "the" is a stopword, "please"/"explain" stay filler -- with `look`
+        no longer filler, `look back reminder design` survives: four
+        terms, clears the too-few-terms gate, and `look` itself is among
+        them (q= in the log line, +-joined)."""
+        session_id = "s-pq-lookback-term"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(
+            session_id, prompt_text="please explain the look-back reminder design",
+        )
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        line = self._last_pq_line(log_text, "prompt-query-empty")
+        self.assertNotIn("too-few-terms", line, line)
+        self.assertIn("reason=no-hits", line, line)
+        q_field = next(p for p in line.split() if p.startswith("q="))
+        terms = q_field[len("q="):].split("+")
+        self.assertIn("look", terms, terms)
+
+    # -- no hits --------------------------------------------------------------
+
+    def test_no_fts_match_reason_no_hits(self):
+        session_id = "s-pq-no-hits"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.NO_MATCH_PROMPT)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("reason=no-hits", self._last_pq_line(log_text, "prompt-query-empty"))
+        self.assertEqual(proc.stdout.strip(), "", "no other block fired either -- nothing to inject")
+
+    # -- per-session dedup (Addendum B: search_fallbacks union standing_ids) -
+
+    def test_already_surfaced_when_both_matching_topics_excluded(self):
+        session_id = "s-pq-both-excluded"
+        self.seed_ledger(session_id, [])
+        self.patch_state(
+            session_id,
+            search_fallbacks=[
+                {"file": "prompt", "id": "TOP-8001", "title": "Widget caching policy", "hook": "userprompt"},
+                {"file": "prompt", "id": "TOP-8002", "title": "Widget request throttling", "hook": "userprompt"},
+            ],
+        )
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        line = self._last_pq_line(log_text, "prompt-query-empty")
+        self.assertIn("reason=already-surfaced", line)
+        self.assertNotIn("TOP-8001", proc.stdout)
+        self.assertNotIn("TOP-8002", proc.stdout)
+
+    def test_already_surfaced_falls_through_to_second_topic(self):
+        """search_fallbacks already carries the first-ranked topic (as if
+        pre-edit-chain.sh surfaced it earlier this session) -- with
+        --limit 3 the second, different matching topic is picked instead."""
+        session_id = "s-pq-first-excluded"
+        self.seed_ledger(session_id, [])
+        self.patch_state(
+            session_id,
+            search_fallbacks=[
+                {"file": "/some/file.py", "id": "TOP-8001", "title": "Widget caching policy", "hook": "pre-edit-chain"},
+            ],
+        )
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        line = self._last_pq_line(log_text)
+        self.assertIn("outcome=prompt-query ", line)
+        self.assertIn("ids=TOP-8002", line)
+        self.assertIn("TOP-8002", proc.stdout)
+        self.assertNotIn("TOP-8001", proc.stdout)
+
+    def test_standing_topic_already_surfaced_falls_through(self):
+        """Addendum B: a topic the session-start standing digest already
+        delivered (state["standing_ids"], written by
+        sessionstart-remind.sh) is excluded the same way a search-fallback
+        hit is -- the next matching, non-standing topic is picked."""
+        session_id = "s-pq-standing-excluded"
+        self.seed_ledger(session_id, [])
+        self.patch_state(session_id, standing_ids=["TOP-8001"])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        line = self._last_pq_line(log_text)
+        self.assertIn("outcome=prompt-query ", line)
+        self.assertIn("ids=TOP-8002", line)
+        self.assertIn("TOP-8002", proc.stdout)
+        self.assertNotIn("TOP-8001", proc.stdout)
+
+    # -- merge into the three existing emission points -----------------------
+
+    def test_merge_into_coverage_envelope(self):
+        session_id = "s-pq-merge-coverage"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # ONE stdout JSON document.
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Coverage signal", ctx)
+        self.assertIn("Nearest recorded decision by search on this prompt's words -- may be unrelated:", ctx)
+        # Order: existing block first, then the guess.
+        self.assertLess(ctx.index("Coverage signal"), ctx.index("Nearest recorded decision"))
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=injected", log_text)
+        self.assertIn("outcome=prompt-query ", self._last_pq_line(log_text))
+        self.assertNotIn("outcome=prompt-query-only", log_text)
+
+    def test_merge_into_lookback_envelope(self):
+        session_id = "s-pq-merge-lookback"
+        run_script(SESSIONSTART_HOOK, self.session_start_payload(session_id, "startup"), self.base_env())
+        self.seed_ledger(session_id, [])
+        # Four silent warm-up turns (channel OFF, so these never surface
+        # TOP-8001/TOP-8002 themselves and never consume the exclusion
+        # budget) to reach the look-back's own turn-5 threshold, exactly
+        # TestUserPromptLookback's own pattern.
+        for _ in range(4):
+            run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Look-back signal", ctx)
+        self.assertIn("Nearest recorded decision by search on this prompt's words -- may be unrelated:", ctx)
+        self.assertLess(ctx.index("Look-back signal"), ctx.index("Nearest recorded decision"))
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=lookback-injected", log_text)
+        self.assertNotIn("outcome=prompt-query-only", log_text)
+
+    def test_exit3_coverage_candidate_falls_through_to_lookback_no_double_mention(self):
+        """Fix round 2 (TOP-0133 L2, Grok NIT): a turn that IS a coverage
+        candidate (ledger grew, cooldown open) but whose classification
+        finds no evidence (`raise SystemExit(3)` in the coverage python
+        block, hooks/userprompt-remind.sh's own OUTPUT_JSON transform)
+        prints no coverage envelope -- OUT_RC=3, OUTPUT_JSON empty -- and
+        falls straight through to the SAME turn's own look-back check.
+        Before fix round 1's append-after-delivery reordering, that
+        look-back block's "search surfaced ... for prompt" listing (read
+        from search_fallbacks BEFORE this turn's own append) and the
+        guess itself (merged in fresh off PQ_TEXT) could land in the SAME
+        envelope once an exit-3 candidate coincided with a look-back-
+        eligible turn -- the double-mention Grok's own fixture measured.
+        Ledger seeded with the ALREADY-mapped file (src/mapped.py,
+        covered by TOP-9001) makes candidate=1 (pairs non-empty, grew,
+        cooldown open) but has_evidence=False (coverage_status ok,
+        unmapped=[], neither HEAD moved) -- the exit-3 shape -- while
+        patch_state jumps straight to turn 5 so the SAME turn is also
+        look-back eligible."""
+        session_id = "s-pq-exit3-lookback"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "mapped.py"), "code")])
+        # Baseline start_code_sha/start_store_sha directly to the CURRENT
+        # code/store HEADs -- with no baseline at all, both read as
+        # "changed" (code_changed/store_changed true), which alone would
+        # satisfy has_evidence and this turn would never reach the exit-3
+        # shape this test needs. A real SessionStart call would set this
+        # same baseline, but it would ALSO run the standing digest --
+        # WIDGET_STANDING_TOPIC carries `standing: [L1]`, so that digest
+        # would deliver TOP-8001 itself and exclude it from this turn's
+        # own prompt-query search (Addendum B), picking TOP-8002 instead
+        # and defeating this test's fixed expectations below.
+        self.patch_state(
+            session_id,
+            start_code_sha=git_head(self.code_root),
+            start_store_sha=git_head(self.store_root),
+            user_turn_count=4,
+        )
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        # exactly one JSON document on stdout
+        lines = proc.stdout.strip().splitlines()
+        self.assertEqual(len(lines), 1, proc.stdout)
+        out = json.loads(lines[0])
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Look-back signal", ctx)
+        self.assertNotIn("Coverage signal", ctx, "an exit-3 candidate must never also print a coverage envelope")
+        self.assertIn("Nearest recorded decision by search on this prompt's words -- may be unrelated:", ctx)
+        # the guess text present exactly once ...
+        self.assertEqual(ctx.count("TOP-8001"), 1, ctx)
+        # ... and no "search surfaced ... for prompt" line for THIS turn's
+        # own fresh hit in the SAME document (the append that would add
+        # it to search_fallbacks runs strictly after this printf).
+        self.assertNotIn("search surfaced", ctx, ctx)
+
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=lookback-injected", log_text)
+
+        state = self.load_state(session_id)
+        fallbacks = state.get("search_fallbacks") or []
+        self.assertEqual(len(fallbacks), 1)
+        self.assertEqual(fallbacks[0].get("id"), "TOP-8001")
+
+        # the NEXT look-back turn (channel off, no fresh search needed)
+        # DOES list it -- the deferred append already landed by now, and
+        # this later read sees it.
+        self.patch_state(session_id, user_turn_count=9)
+        proc2, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertIn("Look-back signal", proc2.stdout)
+        self.assertIn(
+            "search surfaced Widget caching policy (TOP-8001) for prompt",
+            proc2.stdout,
+        )
+
+    def test_silent_turn_emits_standalone_and_delivery_open_ends_false(self):
+        """A turn with neither coverage nor look-back evidence would
+        otherwise print nothing at all -- the guess goes out standalone,
+        under its own outcome token (Addendum C), and delivery_open still
+        ends false (Addendum C: closes it, stamps nothing else)."""
+        session_id = "s-pq-standalone"
+        self.seed_ledger(session_id, [])
+        state_before = self.load_state(session_id)
+        # A real prompt_id opens delivery_open this turn (mirrors the
+        # existing dual-gate machinery) so the "ends false" half of this
+        # assertion is actually exercising something.
+        payload = self.user_prompt_payload(
+            session_id, prompt_text=self.MATCH_PROMPT, prompt_id="pq-standalone-1",
+        )
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Nearest recorded decision by search on this prompt's words -- may be unrelated:", ctx)
+        self.assertNotIn("Coverage signal", ctx)
+        self.assertNotIn("Look-back signal", ctx)
+
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=prompt-query-only", log_text)
+        self.assertNotIn("outcome=no-evidence", log_text)
+
+        state = self.load_state(session_id)
+        self.assertFalse(state.get("delivery_open"), "a standalone guess must still close delivery_open")
+        # Fix round 1b: the append now runs AFTER the close write above (in
+        # finish() itself, guarded by PQ_EMITTED) rather than before it --
+        # the observable end state is unchanged: the entry is still there.
+        fallbacks = state.get("search_fallbacks") or []
+        self.assertEqual(len(fallbacks), 1, "the delivered guess must still be appended to search_fallbacks")
+        self.assertEqual(fallbacks[0].get("id"), "TOP-8001")
+        # Addendum C: stamps NOTHING else -- every one of these fields
+        # stays exactly what it was BEFORE this turn ran (seed_ledger's
+        # own defaults, e.g. last_inject_time=0), never advanced by the
+        # standalone emission.
+        for key in ("last_inject_turn", "last_inject_time", "last_inject_ts", "lookback_count"):
+            self.assertEqual(state.get(key), state_before.get(key), f"{key} must be untouched by a standalone guess")
+
+    # -- subagent / duplicate-delivery gates run first ------------------------
+
+    def test_subagent_payload_stays_off_no_line(self):
+        session_id = "s-pq-subagent"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, agent_id="agent-1", prompt_text=self.MATCH_PROMPT)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertNotIn("prompt-query", log_text)
+        self.assertIn("outcome=agent-source", log_text)
+
+    def test_duplicate_delivery_never_searches_twice(self):
+        session_id = "s-pq-dup"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT, prompt_id="pq-dup-1")
+        proc1, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        proc2, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertEqual(proc2.stdout.strip(), "")
+        log_text = (self.home / "hook.log").read_text()
+        pq_lines = [l for l in log_text.splitlines() if " outcome=prompt-query " in l or l.rstrip().endswith("outcome=prompt-query")]
+        self.assertEqual(len(pq_lines), 1, log_text)
+        self.assertIn("outcome=duplicate-delivery", log_text)
+
+    def test_resubmit_after_completed_run_is_plain_duplicate_one_entry(self):
+        """Fix round 1b (TOP-0133 L2): a kill landing in the window between
+        the write that closes delivery_open and the search_fallbacks
+        append (the residual defect this round fixes) can no longer be
+        observed from outside the process -- the append now runs strictly
+        after that close, inside finish(), so the moment a run's own
+        process has exited at all, delivery_open is already false and any
+        redelivery of the SAME prompt_id reads as a plain duplicate, not a
+        retry. Exercised end-to-end: run once for real (a genuine
+        completed turn, no simulated rewind), resubmit the identical
+        prompt_id, and confirm the second run neither re-searches (no new
+        `outcome=prompt-query` line, no stdout) nor double-appends (still
+        exactly one search_fallbacks entry)."""
+        session_id = "s-pq-dup-completed"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT, prompt_id="pq-dup-completed-1")
+
+        proc1, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        state1 = self.load_state(session_id)
+        self.assertFalse(state1.get("delivery_open"), "a completed run must leave delivery_open false")
+        self.assertEqual(len(state1.get("search_fallbacks") or []), 1)
+
+        proc2, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertEqual(proc2.stdout.strip(), "", "a duplicate delivery must print nothing")
+
+        log_text = (self.home / "hook.log").read_text()
+        pq_lines = [
+            l for l in log_text.splitlines()
+            if " outcome=prompt-query " in l or l.rstrip().endswith("outcome=prompt-query")
+        ]
+        self.assertEqual(len(pq_lines), 1, "a duplicate must never re-search: still exactly one prompt-query line")
+        self.assertIn("outcome=duplicate-delivery", log_text)
+
+        state2 = self.load_state(session_id)
+        self.assertFalse(state2.get("delivery_open"))
+        self.assertEqual(len(state2.get("search_fallbacks") or []), 1, "one entry, not two")
+
+    def test_append_transform_itself_closes_delivery_open_fix_round_2(self):
+        """Fix round 2 (TOP-0133 L2, Grok NIT): pq_mark_delivered's own
+        search_fallbacks append (mc_fallback_write_state's CLOSE_DELIVERY
+        arg) now sets delivery_open=False itself, inside the SAME locked
+        write, rather than relying solely on a separate close write that
+        ran a moment earlier -- a lock-wait timeout or a skipped close on
+        some future outcome branch could otherwise leave that separate
+        write undone while the append still ran, leaving delivery_open
+        true with the hit already excluded (a redelivery would then
+        misread as a retry and take a SECOND topic). Forcing that
+        specific separate-close-failed shape is not exercisable from
+        outside the process; this instead pins the postcondition the fix
+        guarantees end-to-end. NOTE (fix round 3, Codex final26 review):
+        a standalone guess is NOT the one outcome with no separate close
+        write of its own -- finish() DOES perform one, for any outcome
+        other than "injected"/"lookback-injected" (a standalone guess's
+        own outcome, "prompt-query-only", is neither), strictly before
+        calling pq_mark_delivered. The CLOSE_DELIVERY arg is a SECOND,
+        REDUNDANT close covering that first one failing (a lock timeout,
+        a skipped branch), not the only close on this path -- this test
+        still ends up asserting the right thing (delivery_open false
+        after a standalone guess) because BOTH the ordinary close and the
+        redundant one succeed in the common case this test exercises; it
+        is not, by itself, proof the redundant close is what did the
+        work."""
+        session_id = "s-pq-append-closes"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(
+            session_id, prompt_text=self.MATCH_PROMPT, prompt_id="pq-append-closes-1",
+        )
+        proc1, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        self.assertIn("outcome=prompt-query-only", (self.home / "hook.log").read_text())
+        state1 = self.load_state(session_id)
+        self.assertFalse(state1.get("delivery_open"), "the append's own transform must leave delivery_open false")
+        self.assertEqual(len(state1.get("search_fallbacks") or []), 1)
+
+        proc2, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertEqual(proc2.stdout.strip(), "", "a duplicate delivery must print nothing")
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=duplicate-delivery", log_text)
+        state2 = self.load_state(session_id)
+        self.assertFalse(state2.get("delivery_open"))
+        self.assertEqual(len(state2.get("search_fallbacks") or []), 1, "one entry, not two")
+
+    # -- the prompt-text invariant --------------------------------------------
+
+    def test_prompt_text_never_leaks_only_individual_terms_do(self):
+        """A distinctive 6-word sentence that matches nothing in the store
+        (NO_MATCH_PROMPT): no 3-word-or-longer substring of it appears
+        anywhere in hook.log, the state file, or stdout -- terms show up
+        only individually, space-replaced-by-'+' in `q=`. The terms are
+        also never written to state (only ids/titles are, and only on a
+        hit -- this is a no-hit turn, so search_fallbacks stays empty)."""
+        session_id = "s-pq-invariant"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.NO_MATCH_PROMPT)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        log_text = (self.home / "hook.log").read_text()
+        state_text = json.dumps(self.load_state(session_id))
+        words = self.NO_MATCH_PROMPT.split()
+        for i in range(len(words) - 2):
+            substring = " ".join(words[i:i + 3])
+            self.assertNotIn(substring, log_text)
+            self.assertNotIn(substring, state_text)
+            self.assertNotIn(substring, proc.stdout)
+        # Individual terms DO appear, +-joined, in q=.
+        self.assertIn("banana+pineapple+coconut", log_text)
+        state = self.load_state(session_id)
+        self.assertNotIn("search_fallbacks", state)
+
+    # -- latency ---------------------------------------------------------------
+
+    def test_latency_under_one_second_on_hit_turn(self):
+        """Same generous bound test_latency_under_one_second_with_twenty_
+        path_ledger_poisoned_pythonpath uses -- see the final report
+        message for the actual measured number on this machine."""
+        session_id = "s-pq-latency"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT)
+        proc, elapsed = run_script(USERPROMPT_HOOK, payload, self.pq_env(), timeout=10.0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Nearest recorded decision", proc.stdout)
+        self.assertLess(elapsed, 1.0, f"userprompt hook (prompt-query ON, hit) took {elapsed:.3f}s")
+
+    # -- fix round 1 (Grok) --------------------------------------------------
+
+    def test_two_char_tokens_are_dropped_too_few_terms(self):
+        """Fix round 1 (MINOR, Grok): a wrong implementation that keeps
+        2-character tokens would find 4 terms here ("ok", "go", "fix",
+        "bug") and search; the real gate drops tokens under 3 characters
+        (and, since fix round 1, filler/stopwords too) -- only "fix" and
+        "bug" survive ("ok"/"go" are 2 characters, "the"/"now" are
+        stopwords, "please" is filler) -- too-few-terms."""
+        session_id = "s-pq-two-char-tokens"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text="ok go fix the bug now please")
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        line = self._last_pq_line(log_text, "prompt-query-empty")
+        self.assertIn("outcome=prompt-query-empty reason=too-few-terms", line)
+
+    def test_prompt_terms_field_requested_only_when_on(self):
+        """Fix round 1 (MINOR, Grok): a wrong implementation that always
+        requests "_prompt_terms" from mc_extract_fields (rather than only
+        when PQ_ON=1) would defeat the OFF-project "the prompt is never
+        read" proof even though no test asserting on OUTPUT would catch
+        it -- test_never_reads_prompt_key_either only flags a `.get(...)`
+        dereference inside userprompt-remind.sh's OWN code, not the field
+        list it hands to mc_extract_fields. Proven via a real seam
+        (MC_MEMLIB_PATH, the same seam test_outer_deadline_covers_
+        memlib_sourcing above uses): a shim sources the real memlib.sh,
+        then wraps mc_extract_fields to log its FIELD NAMES ONLY (argv
+        from position 2 on -- never argv[1], the raw payload) to a file
+        before delegating to the real implementation."""
+        argv_log = Path(self.td) / "extract-argv.log"
+        shim = Path(self.td) / "shim-memlib.sh"
+        shim.write_text(
+            "source " + shlex.quote(str(MEMLIB)) + "\n"
+            "eval \"$(declare -f mc_extract_fields | "
+            "sed '1s/mc_extract_fields/_orig_mc_extract_fields/')\"\n"
+            "mc_extract_fields() {\n"
+            "    local _payload=\"$1\"\n"
+            "    shift\n"
+            "    printf '%s\\n' \"$*\" >> " + shlex.quote(str(argv_log)) + "\n"
+            "    _orig_mc_extract_fields \"$_payload\" \"$@\"\n"
+            "}\n"
+        )
+
+        session_id_off = "s-pq-fieldlist-off"
+        self.seed_ledger(session_id_off, [])
+        proc_off, _ = run_script(
+            USERPROMPT_HOOK,
+            self.user_prompt_payload(session_id_off, prompt_text=self.MATCH_PROMPT),
+            self.base_env(MC_MEMLIB_PATH=str(shim)),
+        )
+        self.assertEqual(proc_off.returncode, 0, proc_off.stderr)
+        off_log = argv_log.read_text() if argv_log.exists() else ""
+        self.assertEqual(off_log.count("_prompt_terms"), 0, off_log)
+
+        if argv_log.exists():
+            argv_log.unlink()
+
+        session_id_on = "s-pq-fieldlist-on"
+        self.seed_ledger(session_id_on, [])
+        proc_on, _ = run_script(
+            USERPROMPT_HOOK,
+            self.user_prompt_payload(session_id_on, prompt_text=self.MATCH_PROMPT),
+            self.pq_env(MC_MEMLIB_PATH=str(shim)),
+        )
+        self.assertEqual(proc_on.returncode, 0, proc_on.stderr)
+        on_log = argv_log.read_text() if argv_log.exists() else ""
+        self.assertEqual(on_log.count("_prompt_terms"), 1, on_log)
+
+    def test_retry_after_kill_before_stdout_delivers_once_not_twice(self):
+        """Fix round 3 (MAJOR, Codex final26): a RETRY turn (delivery_open
+        still true because a kill landed before either close write could
+        run) now skips the prompt-query search ENTIRELY instead of re-
+        running it -- RETRY is exported from the one-shot decision reader
+        and checked before anything else inside `if [ "$PQ_ON" = "1" ]`
+        (userprompt-remind.sh). This is a deliberate contract change from
+        fix round 1: a retry used to re-search and redeliver the SAME
+        guess (safe only because nothing had been excluded yet); Codex
+        showed that guarantee breaks the moment an intervening write
+        excludes the original hit before the redelivery, since re-
+        searching then surfaces a DIFFERENT topic for the same prompt.
+        Skipping the search on every retry makes "at most one topic per
+        prompt" hold by construction instead: the first delivery either
+        reached stdout (one topic) or it did not (zero) -- a retry never
+        selects, so it can never select a second, different one either.
+        Simulated by running once for real, then rewinding state to
+        exactly the kill-before-close shape (undo this run's own append,
+        reopen delivery_open) before resubmitting the identical
+        prompt_id."""
+        session_id = "s-pq-retry"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT, prompt_id="pq-retry-1")
+        proc1, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        self.assertIn("TOP-8001", proc1.stdout)
+        state1 = self.load_state(session_id)
+        self.assertFalse(state1.get("delivery_open"))
+        self.assertEqual(len(state1.get("search_fallbacks") or []), 1)
+        turn_after_first = state1.get("user_turn_count")
+
+        state_file = self.state_file(session_id)
+        state = json.loads(state_file.read_text())
+        state.pop("search_fallbacks", None)
+        state["delivery_open"] = True
+        state_file.write_text(json.dumps(state))
+
+        proc2, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertNotIn("TOP-8001", proc2.stdout, "a retry must never re-select any topic, not even the original")
+        self.assertNotIn("TOP-8002", proc2.stdout, "a retry must never select a second, different topic")
+
+        state2 = self.load_state(session_id)
+        self.assertFalse(state2.get("delivery_open"))
+        self.assertEqual(
+            len(state2.get("search_fallbacks") or []), 0,
+            "a retry runs no search at all -- nothing new is ever appended",
+        )
+        self.assertEqual(
+            state2.get("user_turn_count"), turn_after_first,
+            "a retry must not double-advance the turn counter",
+        )
+
+        log_text = (self.home / "hook.log").read_text()
+        pq_lines = [
+            l for l in log_text.splitlines()
+            if " outcome=prompt-query " in l or l.rstrip().endswith("outcome=prompt-query")
+        ]
+        self.assertEqual(len(pq_lines), 1, "a retry must never search: still exactly one real hit line, from run 1")
+        self.assertIn("outcome=prompt-query-empty reason=retry", log_text)
+
+    def test_codex_finding_retry_never_yields_second_topic_even_with_intervening_fallback(self):
+        """Codex's own reproduction (final26 review, MAJOR): a kill after
+        the guess already reached stdout but before EITHER close write
+        (finish()'s own, or pq_mark_delivered's) lands leaves
+        delivery_open true with NOTHING written to search_fallbacks for
+        that hit. If, in that same window, an UNRELATED L1 fallback hook
+        (pre-edit-chain.sh/newfile-nudge.sh's own shape) independently
+        appends the SAME id to search_fallbacks for a different file --
+        a real, legitimate event this fix must not depend on the absence
+        of -- the redelivered prompt_id must still read as a RETRY and
+        select nothing new: never TOP-8002, regardless of what
+        search_fallbacks already holds by the time it runs."""
+        session_id = "s-pq-retry-codex"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT, prompt_id="pq-retry-codex-1")
+        proc1, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        self.assertIn("TOP-8001", proc1.stdout)
+
+        # Simulate: both the normal close and pq_mark_delivered's own
+        # append were lost to a kill -- delivery_open reopened, this
+        # run's own search_fallbacks entry undone.
+        state_file = self.state_file(session_id)
+        state = json.loads(state_file.read_text())
+        state["delivery_open"] = True
+        # An unrelated L1 hook independently surfaces the SAME id for a
+        # DIFFERENT file, in the SAME session, moments later -- a real
+        # event, not this run's own (undone) append.
+        state["search_fallbacks"] = [{
+            "file": "somewhere/else/unrelated1.py",
+            "id": "TOP-8001",
+            "title": "Widget caching policy",
+            "hook": "pre-edit",
+        }]
+        state_file.write_text(json.dumps(state))
+
+        proc2, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertNotIn("TOP-8001", proc2.stdout)
+        self.assertNotIn("TOP-8002", proc2.stdout, "must never surface a second topic for the same prompt")
+
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=prompt-query-empty reason=retry", log_text)
+
+        state2 = self.load_state(session_id)
+        self.assertFalse(state2.get("delivery_open"))
+        self.assertEqual(
+            len(state2.get("search_fallbacks") or []), 1,
+            "the intervening L1 entry is left exactly as it was -- a retry adds nothing",
+        )
+
+    def test_grep_qxf_project_name_with_dot_is_literal_not_regex(self):
+        """Fix round 1 (MINOR, Grok): grep -qx treats $MC_PROJECT as a
+        REGEX matched against each line of the projects file -- a project
+        name containing a metacharacter (a bare ".") then matches a
+        DIFFERENT line ("." matches any single character). project =
+        "hook.test", file line "hook-test": under plain -qx this reads as
+        a match (WRONG -- a dash-substituted line must never enable a
+        different project); -qxF requires a literal match, so this must
+        stay OFF. The positive control (the file's own literal name)
+        proves ON still works with -F."""
+        original_project = self.project
+        self.addCleanup(setattr, self, "project", original_project)
+        self.project = "hook.test"
+
+        (self.home / "prompt-query.projects").write_text("hook-test\n")
+        session_id_off = "s-pq-dot-project-off"
+        self.seed_ledger(session_id_off, [])
+        payload_off = self.user_prompt_payload(session_id_off, prompt_text=self.MATCH_PROMPT)
+        proc_off, _ = run_script(USERPROMPT_HOOK, payload_off, self.base_env())
+        self.assertEqual(proc_off.returncode, 0, proc_off.stderr)
+        log_off = (self.home / "hook.log").read_text() if (self.home / "hook.log").exists() else ""
+        self.assertNotIn("prompt-query", log_off)
+
+        (self.home / "prompt-query.projects").write_text("hook.test\n")
+        session_id_on = "s-pq-dot-project-on"
+        self.seed_ledger(session_id_on, [])
+        payload_on = self.user_prompt_payload(session_id_on, prompt_text=self.MATCH_PROMPT)
+        proc_on, _ = run_script(USERPROMPT_HOOK, payload_on, self.base_env())
+        self.assertEqual(proc_on.returncode, 0, proc_on.stderr)
+        log_on = (self.home / "hook.log").read_text()
+        self.assertIn("prompt-query", log_on)
+
+
+class TestMcFallbackParseExcludeIdsMaxHits(unittest.TestCase):
+    """hooks/mc-fallback-lib.sh's mc_fallback_parse (TOP-0133 L2): the two
+    new optional args (EXCLUDE_IDS, MAX_HITS) the prompt-query channel
+    needs, exercised by sourcing the library directly and calling the
+    function -- same in-process-shell approach TestQueryLib
+    (tests/test_hooks.py) already uses for mc-query-lib.sh."""
+
+    FB_LIB = HOOKS_DIR / "mc-fallback-lib.sh"
+    TWO_HIT_JSON = json.dumps({
+        "results": [
+            {"id": "TOP-1", "title": "one", "chain_text": "chain one"},
+            {"id": "TOP-2", "title": "two", "chain_text": "chain two"},
+        ]
+    })
+
+    def _parse(self, raw_json, exclude_ids="", max_hits=""):
+        script = (
+            f'source {shlex.quote(str(self.FB_LIB))}; '
+            f'mc_fallback_parse {shlex.quote(VENV_PYTHON)} 0 LABEL 1 '
+            f'{shlex.quote(raw_json)} {shlex.quote(exclude_ids)} {shlex.quote(max_hits)}; '
+            'echo "HITS=$FB_HITS"; echo "IDS=$FB_IDS"; echo "REASON=$FB_REASON"'
+        )
+        proc = subprocess.run([MC_BASH, "-c", script], capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = {}
+        for line in proc.stdout.splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                out[k] = v
+        return out
+
+    def test_five_arg_form_unchanged(self):
+        """No EXCLUDE_IDS/MAX_HITS args at all -- byte-identical to the
+        pre-L2 behavior: both hits survive, in order."""
+        script = (
+            f'source {shlex.quote(str(self.FB_LIB))}; '
+            f'mc_fallback_parse {shlex.quote(VENV_PYTHON)} 0 LABEL 1 {shlex.quote(self.TWO_HIT_JSON)}; '
+            'echo "HITS=$FB_HITS"; echo "IDS=$FB_IDS"; echo "REASON=$FB_REASON"'
+        )
+        proc = subprocess.run([MC_BASH, "-c", script], capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("HITS=2", proc.stdout)
+        self.assertIn("IDS=TOP-1,TOP-2", proc.stdout)
+        self.assertIn("REASON=", proc.stdout)
+
+    def test_exclude_one_id_leaves_the_other(self):
+        out = self._parse(self.TWO_HIT_JSON, exclude_ids="TOP-1")
+        self.assertEqual(out["HITS"], "1")
+        self.assertEqual(out["IDS"], "TOP-2")
+        self.assertEqual(out["REASON"], "")
+
+    def test_exclude_both_ids_yields_already_surfaced(self):
+        out = self._parse(self.TWO_HIT_JSON, exclude_ids="TOP-1,TOP-2")
+        self.assertEqual(out["HITS"], "0")
+        self.assertEqual(out["REASON"], "already-surfaced")
+
+    def test_max_hits_one_stops_after_first_surviving_hit(self):
+        out = self._parse(self.TWO_HIT_JSON, max_hits="1")
+        self.assertEqual(out["HITS"], "1")
+        self.assertEqual(out["IDS"], "TOP-1")
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestMcFallbackWriteStateCloseDelivery(unittest.TestCase):
+    """Direct library test (fix round 3, TOP-0133 L2, Codex final26 MINOR):
+    mc_fallback_write_state's 6th arg (CLOSE_DELIVERY) proven in isolation
+    against a pre-seeded state file, rather than only end to end through a
+    full hook run. Seeds delivery_open=true, calls the function with the
+    6th arg "1" and confirms it flips to false in the SAME locked write; a
+    control call omitting the 6th arg (the 5-arg form) proves delivery_open
+    is left untouched otherwise -- the two together are what the library
+    comment above the function now claims (a REDUNDANT close, not the only
+    one), not a no-op."""
+
+    FB_LIB = HOOKS_DIR / "mc-fallback-lib.sh"
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-fbwrite-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+
+    def _seed_state(self, name: str) -> Path:
+        state_file = Path(self.td) / f"{name}.json"
+        state_file.write_text(json.dumps({"delivery_open": True, "user_turn_count": 3}))
+        return state_file
+
+    def _call(self, state_file: Path, close_delivery_arg: str) -> subprocess.CompletedProcess:
+        script = (
+            f'source {shlex.quote(str(MEMLIB))}\n'
+            f'source {shlex.quote(str(self.FB_LIB))}\n'
+            f'mc_fallback_write_state {shlex.quote(str(state_file))} "prompt" "[]" "userprompt" 2.0'
+            + (f" {close_delivery_arg}" if close_delivery_arg is not None else "")
+            + "\n"
+            'echo "RC=$?"\n'
+        )
+        env = clean_env(MEMCONTINUUM_HOME=self.td, MEMCONTINUUM_PYTHON=VENV_PYTHON)
+        return subprocess.run([MC_BASH, "-c", script], capture_output=True, text=True, env=env, timeout=10)
+
+    def test_sixth_arg_one_closes_delivery_open(self):
+        state_file = self._seed_state("close")
+        proc = self._call(state_file, '"1"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout)
+        state = json.loads(state_file.read_text())
+        self.assertFalse(state.get("delivery_open"), "CLOSE_DELIVERY=1 must set delivery_open false")
+
+    def test_five_arg_form_leaves_delivery_open_untouched(self):
+        state_file = self._seed_state("control")
+        proc = self._call(state_file, None)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout)
+        state = json.loads(state_file.read_text())
+        self.assertTrue(state.get("delivery_open"), "omitting the 6th arg must never touch delivery_open")
 
 
 # ---------------------------------------------------------------------------

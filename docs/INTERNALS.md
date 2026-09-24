@@ -48,7 +48,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 | `ledger-post-edit.sh` | `PostToolUse` (every tool; no settings-level matcher) | a bash-only prefilter exits before the watchdog for read-only built-ins (`Read`, `Grep`, ...); `Edit`/`Write`/`MultiEdit`/`NotebookEdit` ledger the tool's own file path (`source: tool`); `Bash` and any tool this hook has no dedicated branch for fall through to a shell-diff (`git status`) tree comparison against a per-root baseline (`source: shell-diff`); an unrecognized or missing `tool_name` additionally logs `outcome=unsupported-mutation-surface` |
 | `precompact-persist.sh` | `PreCompact` | persists session state before context is compacted away |
 | `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`/`clear`, initializes session state (captures the code/store roots' git HEAD, prunes state older than 24h; `clear` resets the session's counters and pending nudges but carries the edit ledger over, `resume` keeps everything), then attempts the standing-decisions digest (see [standing decisions](#standing-decisions)); on `source: compact`, injects what `precompact-persist.sh` left pending, with the digest appended after it |
-| `userprompt-remind.sh` | `UserPromptSubmit` | never reads the prompt text or diff; fires the coverage, commit, or look-back nudge |
+| `userprompt-remind.sh` | `UserPromptSubmit` | never reads the diff; never reads the prompt text UNLESS the opted-in prompt-query channel is ON for this project (see "Prompt-derived queries" below), in which case it may derive search terms from the prompt, in process, and discard it; fires the coverage, commit, look-back, or prompt-query nudge |
 | `sessionend-stamp.sh` | `SessionEnd` | stamps session end into state |
 | `post-commit-reindex.sh` | store's git `post-commit` | a bounded content-only reindex after every commit; spawns a background embed-worker when vectors are left behind |
 | `pre-commit-append-only.sh` | store's git `pre-commit` | runs `memlint.py --against-ref HEAD --staged`; BLOCKS the commit on an append-only violation (a recorded link's body edited, or a link removed, deleted, or renamed — its three lifecycle fields may each move forward once); fails open (lets the commit through) on an unborn HEAD, a missing python, its own cwd not being the store, or any engine failure |
@@ -193,7 +193,9 @@ by (file, id) with the position refreshed on a repeat (never a growing run
 of near-duplicates for one repeated miss) and each title truncated to 120
 characters, capped at the last 20 entries — so `userprompt-remind.sh`'s
 look-back nudge can name what was shown, reading only that state (never
-hook.log, never the prompt — ruling B is unchanged) and never
+hook.log, never the prompt — this look-back read itself never reads the
+prompt, unaffected by the prompt-query channel's own amendment to ruling B,
+see "Prompt-derived queries" below) and never
 re-searching: each entry renders as `search surfaced <title> (<id>) for
 <file>`, capped at 8 (the same cap coverage's own `unmapped[:8]` fact line
 uses) — `pre-edit-chain.sh`'s own hook.log lines carry no `session=` field
@@ -217,6 +219,131 @@ existing ranking as-is (hybrid default) with no minimum-score cutoff and no
 change to how `search` ranks anything — weeks of real queries are meant to
 decide that floor (and whether hybrid stays the default mode) later, not
 this feature.
+
+**Prompt-derived queries.** A second, unrelated search channel on
+`userprompt-remind.sh` itself: a second source of decisions the model
+never asked to see, this time derived from the user's own prompt rather
+than the file being edited. Off by default, one project at a time — the
+ruling calls for weeks of measurement on this project before any other
+project turns it on.
+
+The switch: `MEMCONTINUUM_PROMPT_QUERY=1` forces it ON; `=0` forces it OFF
+and wins over everything else; otherwise it is ON only when
+`$MEMCONTINUUM_HOME/prompt-query.projects` exists and contains a line
+equal to this project's name (`grep -qxF`, no python — literal match, not
+a regex, so a project name containing a metacharacter such as `.` cannot
+match a different line). Decided before the
+payload is even read, so an OFF project's `mc_extract_fields` call stays
+byte-identical to the pre-L2 shape — it never requests the derived-terms
+field at all.
+
+What is read and what is never written: when ON, `hooks/memlib.sh`'s
+`mc_extract_fields` reads `payload["prompt"]` (or `payload["user_input"]`
+as a fallback — real payloads on this machine carry `prompt`; see the
+payload-shape capture above), tokenizes it in that one process, and
+returns ONLY the resulting terms — the raw text itself never leaves that
+process, is never placed in an env var, argv, a file, session state, or
+`hook.log`. The tokenizer is the same content-term vocabulary `memidx.py`
+itself uses (`mc_text.py`: lowercase, `[a-z0-9]+` tokens, stopwords
+dropped), with four query-specific rules on top: a second, small list of
+conversational filler is also dropped (`mc_text.py`'s own
+`_PROMPT_FILLER` — `please`, `explain`, `want`, `need`, `help`, `tell`,
+`show`, `thanks`, and the like; no domain words), tokens under 3
+characters are dropped, the result is deduped (first occurrence wins) and
+capped at 12 terms, and — the four-content-word gate — fewer than 4
+surviving terms means the channel treats the turn as if it had found
+nothing (`reason=too-few-terms`), never searching at all. `_PROMPT_FILLER`
+is an ACCEPTED, TUNABLE filter, applied ONLY to this channel's own term
+derivation — never to `_content_terms` (memidx's own coverage scoring),
+which stays byte-identical. Without it, an owner-shaped prompt like
+"please explain me the level of importance" survives the stopword list
+alone as four terms ("please explain level importance") and opens the
+gate; since `memidx.fts_escape` ORs every term, one leftover word that
+happens to occur anywhere in the store becomes a hit on its own —
+collecting OR-hits on boilerplate mostly measures the tokenizer, which is
+exactly what the ruling's weeks of measurement are meant to decide
+instead. This is a term-side filter only: it has no effect on FTS
+ranking, on what a document itself contains, or on `_content_terms`.
+Accepted privacy
+limit: a term is a prompt word after this split, so a secret pasted into
+an opted-in project's prompt can leave a fragment in `q=` (an `sk-abc123`
+key logs as `abc123`) — the ruling accepts this; it is what makes the
+per-project opt-in an INFORMED one, not an incidental one.
+
+The search itself: FTS-only, never hybrid or vector, regardless of
+`MEMCONTINUUM_FALLBACK_MODE` — a prompt's own words are typically several
+short, unrelated tokens (nothing like a code path's own vocabulary), and
+FTS is what returns nothing rather than a plausible-looking wrong guess
+when they don't hit; it also costs milliseconds, not the hundreds of
+milliseconds an embedding call needs. `memidx.py search --mode fts
+--limit 3 --json --hydrate --read-only` (plus `--root` when
+`MEMCONTINUUM_ROOT` is configured), mirroring the search-fallback call
+above in every other respect. At most one topic per prompt: the search
+asks for up to 3 hits so the exclusion filter below has room to skip past
+an already-surfaced one, but only the FIRST surviving hit is ever shown.
+A redelivered prompt (a RETRY — the same `prompt_id` resubmitted while
+`delivery_open` is still true, e.g. after a killed run) never searches at
+all: the guess a prior run may have already computed can be lost, but one
+prompt is never allowed to yield two topics.
+
+Per-session dedup: a topic already surfaced this session — by a search
+fallback (`search_fallbacks`, written by `pre-edit-chain.sh`,
+`newfile-nudge.sh`, AND this channel itself) OR by the session-start
+standing digest (`standing_ids`, written by `sessionstart-remind.sh` —
+see "Standing decisions" below) — is excluded (`mc_fallback_parse`'s own
+`EXCLUDE_IDS` argument, the union of both lists' ids). All matching hits
+excluded reads as `reason=already-surfaced`, never as a plain miss.
+`search_fallbacks` is capped at its last 20 entries (L1's own cap,
+unchanged) — on a very long session a topic can therefore age out and be
+legitimately surfaced again; this is a stated limit, not a bug.
+
+The label, verbatim: `Nearest recorded decision by search on this
+prompt's words -- may be unrelated:` — same shape as the search-fallback
+label (a guess, never a match), reworded because a prompt has no file to
+name. Both labels are constants in `hooks/mc-fallback-lib.sh`
+(`MC_FB_LABEL_FILE` / `MC_FB_LABEL_PROMPT`).
+
+Delivery: the guess merges into whichever of this hook's three existing
+`additionalContext` envelopes (coverage, nudge-only, look-back) this turn
+would already emit — existing content first, the guess last. On a turn
+that would otherwise print nothing at all, the guess goes out standalone,
+under its own outcome token, `outcome=prompt-query-only` (parallel to
+`nudge-only` — a real, terminal turn outcome, not folded under whatever
+silent reason the turn would otherwise have logged); this closes
+`delivery_open` the same way any other completed turn does, but stamps
+nothing else (not `last_inject_turn`, `last_inject_time`, `last_inject_ts`,
+not `lookback_count` — a guess is not a nudge).
+
+Logging: one extra `mc_log` line, written right after the query, on every
+turn the channel is ON and the prompt parsed (never emitted when OFF —
+this is the "the prompt was never read" proof for every other project):
+
+    userprompt outcome=prompt-query hits=1 ids=<id> q=<terms> pq_ms=<n> session=<id>
+    userprompt outcome=prompt-query-empty reason=<reason> q=<terms or empty> pq_ms=<n> session=<id>
+
+`reason` is one of `too-few-terms` / `no-hits` / `already-surfaced` /
+`store-root-unset` / `lib-missing` / `search-failed rc=N` / `bad-json` /
+`retry` (a redelivered prompt_id, delivery_open still open — see above;
+the search never ran) / an index state name. `q=` is `+`-joined, not space-joined — the same
+reason the search-fallback query above is (`memidx.py stats`' generic
+`key=value` field scan has no quote-awareness, so a space-containing value
+would truncate at the first space); this is the one place a term is
+written anywhere, and only individually, never as the prompt's own word
+order. `pq_ms=` (millisecond-resolution, `mc_now_ms`) is present only when
+the search subprocess actually ran — a `too-few-terms`/`store-root-unset`
+turn never contributes a sample, same discipline `fb_ms=` already follows.
+This line is SUPPLEMENTAL, the same way `commit-nudge` is: it rides
+alongside the turn's own real outcome line, never replaces it (except on
+a standalone turn, where `prompt-query-only` IS that turn's own outcome).
+`memidx.py stats` tallies it into its own `prompt_query` block — counts,
+reasons, `pq_ms` p50/p95 — separate from the unrelated `fallback` block;
+`prompt-query`/`prompt-query-empty` are excluded from `user_prompts` (they
+are supplemental), `prompt-query-only` is not (it is a real turn).
+
+Budget: this channel runs inside the SAME 2s watchdog every other
+`userprompt-remind.sh` step shares. Measured on this repo's own test
+fixture (ext4, fts mode, a real hit): ~0.29s end to end for the whole
+hook run, five-sample average — comfortably inside budget.
 
 **Logging, per hook.** The seven project-level hooks each write exactly one
 `outcome=` line per run to `$MEMCONTINUUM_HOME/hook.log`.
@@ -413,7 +540,9 @@ coverage was never asked to fire this turn); the turn's own outcome is
 `userprompt outcome=nudge-only`, and coverage's own cooldown/delivery
 bookkeeping (`last_injected_pairs`, `last_inject_turn`, `last_inject_time`)
 is left untouched — a nudge must never quietly re-arm coverage's own
-cooldown clock. The nudge never reads the diff and never reads the prompt.
+cooldown clock. The commit nudge itself never reads the diff and never
+reads the prompt — that stays true regardless of the prompt-query channel
+below, which is a separate, opt-in code path this hook may also run.
 `stats` counts `outcome=commit-nudge` as `nudges.commit_nudges`, separate
 from `nudges.total`, and excludes it from `user_prompts` (Codex 12: it is
 SUPPLEMENTAL to the turn's own real outcome line — `injected`,
@@ -2888,10 +3017,13 @@ never dedupe a following `resume`, and would re-inject the same digest twice
 in a row for no reason.
 
 **No write path.** The digest reads the index and, on an inject or a dedup
-decision, writes exactly one field (`standing_hash`) into the session's own
-state file — never the store, never a rendered file. A hook run that
-computes and injects a digest leaves the store's git status clean and its
-index untouched — including against a generation-behind index, which the
+decision, writes into the session's own state file — never the store, never
+a rendered file. An inject writes both `standing_hash` and `standing_ids` in
+that same locked transform; a dedup writes nothing, except that when
+`standing_ids` is absent from a pre-existing session state it backfills
+`standing_ids` alone (the hash stays untouched). A hook run that computes
+and injects a digest leaves the store's git status clean and its index
+untouched — including against a generation-behind index, which the
 read-only opener above makes structural, not merely tested-for.
 
 **Subagents.** Whether Claude Code fires `SessionStart` for a subagent

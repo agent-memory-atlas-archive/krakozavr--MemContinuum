@@ -19,7 +19,16 @@
 # FB_IDS, FB_TEXT, FB_HITS_FOR_STATE, FB_REASON), the same convention the
 # original inline code already used before this refactor.
 
-# mc_fallback_parse PY RC LABEL WANT_ENVELOPE RAW_JSON
+# MC_FB_LABEL_FILE / MC_FB_LABEL_PROMPT (TOP-0133 L2, owner's duplication
+# rule -- "you see it, you kill it"): the L1 label used to be duplicated
+# verbatim in pre-edit-chain.sh and newfile-nudge.sh; both now reference
+# this ONE constant instead. MC_FB_LABEL_PROMPT is L2's own label (same
+# shape -- a guess, never a match -- adapted wording: a prompt has no file
+# to name).
+MC_FB_LABEL_FILE='No recorded decision binds this file. Nearest by search -- may be unrelated:'
+MC_FB_LABEL_PROMPT="Nearest recorded decision by search on this prompt's words -- may be unrelated:"
+
+# mc_fallback_parse PY RC LABEL WANT_ENVELOPE RAW_JSON [EXCLUDE_IDS] [MAX_HITS]
 #
 # Runs the search-fallback result parser (one python process) and sets,
 # as plain (non-local, so the caller reads them back) shell variables:
@@ -38,16 +47,33 @@
 #                          uninitialized/index-needs-migration/
 #                          quarantined/stale), "search-failed rc=N" (RC
 #                          was non-zero), "bad-json" (RC==0 but stdout
-#                          didn't parse), or "no-hits" (parsed fine, zero
-#                          real hits, no state worth naming).
+#                          didn't parse), "already-surfaced" (parsed fine,
+#                          every hit was in EXCLUDE_IDS), or "no-hits"
+#                          (parsed fine, zero real hits, no state worth
+#                          naming).
 #
 # RC is the exit code of the search subprocess that produced RAW_JSON
 # (its stdout, possibly empty). Runs even when RAW_JSON is empty -- a
 # genuine crash with nothing on stdout still needs `reason=search-failed
 # rc=N` named (re-gate round 1 fix: the old gate only ran this parser
 # when stdout was non-empty, silently defaulting a crash to "no-hits").
+#
+# EXCLUDE_IDS (TOP-0133 L2, optional 6th arg): a comma-joined set of hit
+# ids to skip entirely -- never counted, never rendered, never added to
+# FB_HITS_FOR_STATE -- so a caller (userprompt-remind.sh's prompt-query
+# channel) can ask for "the first hit not already surfaced this session"
+# off the SAME one search call, with no second query. Omitted/empty
+# excludes nothing -- byte-identical to the 5-arg form (see
+# test_mc_fallback_parse_five_arg_form_unchanged).
+#
+# MAX_HITS (optional 7th arg): stop accepting hits once this many have
+# survived the exclude filter. Omitted/empty/non-positive means "all" --
+# the 5-arg form's own unbounded behavior (pre-edit-chain.sh/
+# newfile-nudge.sh's own `--limit 2` already bounds the search call
+# itself, so neither existing caller has ever needed this).
 mc_fallback_parse() {
     local _py="$1" _rc="$2" _label="$3" _want_envelope="$4" _raw="$5"
+    local _exclude_ids="${6:-}" _max_hits="${7:-}"
     FB_HITS=""
     FB_IDS=""
     FB_TEXT=""
@@ -56,6 +82,8 @@ mc_fallback_parse() {
     export HOOK_FB_LABEL="$_label"
     export MC_FB_RC="$_rc"
     export MC_FB_WANT_ENVELOPE="$_want_envelope"
+    export MC_FB_EXCLUDE_IDS="$_exclude_ids"
+    export MC_FB_MAX_HITS="$_max_hits"
     {
         IFS= read -r -d '' FB_HITS
         IFS= read -r -d '' FB_IDS
@@ -67,6 +95,11 @@ import json, os, sys
 
 rc = int(os.environ.get("MC_FB_RC", "1") or "1")
 want_envelope = os.environ.get("MC_FB_WANT_ENVELOPE", "0") == "1"
+exclude_ids = {x for x in (os.environ.get("MC_FB_EXCLUDE_IDS", "") or "").split(",") if x}
+try:
+    max_hits = int(os.environ.get("MC_FB_MAX_HITS", "") or "0")
+except ValueError:
+    max_hits = 0
 raw = sys.stdin.read()
 
 d = None
@@ -99,6 +132,7 @@ label = os.environ.get("HOOK_FB_LABEL", "")
 chain_texts = []
 ids = []
 for_state = []
+any_excluded = False
 for h in hits:
     if not isinstance(h, dict):
         continue
@@ -106,12 +140,22 @@ for h in hits:
     if not ct:
         continue
     hid = str(h.get("id", ""))
+    if hid in exclude_ids:
+        any_excluded = True
+        continue
     ids.append(hid)
     chain_texts.append(ct)
     for_state.append({"id": hid, "title": str(h.get("title", "") or "")})
+    if max_hits > 0 and len(chain_texts) >= max_hits:
+        break
 
 if not chain_texts and not reason:
-    reason = state if state in ("quarantined", "stale") else "no-hits"
+    if state in ("quarantined", "stale"):
+        reason = state
+    elif any_excluded:
+        reason = "already-surfaced"
+    else:
+        reason = "no-hits"
 
 if not chain_texts:
     fields = ("0", "", "", "", reason)
@@ -132,7 +176,7 @@ for field in fields:
 ' 2>/dev/null)
 }
 
-# mc_fallback_write_state STATE_FILE FILE_PATH HITS_JSON HOOK_NAME [DEADLINE_SECONDS]
+# mc_fallback_write_state STATE_FILE FILE_PATH HITS_JSON HOOK_NAME [DEADLINE_SECONDS] [CLOSE_DELIVERY]
 #
 # Appends each (id, title) pair in HITS_JSON to STATE_FILE's own
 # `search_fallbacks` list, deduped by (FILE_PATH, id) with the position
@@ -149,11 +193,40 @@ for field in fields:
 # lock timeout/open failure, which the caller maps to its own `fb_state=
 # skipped-lock` field rather than treating as fatal (the additionalContext
 # guess itself is unaffected either way -- this is titling metadata only).
+#
+# CLOSE_DELIVERY (fix round 2, TOP-0133 L2, Grok NIT): pass "1" to also
+# set state["delivery_open"] = False inside this SAME locked write, never
+# a second write. ONLY hooks/userprompt-remind.sh's own pq_mark_delivered
+# passes it -- pre-edit-chain.sh and newfile-nudge.sh never touch
+# delivery_open at all and always omit it (empty/unset here is a no-op).
+# pq_mark_delivered calls this function strictly AFTER the prompt-query
+# guess has already gone out on stdout (PQ_EMITTED is its only guard) AND
+# after finish()'s own SEPARATE delivery_open close write, which runs for
+# every outcome that reaches pq_mark_delivered at all -- including the
+# standalone "prompt-query-only" outcome: finish() closes delivery_open
+# for any outcome other than "injected"/"lookback-injected" (whose own
+# caller-side bookkeeping write already closed it before finish() was
+# even called), and a standalone guess's own outcome is neither of those
+# two. So this is a SECOND, REDUNDANT close, not the only one -- every
+# path pq_mark_delivered can be reached from already had one close write
+# attempt moments earlier in the SAME invocation. It exists to cover that
+# first attempt failing: a lock-wait timeout, or a skipped close on some
+# future outcome branch, could otherwise leave delivery_open still open
+# by the time this append runs. Folding a second, redundant close into
+# this SAME locked write removes that risk entirely -- delivery_open ends
+# up false here regardless of whether the first close write landed, so a
+# killed-and-redelivered prompt_id can never read as an open retry once
+# its guess has actually been delivered (fix round 3, TOP-0133 L2, Codex
+# final26: a kill BEFORE either close write even runs is a separate gap
+# this cannot cover by itself -- closed instead by skipping the search
+# outright on every retry turn; see userprompt-remind.sh's own RETRY
+# check for the actual "at most one topic per prompt" guarantee).
 mc_fallback_write_state() {
-    local state_file="$1" fb_file="$2" hits_json="$3" hook_name="$4" deadline_s="${5:-2.0}"
+    local state_file="$1" fb_file="$2" hits_json="$3" hook_name="$4" deadline_s="${5:-2.0}" close_delivery="${6:-}"
     export MC_FB_FILE="$fb_file"
     export MC_FB_HITS_JSON="$hits_json"
     export MC_FB_HOOK_NAME="$hook_name"
+    export MC_FB_CLOSE_DELIVERY="$close_delivery"
     mc_update_state_json "$state_file" '
 import json, os
 
@@ -190,6 +263,8 @@ for h in new_hits:
         "hook": hook_name,
     })
 state["search_fallbacks"] = existing[-20:]
+if os.environ.get("MC_FB_CLOSE_DELIVERY") == "1":
+    state["delivery_open"] = False
 print(json.dumps(state))
 ' "$deadline_s"
 }

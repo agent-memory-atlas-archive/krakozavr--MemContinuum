@@ -126,7 +126,9 @@ def copy_engine_for_machine_layer(dst):
         (dst / "scripts" / name).chmod(0o755)
     shutil.copy(TOOLS_DIR / "memcontinuum-setup.sh", dst / "memcontinuum-setup.sh")
     (dst / "memcontinuum-setup.sh").chmod(0o755)
-    for name in ("memidx.py", "memlint.py", "requirements.txt", "requirements.lock"):
+    # TOP-0133 L2: memidx.py imports mc_text.py at module load -- same
+    # reasoning as test_repo_init.py's own copy_engine.
+    for name in ("memidx.py", "mc_text.py", "memlint.py", "requirements.txt", "requirements.lock"):
         shutil.copy(TOOLS_DIR / name, dst / name)
     for name in ("hooks", "templates", "skills"):
         shutil.copytree(TOOLS_DIR / name, dst / name)

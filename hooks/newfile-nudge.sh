@@ -775,7 +775,7 @@ print(d.get("cwd", "") or "")
             # shellcheck source=mc-fallback-lib.sh
             if source "$SCRIPT_DIR/mc-fallback-lib.sh" 2>/dev/null; then
                 mc_fallback_parse "$PY" "$FB_RC" \
-                    'No recorded decision binds this file. Nearest by search -- may be unrelated:' \
+                    "$MC_FB_LABEL_FILE" \
                     0 "$FB_JSON_RAW"
             else
                 FB_REASON="lib-missing"

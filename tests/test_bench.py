@@ -488,8 +488,28 @@ class TestPathOracle(unittest.TestCase):
 # INC-0115: this stopword list/tokenizer used to be defined here only; it
 # now also backs memidx._fts_top_hit_is_confident's own content-term
 # coverage gate (hybrid's FTS-step-aside threshold), so it lives in
-# memidx.py and is imported, not duplicated, here.
+# memidx.py and is imported, not duplicated, here. TOP-0133 L2: the
+# definition itself moved on to mc_text.py (so hooks/memlib.sh's
+# prompt-query term derivation can import it without pulling in this
+# whole module) -- memidx.py re-exports the SAME object, never a copy
+# (see test_mc_text_content_terms_is_the_same_object_as_memidx below), so
+# this alias still points at the one true implementation either way.
 _tokens = memidx._content_terms
+
+
+class TestMcTextReExport(unittest.TestCase):
+    """TOP-0133 L2: mc_text.py is the one true home of _content_terms
+    (and _STOPWORDS/_CONTENT_TOKEN_RE); memidx.py imports it rather than
+    defining its own copy, so every existing caller/test in this file
+    (the paraphrase-independence check right below, hybrid's own
+    step-aside gate) keeps working with zero code change here."""
+
+    def test_mc_text_content_terms_is_the_same_object_as_memidx(self):
+        import mc_text
+
+        self.assertIs(memidx._content_terms, mc_text._content_terms)
+        self.assertIs(memidx._STOPWORDS, mc_text._STOPWORDS)
+        self.assertIs(memidx._CONTENT_TOKEN_RE, mc_text._CONTENT_TOKEN_RE)
 
 
 def _indexed_text_for(record_id: str, topics: dict, incidents: dict) -> str:
