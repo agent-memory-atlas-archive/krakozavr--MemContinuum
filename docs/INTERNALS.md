@@ -245,11 +245,26 @@ returns ONLY the resulting terms — the raw text itself never leaves that
 process, is never placed in an env var, argv, a file, session state, or
 `hook.log`. The tokenizer is the same content-term vocabulary `memidx.py`
 itself uses (`mc_text.py`: lowercase, `[a-z0-9]+` tokens, stopwords
-dropped), with three query-specific rules on top: tokens under 3
+dropped), with four query-specific rules on top: a second, small list of
+conversational filler is also dropped (`mc_text.py`'s own
+`_PROMPT_FILLER` — `please`, `explain`, `want`, `need`, `help`, `tell`,
+`show`, `thanks`, and the like; no domain words), tokens under 3
 characters are dropped, the result is deduped (first occurrence wins) and
 capped at 12 terms, and — the four-content-word gate — fewer than 4
 surviving terms means the channel treats the turn as if it had found
-nothing (`reason=too-few-terms`), never searching at all. Accepted privacy
+nothing (`reason=too-few-terms`), never searching at all. `_PROMPT_FILLER`
+is an ACCEPTED, TUNABLE filter, applied ONLY to this channel's own term
+derivation — never to `_content_terms` (memidx's own coverage scoring),
+which stays byte-identical. Without it, an owner-shaped prompt like
+"please explain me the level of importance" survives the stopword list
+alone as four terms ("please explain level importance") and opens the
+gate; since `memidx.fts_escape` ORs every term, one leftover word that
+happens to occur anywhere in the store becomes a hit on its own —
+collecting OR-hits on boilerplate mostly measures the tokenizer, which is
+exactly what the ruling's weeks of measurement are meant to decide
+instead. This is a term-side filter only: it has no effect on FTS
+ranking, on what a document itself contains, or on `_content_terms`.
+Accepted privacy
 limit: a term is a prompt word after this split, so a secret pasted into
 an opted-in project's prompt can leave a fragment in `q=` (an `sk-abc123`
 key logs as `abc123`) — the ruling accepts this; it is what makes the
