@@ -176,7 +176,7 @@ for field in fields:
 ' 2>/dev/null)
 }
 
-# mc_fallback_write_state STATE_FILE FILE_PATH HITS_JSON HOOK_NAME [DEADLINE_SECONDS]
+# mc_fallback_write_state STATE_FILE FILE_PATH HITS_JSON HOOK_NAME [DEADLINE_SECONDS] [CLOSE_DELIVERY]
 #
 # Appends each (id, title) pair in HITS_JSON to STATE_FILE's own
 # `search_fallbacks` list, deduped by (FILE_PATH, id) with the position
@@ -193,11 +193,31 @@ for field in fields:
 # lock timeout/open failure, which the caller maps to its own `fb_state=
 # skipped-lock` field rather than treating as fatal (the additionalContext
 # guess itself is unaffected either way -- this is titling metadata only).
+#
+# CLOSE_DELIVERY (fix round 2, TOP-0133 L2, Grok NIT): pass "1" to also
+# set state["delivery_open"] = False inside this SAME locked write, never
+# a second write. ONLY hooks/userprompt-remind.sh's own pq_mark_delivered
+# passes it -- pre-edit-chain.sh and newfile-nudge.sh never touch
+# delivery_open at all and always omit it (empty/unset here is a no-op).
+# pq_mark_delivered calls this function strictly AFTER the prompt-query
+# guess has already gone out on stdout (PQ_EMITTED is its only guard), so
+# closing delivery_open again here is always correct -- it either repeats
+# a close that already happened moments earlier in the SAME invocation
+# (the common case: coverage/look-back's own bookkeeping write, or
+# finish()'s own silent-turn close, already ran first), or, on the one
+# path with no separate close write of its own (the standalone guess),
+# performs the close for the first and only time. Folding it into this
+# append closes the one residual window a re-gate found: if the SEPARATE
+# close write's own lock wait were ever skipped or lost between it and
+# this append, delivery_open would still end up false here regardless,
+# so a killed-and-redelivered prompt_id can never read as an open retry
+# once its guess has actually been delivered.
 mc_fallback_write_state() {
-    local state_file="$1" fb_file="$2" hits_json="$3" hook_name="$4" deadline_s="${5:-2.0}"
+    local state_file="$1" fb_file="$2" hits_json="$3" hook_name="$4" deadline_s="${5:-2.0}" close_delivery="${6:-}"
     export MC_FB_FILE="$fb_file"
     export MC_FB_HITS_JSON="$hits_json"
     export MC_FB_HOOK_NAME="$hook_name"
+    export MC_FB_CLOSE_DELIVERY="$close_delivery"
     mc_update_state_json "$state_file" '
 import json, os
 
@@ -234,6 +254,8 @@ for h in new_hits:
         "hook": hook_name,
     })
 state["search_fallbacks"] = existing[-20:]
+if os.environ.get("MC_FB_CLOSE_DELIVERY") == "1":
+    state["delivery_open"] = False
 print(json.dumps(state))
 ' "$deadline_s"
 }

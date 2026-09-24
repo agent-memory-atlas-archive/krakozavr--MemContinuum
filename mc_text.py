@@ -47,10 +47,14 @@ _CONTENT_TOKEN_RE = re.compile(r"[a-z0-9]+")
 # accepted, TUNABLE filter for that -- a term-side filter only, no effect
 # on FTS ranking or on what a document itself contains -- deliberately
 # free of domain words (`review`, `fix`, `search`, `hook`, `test`, ...
-# stay searchable).
+# stay searchable). Fix round 2 (TOP-0133 L2, Grok NIT): `look` dropped
+# from this list -- this store's own "look-back" (the feature name)
+# tokenizes to `look` + `back`, and `look` is the distinctive half; a
+# prompt asking about it (e.g. "please explain the look-back reminder
+# design") must keep `look` as a searchable term.
 _PROMPT_FILLER = frozenset("""
 please explain want need help tell show thanks thank let lets like think
-know look see make sure just also really actually maybe something anything
+know see make sure just also really actually maybe something anything
 everything nothing thing things way well okay yes yeah right hmm still
 """.split())
 

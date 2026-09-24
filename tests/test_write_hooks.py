@@ -4701,6 +4701,32 @@ Body prose about widget regression throttling handling in detail.
         log_b = (self.home / "hook.log").read_text()
         self.assertIn("outcome=prompt-query-empty reason=too-few-terms", self._last_pq_line(log_b, "prompt-query-empty"))
 
+    def test_look_back_reminder_survives_filler_with_look_removed(self):
+        """Fix round 2 (TOP-0133 L2, Grok NIT): `_PROMPT_FILLER` used to
+        include "look" -- but this store's own "look-back" (the feature
+        name) tokenizes to `look` + `back`, and `look` is the distinctive
+        half of that compound; filtering it out defeated a search for the
+        store's own feature name. "please explain the look-back reminder
+        design" tokenizes to please/explain/the/look/back/reminder/design;
+        "the" is a stopword, "please"/"explain" stay filler -- with `look`
+        no longer filler, `look back reminder design` survives: four
+        terms, clears the too-few-terms gate, and `look` itself is among
+        them (q= in the log line, +-joined)."""
+        session_id = "s-pq-lookback-term"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(
+            session_id, prompt_text="please explain the look-back reminder design",
+        )
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        line = self._last_pq_line(log_text, "prompt-query-empty")
+        self.assertNotIn("too-few-terms", line, line)
+        self.assertIn("reason=no-hits", line, line)
+        q_field = next(p for p in line.split() if p.startswith("q="))
+        terms = q_field[len("q="):].split("+")
+        self.assertIn("look", terms, terms)
+
     # -- no hits --------------------------------------------------------------
 
     def test_no_fts_match_reason_no_hits(self):
@@ -4816,6 +4842,82 @@ Body prose about widget regression throttling handling in detail.
         self.assertIn("outcome=lookback-injected", log_text)
         self.assertNotIn("outcome=prompt-query-only", log_text)
 
+    def test_exit3_coverage_candidate_falls_through_to_lookback_no_double_mention(self):
+        """Fix round 2 (TOP-0133 L2, Grok NIT): a turn that IS a coverage
+        candidate (ledger grew, cooldown open) but whose classification
+        finds no evidence (`raise SystemExit(3)` in the coverage python
+        block, hooks/userprompt-remind.sh's own OUTPUT_JSON transform)
+        prints no coverage envelope -- OUT_RC=3, OUTPUT_JSON empty -- and
+        falls straight through to the SAME turn's own look-back check.
+        Before fix round 1's append-after-delivery reordering, that
+        look-back block's "search surfaced ... for prompt" listing (read
+        from search_fallbacks BEFORE this turn's own append) and the
+        guess itself (merged in fresh off PQ_TEXT) could land in the SAME
+        envelope once an exit-3 candidate coincided with a look-back-
+        eligible turn -- the double-mention Grok's own fixture measured.
+        Ledger seeded with the ALREADY-mapped file (src/mapped.py,
+        covered by TOP-9001) makes candidate=1 (pairs non-empty, grew,
+        cooldown open) but has_evidence=False (coverage_status ok,
+        unmapped=[], neither HEAD moved) -- the exit-3 shape -- while
+        patch_state jumps straight to turn 5 so the SAME turn is also
+        look-back eligible."""
+        session_id = "s-pq-exit3-lookback"
+        self.seed_ledger(session_id, [(str(self.code_root / "src" / "mapped.py"), "code")])
+        # Baseline start_code_sha/start_store_sha directly to the CURRENT
+        # code/store HEADs -- with no baseline at all, both read as
+        # "changed" (code_changed/store_changed true), which alone would
+        # satisfy has_evidence and this turn would never reach the exit-3
+        # shape this test needs. A real SessionStart call would set this
+        # same baseline, but it would ALSO run the standing digest --
+        # WIDGET_STANDING_TOPIC carries `standing: [L1]`, so that digest
+        # would deliver TOP-8001 itself and exclude it from this turn's
+        # own prompt-query search (Addendum B), picking TOP-8002 instead
+        # and defeating this test's fixed expectations below.
+        self.patch_state(
+            session_id,
+            start_code_sha=git_head(self.code_root),
+            start_store_sha=git_head(self.store_root),
+            user_turn_count=4,
+        )
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        # exactly one JSON document on stdout
+        lines = proc.stdout.strip().splitlines()
+        self.assertEqual(len(lines), 1, proc.stdout)
+        out = json.loads(lines[0])
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Look-back signal", ctx)
+        self.assertNotIn("Coverage signal", ctx, "an exit-3 candidate must never also print a coverage envelope")
+        self.assertIn("Nearest recorded decision by search on this prompt's words -- may be unrelated:", ctx)
+        # the guess text present exactly once ...
+        self.assertEqual(ctx.count("TOP-8001"), 1, ctx)
+        # ... and no "search surfaced ... for prompt" line for THIS turn's
+        # own fresh hit in the SAME document (the append that would add
+        # it to search_fallbacks runs strictly after this printf).
+        self.assertNotIn("search surfaced", ctx, ctx)
+
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=lookback-injected", log_text)
+
+        state = self.load_state(session_id)
+        fallbacks = state.get("search_fallbacks") or []
+        self.assertEqual(len(fallbacks), 1)
+        self.assertEqual(fallbacks[0].get("id"), "TOP-8001")
+
+        # the NEXT look-back turn (channel off, no fresh search needed)
+        # DOES list it -- the deferred append already landed by now, and
+        # this later read sees it.
+        self.patch_state(session_id, user_turn_count=9)
+        proc2, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertIn("Look-back signal", proc2.stdout)
+        self.assertIn(
+            "search surfaced Widget caching policy (TOP-8001) for prompt",
+            proc2.stdout,
+        )
+
     def test_silent_turn_emits_standalone_and_delivery_open_ends_false(self):
         """A turn with neither coverage nor look-back evidence would
         otherwise print nothing at all -- the guess goes out standalone,
@@ -4918,6 +5020,45 @@ Body prose about widget regression throttling handling in detail.
         self.assertEqual(len(pq_lines), 1, "a duplicate must never re-search: still exactly one prompt-query line")
         self.assertIn("outcome=duplicate-delivery", log_text)
 
+        state2 = self.load_state(session_id)
+        self.assertFalse(state2.get("delivery_open"))
+        self.assertEqual(len(state2.get("search_fallbacks") or []), 1, "one entry, not two")
+
+    def test_append_transform_itself_closes_delivery_open_fix_round_2(self):
+        """Fix round 2 (TOP-0133 L2, Grok NIT): pq_mark_delivered's own
+        search_fallbacks append (mc_fallback_write_state's CLOSE_DELIVERY
+        arg) now sets delivery_open=False itself, inside the SAME locked
+        write, rather than relying solely on a separate close write that
+        ran a moment earlier -- a lock-wait timeout or a skipped close on
+        some future outcome branch could otherwise leave that separate
+        write undone while the append still ran, leaving delivery_open
+        true with the hit already excluded (a redelivery would then
+        misread as a retry and take a SECOND topic). Forcing that
+        specific separate-close-failed shape is not exercisable from
+        outside the process; this instead pins the postcondition the fix
+        guarantees end-to-end, on the ONE outcome (a standalone guess)
+        that has no separate close write of its own at all -- the append
+        is the ONLY write that could possibly close delivery_open here:
+        a normal standalone-guess turn still ends with delivery_open
+        false, and the identical prompt_id resubmitted afterward reads as
+        a plain duplicate, never a retry."""
+        session_id = "s-pq-append-closes"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(
+            session_id, prompt_text=self.MATCH_PROMPT, prompt_id="pq-append-closes-1",
+        )
+        proc1, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        self.assertIn("outcome=prompt-query-only", (self.home / "hook.log").read_text())
+        state1 = self.load_state(session_id)
+        self.assertFalse(state1.get("delivery_open"), "the append's own transform must leave delivery_open false")
+        self.assertEqual(len(state1.get("search_fallbacks") or []), 1)
+
+        proc2, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertEqual(proc2.stdout.strip(), "", "a duplicate delivery must print nothing")
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=duplicate-delivery", log_text)
         state2 = self.load_state(session_id)
         self.assertFalse(state2.get("delivery_open"))
         self.assertEqual(len(state2.get("search_fallbacks") or []), 1, "one entry, not two")

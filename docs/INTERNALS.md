@@ -3012,10 +3012,13 @@ never dedupe a following `resume`, and would re-inject the same digest twice
 in a row for no reason.
 
 **No write path.** The digest reads the index and, on an inject or a dedup
-decision, writes exactly one field (`standing_hash`) into the session's own
-state file — never the store, never a rendered file. A hook run that
-computes and injects a digest leaves the store's git status clean and its
-index untouched — including against a generation-behind index, which the
+decision, writes into the session's own state file — never the store, never
+a rendered file. An inject writes both `standing_hash` and `standing_ids` in
+that same locked transform; a dedup writes nothing, except that when
+`standing_ids` is absent from a pre-existing session state it backfills
+`standing_ids` alone (the hash stays untouched). A hook run that computes
+and injects a digest leaves the store's git status clean and its index
+untouched — including against a generation-behind index, which the
 read-only opener above makes structural, not merely tested-for.
 
 **Subagents.** Whether Claude Code fires `SessionStart` for a subagent

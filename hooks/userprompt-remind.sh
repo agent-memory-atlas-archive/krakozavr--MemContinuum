@@ -220,23 +220,28 @@ PQ_EMITTED=""
 # away) still left delivery_open true with the hit already in
 # search_fallbacks: the redelivered prompt then read as a RETRY, re-ran
 # the search with that id excluded, and surfaced a SECOND topic for one
-# prompt -- Grok's fixture, shrunk to this one lock round-trip. This
-# round's fix orders on delivery_open, not on stdout: the three sites that
-# actually print PQ_TEXT (coverage/nudge-only, look-back, finish()'s own
-# standalone branch) set PQ_EMITTED=1 themselves, right after their
-# printf, and no longer call this function directly -- finish() calls it,
-# unconditionally guarded on PQ_EMITTED, once, after every outcome's own
-# delivery_open close is already done (this is a fresh ordering decided
-# from this bug, not a reuse of pre-edit-chain.sh's precedent, which
-# doesn't have a close-before-append shape to model). A kill after that
-# close but before this append now only ever loses the search_fallbacks
-# TITLING entry (the look-back list simply omits this hit one turn
-# longer); the redelivered prompt_id finds delivery_open already false,
-# reads as a plain duplicate, and is suppressed -- never a second search,
-# never a second topic.
+# prompt -- Grok's fixture, shrunk to this one lock round-trip. Fix round
+# 1b's fix ordered this append AFTER whichever write closes delivery_open,
+# never before.
+#
+# Fix round 2 (TOP-0133 L2, Grok NIT): ordering two SEPARATE locked writes
+# still leaves a window between them in principle (a lock-wait timeout, a
+# skipped close on some future outcome branch) where this append could run
+# with delivery_open never actually closed. Since this call only ever
+# happens once PQ_EMITTED is set -- i.e. the guess is already past
+# stdout -- closing delivery_open is ALWAYS the correct thing to do here,
+# so the append transform now does it itself (CLOSE_DELIVERY=1, the same
+# locked write, never a second one): a genuinely-already-closed turn just
+# re-writes the same `false` it already had; a turn whose separate close
+# never landed gets closed right here instead. Either way, the redelivered
+# prompt_id finds delivery_open already false, reads as a plain duplicate,
+# and is suppressed -- never a second search, never a second topic. A kill
+# after this append itself (guaranteed atomic with the close, one lock)
+# now only ever loses the search_fallbacks TITLING entry (the look-back
+# list simply omits this hit one turn longer).
 pq_mark_delivered() {
     if [ -n "${SESSION_ID:-}" ] && [ -n "${FB_HITS_FOR_STATE:-}" ]; then
-        mc_fallback_write_state "$STATE_FILE" "prompt" "$FB_HITS_FOR_STATE" "userprompt" 0.25
+        mc_fallback_write_state "$STATE_FILE" "prompt" "$FB_HITS_FOR_STATE" "userprompt" 0.25 1
     fi
 }
 
@@ -308,7 +313,12 @@ print(json.dumps(state))
     # called, so this is still "after close" for every outcome. PQ_EMITTED
     # is the only guard needed (finish() always exits, so this function
     # body runs at most once per invocation) -- see pq_mark_delivered's own
-    # header comment for the full reasoning.
+    # header comment for the full reasoning. Fix round 2 (Grok NIT): the
+    # append below also sets delivery_open=False in its own locked write
+    # (pq_mark_delivered -> mc_fallback_write_state's CLOSE_DELIVERY arg),
+    # so this still ends correctly even if the close write just above (or
+    # the caller's own bookkeeping write, for "injected"/"lookback-
+    # injected") never actually landed.
     if [ -n "$PQ_EMITTED" ]; then
         pq_mark_delivered
     fi
