@@ -61,11 +61,19 @@
 # gets a second turn, a second cooldown of its own, or a second `unmapped`
 # call.
 #
-# This hook NEVER reads transcript_path, user_input, prompt, or
-# last_assistant_message from the payload (ruling B; the addendum extends
-# the not-read invariant to `prompt`, the alternate payload key Claude Code
-# may use for the same field) -- only session_id, agent_id, agent_type, and
-# prompt_id. prompt_id itself is never extracted, stored, or logged: only
+# This hook NEVER reads transcript_path or last_assistant_message from the
+# payload (ruling B) -- only session_id, agent_id, agent_type, prompt_id,
+# and the sorted top-level KEY NAMES (payload-shape capture, below). It
+# also never reads user_input/prompt UNLESS the opted-in prompt-query
+# channel (TOP-0133 L2, "Prompt-derived queries" below) is ON for this
+# project, in which case ruling B is amended: mc_extract_fields may read
+# payload["prompt"] (or ["user_input"] as a fallback) to derive search
+# terms, in one process, and discard the text immediately -- only the
+# resulting terms (never the text itself) ever leave that call, and only
+# when PQ_ON=1 requests the "_prompt_terms" field at all (an OFF project's
+# mc_extract_fields call stays byte-identical to the pre-L2 shape). See
+# "Prompt-derived queries" further down and docs/INTERNALS.md for the
+# full amendment. prompt_id itself is never extracted, stored, or logged: only
 # sha256(prompt_id)[:16] ever exists past the one extraction call (dual-gate
 # review finding 2), stored as `last_prompt_hash`, for dedupe only. A
 # duplicate delivery (the same prompt_id redelivered) suppresses the WHOLE
@@ -85,7 +93,8 @@
 # environment variable, so no subprocess this hook spawns (dirname/mkdir/
 # cat/env/python) ever inherits it (dual-gate review
 # finding 1, BLOCKER). Only the extracted scalar fields (session_id,
-# agent_id/agent_type presence, a prompt_id fingerprint) and the sorted
+# agent_id/agent_type presence, a prompt_id fingerprint, and -- ON turns
+# only -- the derived, terms-only PROMPT_TERMS) and the sorted
 # top-level payload KEY NAMES (never values -- the payload-shape capture
 # addendum below) ever exist past that call.
 #

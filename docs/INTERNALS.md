@@ -193,7 +193,9 @@ by (file, id) with the position refreshed on a repeat (never a growing run
 of near-duplicates for one repeated miss) and each title truncated to 120
 characters, capped at the last 20 entries — so `userprompt-remind.sh`'s
 look-back nudge can name what was shown, reading only that state (never
-hook.log, never the prompt — ruling B is unchanged) and never
+hook.log, never the prompt — this look-back read itself never reads the
+prompt, unaffected by the prompt-query channel's own amendment to ruling B,
+see "Prompt-derived queries" below) and never
 re-searching: each entry renders as `search surfaced <title> (<id>) for
 <file>`, capped at 8 (the same cap coverage's own `unmapped[:8]` fact line
 uses) — `pre-edit-chain.sh`'s own hook.log lines carry no `session=` field
