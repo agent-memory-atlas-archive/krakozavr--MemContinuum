@@ -647,6 +647,15 @@ if [ "$PQ_ON" = "1" ]; then
     PQ_TERMS_LOGGED="${PQ_TERMS_LOGGED// /+}"
     if [ "${RETRY:-0}" = "1" ]; then
         mc_log "userprompt outcome=prompt-query-empty reason=retry q=$PQ_TERMS_LOGGED session=${SESSION_ID:-}"
+    elif [ "${PROMPT_SOURCE:-}" = "machine" ]; then
+        # TOP-0133 L3: Claude Code delivers subagent hand-back reports,
+        # background-task notifications, and cross-session messages
+        # through this SAME UserPromptSubmit event a typed prompt arrives
+        # on. mc_extract_fields (memlib.sh) already classified the text
+        # BEFORE tokenizing it and reports it here as PROMPT_SOURCE --
+        # never tokenized, never searched, q= stays empty the same way
+        # too-few-terms's own line does.
+        mc_log "userprompt outcome=prompt-query-empty reason=non-user q= session=${SESSION_ID:-}"
     elif [ -z "${PROMPT_TERMS:-}" ]; then
         mc_log "userprompt outcome=prompt-query-empty reason=too-few-terms q= session=${SESSION_ID:-}"
     elif [ -z "${MEMCONTINUUM_ROOT:-}" ]; then

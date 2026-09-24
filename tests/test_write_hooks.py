@@ -5326,6 +5326,122 @@ Body prose about widget regression throttling handling in detail.
         log_on = (self.home / "hook.log").read_text()
         self.assertIn("prompt-query", log_on)
 
+    # -- machine-delivered messages never search (TOP-0133 L3) ---------------
+    #
+    # Claude Code delivers subagent hand-back reports, background-task
+    # notifications, and cross-session messages through this SAME
+    # UserPromptSubmit event a typed prompt arrives on. hooks/memlib.sh
+    # classifies the prompt text BEFORE tokenizing it (mc_text.py's
+    # `_MACHINE_PROMPT_PREFIXES`) and userprompt-remind.sh's prompt-query
+    # block skips the search entirely on a machine-framed turn -- no search
+    # subprocess (no `pq_ms=`), no guess on stdout, no `search_fallbacks`
+    # entry, logged as `reason=non-user q=`. Every fixture below embeds
+    # MATCH_PROMPT (which WOULD hit TOP-8001 if tokenized) so a wrongly-
+    # searching implementation would fail loudly, not silently.
+
+    TASK_NOTIFICATION_PROMPT = (
+        "<task-notification>\n<task-id>abc</task-id>\n" + MATCH_PROMPT
+    )
+    AGENT_MESSAGE_PROMPT = (
+        "Another Claude session sent a message:\n"
+        '<agent-message from="a1">\n[Subagent hand-back] ' + MATCH_PROMPT
+    )
+    CROSS_SESSION_PROMPT = (
+        '<cross-session-message from="x">\n' + MATCH_PROMPT
+    )
+
+    def _assert_non_user_no_search(self, session_id, prompt_text):
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=prompt_text)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        line = self._last_pq_line(log_text, "prompt-query-empty")
+        self.assertIn("outcome=prompt-query-empty reason=non-user q=", line)
+        self.assertNotIn("pq_ms=", line, "a non-user turn must never run the search subprocess")
+        self.assertNotIn("TOP-8001", log_text)
+        self.assertNotIn("TOP-8001", proc.stdout)
+        state = self.load_state(session_id)
+        self.assertNotIn("search_fallbacks", state)
+
+    def test_task_notification_prefix_never_searches(self):
+        self._assert_non_user_no_search("s-pq-nonuser-tasknotif", self.TASK_NOTIFICATION_PROMPT)
+
+    def test_agent_message_hand_back_prefix_never_searches(self):
+        self._assert_non_user_no_search("s-pq-nonuser-agentmsg", self.AGENT_MESSAGE_PROMPT)
+
+    def test_cross_session_message_prefix_never_searches(self):
+        self._assert_non_user_no_search("s-pq-nonuser-crosssess", self.CROSS_SESSION_PROMPT)
+
+    def test_leading_whitespace_before_marker_still_recognised(self):
+        """The classification checks `text.lstrip().startswith(...)` --
+        leading whitespace/newlines (as a JSON string can legitimately
+        carry) before the marker must not defeat the match."""
+        self._assert_non_user_no_search(
+            "s-pq-nonuser-leading-ws",
+            "\n\n   " + self.TASK_NOTIFICATION_PROMPT,
+        )
+
+    def test_mid_sentence_mention_of_marker_text_still_searches(self):
+        """A human prompt that merely MENTIONS "task-notification" or
+        "agent-message" mid-sentence is a prefix miss (the marker text is
+        not at the very start) -- it must still search normally, same as
+        any other human prompt, and hit TOP-8001 on MATCH_PROMPT's own
+        words."""
+        session_id = "s-pq-nonuser-midsentence"
+        self.seed_ledger(session_id, [])
+        prompt_text = (
+            self.MATCH_PROMPT
+            + " -- similar to that task-notification and agent-message issue from before"
+        )
+        payload = self.user_prompt_payload(session_id, prompt_text=prompt_text)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        line = self._last_pq_line(log_text)
+        self.assertIn("outcome=prompt-query ", line)
+        self.assertIn("ids=TOP-8001", line)
+        self.assertNotIn("reason=non-user", log_text)
+
+    def test_channel_off_machine_framed_prompt_produces_no_line_at_all(self):
+        """Channel OFF: a machine-framed prompt must behave exactly like
+        the plain "off by default" case -- no prompt-query line of any
+        kind, since the whole `_prompt_terms`/PROMPT_SOURCE derivation is
+        never requested at all when PQ_ON != 1."""
+        session_id = "s-pq-nonuser-off"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.TASK_NOTIFICATION_PROMPT)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        self.assertNotIn("prompt-query", log_text)
+
+    def test_prompt_text_invariant_holds_for_machine_framed_prompt(self):
+        """Same invariant as test_prompt_text_never_leaks_only_individual_
+        terms_do above, for a machine-framed prompt: since it is never
+        tokenized at all, no 3-word-or-longer substring of it may appear
+        anywhere in hook.log, state, or stdout."""
+        session_id = "s-pq-nonuser-invariant"
+        prompt_text = (
+            "<task-notification>\n<task-id>xyz789</task-id>\n"
+            + self.NO_MATCH_PROMPT
+        )
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=prompt_text)
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        log_text = (self.home / "hook.log").read_text()
+        state_text = json.dumps(self.load_state(session_id))
+        words = prompt_text.split()
+        for i in range(len(words) - 2):
+            substring = " ".join(words[i:i + 3])
+            self.assertNotIn(substring, log_text)
+            self.assertNotIn(substring, state_text)
+            self.assertNotIn(substring, proc.stdout)
+        line = self._last_pq_line(log_text, "prompt-query-empty")
+        self.assertIn("outcome=prompt-query-empty reason=non-user q=", line)
+
 
 class TestMcFallbackParseExcludeIdsMaxHits(unittest.TestCase):
     """hooks/mc-fallback-lib.sh's mc_fallback_parse (TOP-0133 L2): the two

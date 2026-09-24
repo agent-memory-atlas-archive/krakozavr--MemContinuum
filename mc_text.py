@@ -64,6 +64,36 @@ know see make sure just also really actually maybe something anything
 everything nothing thing things way well okay yes yeah right hmm
 """.split())
 
+# _MACHINE_PROMPT_PREFIXES (TOP-0133 L3): Claude Code delivers machine text
+# -- subagent hand-back reports and background-task notifications -- through
+# the SAME UserPromptSubmit event a typed prompt arrives on; the payload
+# carries no field that distinguishes the two (reading transcript_path is
+# forbidden, ruling B). Both shapes are framed with a fixed prefix, verified
+# from a live session's hook.log `q=` terms (`agent+message+...+subagent
+# +hand+back...`, `task+notification+...+tool+use+toolu...`) and the raw
+# prompt text behind them: a task notification's first non-whitespace
+# characters are `<task-notification>`; a subagent hand-back / peer message
+# opens with `Another Claude session sent a message:` followed by
+# `<agent-message from="...">`; a cross-session message opens with
+# `<cross-session-message from="...">`. hooks/memlib.sh's `_prompt_terms`
+# branch -- the ONE process that reads the prompt -- checks
+# `text.lstrip().startswith(_MACHINE_PROMPT_PREFIXES)` (a PREFIX match, not a
+# substring one, so a human prompt that merely mentions "task-notification"
+# or "agent-message" mid-sentence still searches) before tokenizing anything,
+# and reports the classification via a second output field, PROMPT_SOURCE
+# ("human" / "machine" / empty when there is no prompt string at all) --
+# never a second process, never a second payload read. This list is a
+# STATED LIMIT, not a guarantee: if Claude Code ever rewords its own
+# framing, the skip silently stops matching -- visible in hook.log as
+# `reason=non-user` falling to zero while machine-looking terms (hex ids,
+# `toolu`) reappear in `q=` (see docs/INTERNALS.md).
+_MACHINE_PROMPT_PREFIXES = (
+    "<task-notification>",
+    "<cross-session-message",
+    "<agent-message",
+    "Another Claude session sent a message:",
+)
+
 
 def _content_terms(text: str) -> set[str]:
     """INC-0115: non-stopword, length>1 tokens -- the same definition

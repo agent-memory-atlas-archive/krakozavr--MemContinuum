@@ -1291,6 +1291,24 @@ class TestStatsPromptQueryBucket(StatsTestBase):
         self.assertEqual(pq["prompt_query_empty"], 1)
         self.assertEqual(pq["reasons"], {"retry": 1})
 
+    def test_non_user_reason_is_tallied_like_any_other(self):
+        """TOP-0133 L3: `reason=non-user` (userprompt-remind.sh, a
+        machine-framed prompt -- an agent hand-back report, a task
+        notification, or a cross-session message -- that skipped the
+        search outright) needs no new code here either -- same generic
+        `reason=<value>` reading as `test_retry_reason_is_tallied_like_
+        any_other` above confirms for `retry`."""
+        lines = [
+            f"{ts(1)} userprompt outcome=prompt-query-empty "
+            "reason=non-user q= session=s1 project=demo",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        pq = out["prompt_query"]
+        self.assertEqual(pq["prompt_query_empty"], 1)
+        self.assertEqual(pq["reasons"], {"non-user": 1})
+
     def test_text_mode_prints_a_prompt_query_line(self):
         lines = [
             f"{ts(1)} userprompt outcome=prompt-query hits=1 ids=TOP-1 "
