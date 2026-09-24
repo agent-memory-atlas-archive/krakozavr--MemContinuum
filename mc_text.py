@@ -64,6 +64,45 @@ know see make sure just also really actually maybe something anything
 everything nothing thing things way well okay yes yeah right hmm
 """.split())
 
+# _MACHINE_PROMPT_PREFIXES (TOP-0133 L3): Claude Code delivers machine text
+# -- subagent hand-back reports, background-task notifications, cross-session
+# messages, and harness-injected system framing -- through the SAME
+# UserPromptSubmit event a typed prompt arrives on; the payload carries no
+# field that distinguishes these from a typed prompt (reading
+# transcript_path is forbidden, ruling B). Each shape is framed with a fixed
+# prefix: a task notification's first non-whitespace characters are
+# `<task-notification>`; a subagent hand-back / peer message opens with
+# `Another Claude session sent a message` (with or without a trailing
+# colon -- the harness also uses a "... while you were working:" variant),
+# usually followed by `<agent-message from="...">`; that inner tag is its
+# own tuple entry, matched independently of any preamble, so a delivery
+# that opens directly with `<agent-message` (no preamble at all) is still
+# caught; a peer session's own variant opens with `A peer session sent a
+# message`; a cross-session message opens with
+# `<cross-session-message from="...">`; a harness system reminder opens
+# with `<system-reminder>`; a background system notification opens with
+# `[SYSTEM NOTIFICATION`. hooks/memlib.sh's `_prompt_terms`
+# branch -- the ONE process that reads the prompt -- checks
+# `text.lstrip().startswith(_MACHINE_PROMPT_PREFIXES)` (a PREFIX match, not a
+# substring one, so a human prompt that merely mentions one of these marker
+# strings mid-sentence still searches) before tokenizing anything, and
+# reports the classification via a second output field, PROMPT_SOURCE
+# ("human" / "machine" / empty when there is no prompt string at all) --
+# never a second process, never a second payload read. This list is a
+# STATED LIMIT, not a guarantee: if Claude Code ever rewords its own
+# framing, the skip silently stops matching -- visible in hook.log as
+# `reason=non-user` falling to zero while machine-looking terms (hex ids,
+# `toolu`) reappear in `q=` (see docs/INTERNALS.md).
+_MACHINE_PROMPT_PREFIXES = (
+    "<task-notification>",
+    "<cross-session-message",
+    "<agent-message",
+    "Another Claude session sent a message",
+    "A peer session sent a message",
+    "<system-reminder>",
+    "[SYSTEM NOTIFICATION",
+)
+
 
 def _content_terms(text: str) -> set[str]:
     """INC-0115: non-stopword, length>1 tokens -- the same definition

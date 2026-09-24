@@ -390,8 +390,9 @@ mc_state_file_for() {
 # extracted or emitted, dual-gate review finding 2), "_top_keys_csv" ->
 # TOP_KEYS_CSV (sorted top-level KEY NAMES only, comma-joined, never
 # values -- the payload-shape capture addendum), and "_prompt_terms" ->
-# PROMPT_TERMS (TOP-0133 L2, the prompt-query channel's own amendment to
-# ruling B -- see below). Never reads transcript_path, user_input, prompt,
+# PROMPT_TERMS plus a second line, PROMPT_SOURCE (TOP-0133 L2/L3, the
+# prompt-query channel's own amendment to ruling B -- see below). Never
+# reads transcript_path, user_input, prompt,
 # or last_assistant_message beyond that one explicitly-requested,
 # terms-only derivation on purpose -- a caller must not ask for the other
 # tokens above (docs/DESIGN.md ruling B). The payload is
@@ -402,8 +403,19 @@ mc_state_file_for() {
 # "_prompt_terms" (TOP-0133 L2, ruling B amendment): reads
 # payload["prompt"] first, payload["user_input"] as a fallback (whichever
 # is a non-empty string -- Addendum A: real UserPromptSubmit payloads on
-# this machine carry "prompt", never "user_input"), tokenizes it with the
-# SAME content-term vocabulary memidx.py's own `_content_terms` uses
+# this machine carry "prompt", never "user_input"). Before tokenizing
+# anything (TOP-0133 L3), the lstripped text is checked against
+# mc_text._MACHINE_PROMPT_PREFIXES -- Claude Code delivers subagent
+# hand-back reports, background-task notifications, cross-session
+# messages, and harness-injected system framing through this SAME event,
+# framed with a fixed prefix (`<task-notification>`, `Another Claude
+# session sent a message` (with or without a trailing colon),
+# `A peer session sent a message`, `<agent-message`,
+# `<cross-session-message`, `<system-reminder>`, `[SYSTEM NOTIFICATION`);
+# a prefix match (never substring) there sets PROMPT_SOURCE=machine and skips tokenizing
+# entirely (PROMPT_TERMS stays empty). Otherwise PROMPT_SOURCE=human and
+# the text is tokenized with the SAME content-term vocabulary memidx.py's
+# own `_content_terms` uses
 # (mc_text.py, imported via a `sys.path.insert` onto MC_ENGINE_ROOT -- an
 # env var scoped to THIS one subprocess call, never exported globally),
 # lowercases, drops stopwords AND conversational filler (mc_text.py's own
@@ -413,10 +425,12 @@ mc_state_file_for() {
 # EMPTY value when
 # fewer than 4 terms survive -- the "at least four content words" gate
 # lives HERE, so a caller downstream of this function never sees a
-# partial term list to second-guess. The prompt TEXT itself never leaves
-# this one python process: it is read, tokenized, and immediately
-# discarded -- only the resulting terms (never argv, env, a file, state,
-# or hook.log) are the return value. A caller must request this field only
+# partial term list to second-guess. PROMPT_SOURCE stays "" when there is
+# no prompt/user_input string at all. The prompt TEXT itself never leaves
+# this one python process: it is read, classified, tokenized (when
+# human-framed), and immediately discarded -- only PROMPT_TERMS and
+# PROMPT_SOURCE (never argv, env, a file, state, or hook.log) are the
+# return value. A caller must request this field only
 # when the prompt-query channel is confirmed ON (see
 # userprompt-remind.sh) -- requesting it unconditionally would defeat the
 # whole point of an opt-in channel (a caller that never asks for
@@ -454,6 +468,13 @@ for f in fields:
     elif f == "_prompt_terms":
         name = "PROMPT_TERMS"
         v = ""
+        # PROMPT_SOURCE (TOP-0133 L3): "human" / "machine" / "" (no prompt
+        # string at all). Printed explicitly right here -- one extra line,
+        # from the SAME one process that already reads the prompt -- rather
+        # than adding a second field token, so a caller never triggers a
+        # second read of payload["prompt"]/["user_input"]. The eval this
+        # feeds already handles multiple output lines per call.
+        _source = ""
         _txt = d.get("prompt")
         if not (isinstance(_txt, str) and _txt):
             _txt = d.get("user_input")
@@ -463,24 +484,31 @@ for f in fields:
                 if _root:
                     sys.path.insert(0, _root)
                 import mc_text
-                _seen = set()
-                _toks = []
-                for _w in mc_text._CONTENT_TOKEN_RE.findall(_txt.lower()):
-                    if (
-                        _w in mc_text._STOPWORDS
-                        or _w in mc_text._PROMPT_FILLER
-                        or len(_w) < 3
-                        or _w in _seen
-                    ):
-                        continue
-                    _seen.add(_w)
-                    _toks.append(_w)
-                    if len(_toks) >= 12:
-                        break
-                if len(_toks) >= 4:
-                    v = " ".join(_toks)
+                if _txt.lstrip().startswith(mc_text._MACHINE_PROMPT_PREFIXES):
+                    _source = "machine"
+                    # Machine-framed text is never tokenized -- v stays "".
+                else:
+                    _source = "human"
+                    _seen = set()
+                    _toks = []
+                    for _w in mc_text._CONTENT_TOKEN_RE.findall(_txt.lower()):
+                        if (
+                            _w in mc_text._STOPWORDS
+                            or _w in mc_text._PROMPT_FILLER
+                            or len(_w) < 3
+                            or _w in _seen
+                        ):
+                            continue
+                        _seen.add(_w)
+                        _toks.append(_w)
+                        if len(_toks) >= 12:
+                            break
+                    if len(_toks) >= 4:
+                        v = " ".join(_toks)
             except Exception:
                 v = ""
+                _source = ""
+        print(f"PROMPT_SOURCE={shlex.quote(_source)}")
         del _txt
     else:
         v = d.get(f)

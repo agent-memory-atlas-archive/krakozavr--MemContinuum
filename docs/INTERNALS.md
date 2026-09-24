@@ -297,6 +297,31 @@ excluded reads as `reason=already-surfaced`, never as a plain miss.
 unchanged) — on a very long session a topic can therefore age out and be
 legitimately surfaced again; this is a stated limit, not a bug.
 
+**Machine-delivered messages.** Claude Code delivers machine
+text — subagent hand-back reports, background-task notifications, and
+harness-injected system framing — through this SAME `UserPromptSubmit` event
+a typed prompt arrives on; a cross-session message arrives the same way. The
+payload carries no field that distinguishes these from a typed prompt
+(reading `transcript_path` is forbidden, ruling B), so `hooks/memlib.sh`'s
+`mc_extract_fields` — the ONE process that reads the prompt — recognises
+them by their framing prefix instead: after `lstrip()`, the text is
+machine-framed when it starts with `<task-notification>`,
+`<cross-session-message`, `<agent-message`, `Another Claude session sent a
+message` (with or without a trailing colon, so the "... while you were
+working:" variant matches too), `A peer session sent a message`,
+`<system-reminder>`, or `[SYSTEM NOTIFICATION` (a PREFIX match, never a
+substring one, so a human prompt that merely mentions one of these marker
+strings mid-sentence still searches). The marker list is one tuple
+constant, `mc_text._MACHINE_PROMPT_PREFIXES`, documented next to
+`_PROMPT_FILLER`. A machine-framed prompt is never tokenized and never
+searched — the same one-process, prompt-text-never-leaves-the-process
+discipline as the rest of this channel — and logs
+`reason=non-user`, `q=` empty, with no search subprocess run (no `pq_ms=`).
+This is a stated limit, not a guarantee: if Claude Code ever rewords its own
+framing, the skip silently stops matching — visible in hook.log as
+`reason=non-user` falling to zero while machine-looking terms (hex ids,
+`toolu`) reappear in `q=`.
+
 The label, verbatim: `Nearest recorded decision by search on this
 prompt's words -- may be unrelated:` — same shape as the search-fallback
 label (a guess, never a match), reworded because a prompt has no file to
@@ -324,7 +349,9 @@ this is the "the prompt was never read" proof for every other project):
 `reason` is one of `too-few-terms` / `no-hits` / `already-surfaced` /
 `store-root-unset` / `lib-missing` / `search-failed rc=N` / `bad-json` /
 `retry` (a redelivered prompt_id, delivery_open still open — see above;
-the search never ran) / an index state name. `q=` is `+`-joined, not space-joined — the same
+the search never ran) / `non-user` (a machine-framed message — an agent
+hand-back report, a task notification, a cross-session message — see
+above; the search never ran) / an index state name. `q=` is `+`-joined, not space-joined — the same
 reason the search-fallback query above is (`memidx.py stats`' generic
 `key=value` field scan has no quote-awareness, so a space-containing value
 would truncate at the first space); this is the one place a term is
