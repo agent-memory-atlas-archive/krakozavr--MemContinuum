@@ -228,7 +228,9 @@ project turns it on.
 The switch: `MEMCONTINUUM_PROMPT_QUERY=1` forces it ON; `=0` forces it OFF
 and wins over everything else; otherwise it is ON only when
 `$MEMCONTINUUM_HOME/prompt-query.projects` exists and contains a line
-equal to this project's name (`grep -qx`, no python). Decided before the
+equal to this project's name (`grep -qxF`, no python — literal match, not
+a regex, so a project name containing a metacharacter such as `.` cannot
+match a different line). Decided before the
 payload is even read, so an OFF project's `mc_extract_fields` call stays
 byte-identical to the pre-L2 shape — it never requests the derived-terms
 field at all.

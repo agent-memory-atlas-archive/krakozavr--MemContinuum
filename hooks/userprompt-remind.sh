@@ -288,8 +288,13 @@ print(json.dumps(state))
 }
 
 # TOP-0133 L2: the opt-in switch, decided BEFORE the payload is even read
-# (a plain env check plus, at most, one `grep -qx` against a small file --
+# (a plain env check plus, at most, one `grep -qxF` against a small file --
 # no python, no state) -- see docs/INTERNALS.md "Prompt-derived queries".
+# Fix round 1 (MINOR, Grok): `-qx` alone treats $MC_PROJECT as a REGEX
+# matched against each line, not a literal string -- a project name
+# containing a regex metacharacter (a bare `.` is the common one) then
+# matches lines it should not (`grep -qx 'foo.bar'` matches a line
+# `foo-bar`). `-F` makes the match literal.
 # ON when MEMCONTINUUM_PROMPT_QUERY=1 (explicit override), or the literal
 # string "0" forces OFF and wins over the file either way; otherwise ON
 # only when $MEMCONTINUUM_HOME/prompt-query.projects exists and contains a
@@ -302,7 +307,7 @@ case "${MEMCONTINUUM_PROMPT_QUERY:-}" in
     0) PQ_ON=0 ;;
     *)
         if [ -f "$MEMCONTINUUM_HOME/prompt-query.projects" ] \
-            && grep -qx "$MC_PROJECT" "$MEMCONTINUUM_HOME/prompt-query.projects" 2>/dev/null; then
+            && grep -qxF "$MC_PROJECT" "$MEMCONTINUUM_HOME/prompt-query.projects" 2>/dev/null; then
             PQ_ON=1
         fi
         ;;
