@@ -4844,6 +4844,12 @@ Body prose about widget regression throttling handling in detail.
 
         state = self.load_state(session_id)
         self.assertFalse(state.get("delivery_open"), "a standalone guess must still close delivery_open")
+        # Fix round 1b: the append now runs AFTER the close write above (in
+        # finish() itself, guarded by PQ_EMITTED) rather than before it --
+        # the observable end state is unchanged: the entry is still there.
+        fallbacks = state.get("search_fallbacks") or []
+        self.assertEqual(len(fallbacks), 1, "the delivered guess must still be appended to search_fallbacks")
+        self.assertEqual(fallbacks[0].get("id"), "TOP-8001")
         # Addendum C: stamps NOTHING else -- every one of these fields
         # stays exactly what it was BEFORE this turn ran (seed_ledger's
         # own defaults, e.g. last_inject_time=0), never advanced by the
@@ -4876,6 +4882,45 @@ Body prose about widget regression throttling handling in detail.
         pq_lines = [l for l in log_text.splitlines() if " outcome=prompt-query " in l or l.rstrip().endswith("outcome=prompt-query")]
         self.assertEqual(len(pq_lines), 1, log_text)
         self.assertIn("outcome=duplicate-delivery", log_text)
+
+    def test_resubmit_after_completed_run_is_plain_duplicate_one_entry(self):
+        """Fix round 1b (TOP-0133 L2): a kill landing in the window between
+        the write that closes delivery_open and the search_fallbacks
+        append (the residual defect this round fixes) can no longer be
+        observed from outside the process -- the append now runs strictly
+        after that close, inside finish(), so the moment a run's own
+        process has exited at all, delivery_open is already false and any
+        redelivery of the SAME prompt_id reads as a plain duplicate, not a
+        retry. Exercised end-to-end: run once for real (a genuine
+        completed turn, no simulated rewind), resubmit the identical
+        prompt_id, and confirm the second run neither re-searches (no new
+        `outcome=prompt-query` line, no stdout) nor double-appends (still
+        exactly one search_fallbacks entry)."""
+        session_id = "s-pq-dup-completed"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT, prompt_id="pq-dup-completed-1")
+
+        proc1, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        state1 = self.load_state(session_id)
+        self.assertFalse(state1.get("delivery_open"), "a completed run must leave delivery_open false")
+        self.assertEqual(len(state1.get("search_fallbacks") or []), 1)
+
+        proc2, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertEqual(proc2.stdout.strip(), "", "a duplicate delivery must print nothing")
+
+        log_text = (self.home / "hook.log").read_text()
+        pq_lines = [
+            l for l in log_text.splitlines()
+            if " outcome=prompt-query " in l or l.rstrip().endswith("outcome=prompt-query")
+        ]
+        self.assertEqual(len(pq_lines), 1, "a duplicate must never re-search: still exactly one prompt-query line")
+        self.assertIn("outcome=duplicate-delivery", log_text)
+
+        state2 = self.load_state(session_id)
+        self.assertFalse(state2.get("delivery_open"))
+        self.assertEqual(len(state2.get("search_fallbacks") or []), 1, "one entry, not two")
 
     # -- the prompt-text invariant --------------------------------------------
 

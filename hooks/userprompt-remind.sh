@@ -192,35 +192,49 @@ DELIVERY_CLOSE_DONE=""
 # the prompt-query channel finds a hit further down this script -- empty
 # on every OFF/no-hit/excluded turn. PQ_EMITTED tracks whether that guess
 # has already ridden inside one of the three existing additionalContext
-# envelopes this hook can print (coverage, nudge-only, look-back); when a
-# turn reaches finish() with PQ_TEXT still non-empty and PQ_EMITTED still
-# unset, the turn was about to end SILENTLY (no stdout at all) with an
-# already-computed guess sitting unused -- finish() below emits it
-# standalone rather than losing it, exactly the same "the guess is the
-# feature, never let a later step lose it" precedent pre-edit-chain.sh's
-# own fallback already set (see that hook's own re-gate round 3 comment).
-# Declared here (before the first possible finish() call, under `set -u`)
-# so referencing either one inside finish() is always safe.
+# envelopes this hook can print (coverage, nudge-only, look-back), OR gone
+# out standalone from finish() itself -- set immediately after whichever
+# printf actually delivered it (never deferred to the state-append call;
+# see pq_mark_delivered below, fix round 1b). When a turn reaches finish()
+# with PQ_TEXT still non-empty and PQ_EMITTED still unset, the turn was
+# about to end SILENTLY (no stdout at all) with an already-computed guess
+# sitting unused -- finish() below emits it standalone rather than losing
+# it, exactly the same "the guess is the feature, never let a later step
+# lose it" precedent pre-edit-chain.sh's own fallback already set (see
+# that hook's own re-gate round 3 comment). Declared here (before the
+# first possible finish() call, under `set -u`) so referencing either one
+# inside finish() is always safe.
 PQ_TEXT=""
 PQ_EMITTED=""
 
-# pq_mark_delivered (fix round 1, TOP-0133 L2, MAJOR): the ONE place the
-# search_fallbacks state write for a prompt-query hit happens -- called at
-# each of the three points that actually print the guess (the coverage/
-# nudge-only printf, the look-back printf, and finish()'s own standalone
-# branch), always AFTER that printf, never before. The old placement
-# (right after the search, long before any of those three points) wrote
-# the hit to state while `delivery_open` was still true; a redelivery of
-# the same prompt_id killed in that window read as a RETRY (not a
-# duplicate), re-ran the query with the now-already-written id excluded,
-# and surfaced a SECOND topic for one prompt (or `already-surfaced` with
-# nothing to show, swallowing the guess for good) -- Grok's fixture.
-# Sets PQ_EMITTED (so finish() never double-prints) and performs the
-# state append together, so the two can never drift apart. FB_HITS_FOR_STATE
-# is only non-empty once a hit actually survived the exclusion filter, and
-# is left untouched by everything between the search and this call.
+# pq_mark_delivered (fix round 1b, TOP-0133 L2, was MAJOR): the ONE place
+# the search_fallbacks state write for a prompt-query hit happens -- called
+# exactly once, from finish() itself, AFTER finish()'s own delivery_open
+# close write (for "injected"/"lookback-injected" that close is the
+# caller's own bookkeeping write, which already ran before finish() was
+# even invoked; for every other outcome it is finish()'s own close block a
+# few lines above the call site). Fix round 1 moved this append to after
+# the PRINTF that delivers the guess -- correct against a kill landing
+# before stdout, but a kill landing in the window between that append and
+# the SEPARATE locked write that closes delivery_open (a few lines/callers
+# away) still left delivery_open true with the hit already in
+# search_fallbacks: the redelivered prompt then read as a RETRY, re-ran
+# the search with that id excluded, and surfaced a SECOND topic for one
+# prompt -- Grok's fixture, shrunk to this one lock round-trip. This
+# round's fix orders on delivery_open, not on stdout: the three sites that
+# actually print PQ_TEXT (coverage/nudge-only, look-back, finish()'s own
+# standalone branch) set PQ_EMITTED=1 themselves, right after their
+# printf, and no longer call this function directly -- finish() calls it,
+# unconditionally guarded on PQ_EMITTED, once, after every outcome's own
+# delivery_open close is already done (this is a fresh ordering decided
+# from this bug, not a reuse of pre-edit-chain.sh's precedent, which
+# doesn't have a close-before-append shape to model). A kill after that
+# close but before this append now only ever loses the search_fallbacks
+# TITLING entry (the look-back list simply omits this hit one turn
+# longer); the redelivered prompt_id finds delivery_open already false,
+# reads as a plain duplicate, and is suppressed -- never a second search,
+# never a second topic.
 pq_mark_delivered() {
-    PQ_EMITTED=1
     if [ -n "${SESSION_ID:-}" ] && [ -n "${FB_HITS_FOR_STATE:-}" ]; then
         mc_fallback_write_state "$STATE_FILE" "prompt" "$FB_HITS_FOR_STATE" "userprompt" 0.25
     fi
@@ -230,24 +244,24 @@ finish() {
     local outcome="$1"
     local extra="${2:-}"
     # TOP-0133 L2: standalone delivery. Printed BEFORE the delivery_open
-    # close write just below (same ordering reason as pre-edit-chain.sh's
-    # own re-gate round 3, MAJOR 1: the close write's own lock deadline
-    # could still lose an already-computed guess to the watchdog if this
-    # ran after it). Guarded by PQ_EMITTED so this never double-prints --
-    # every one of the three merge points below calls pq_mark_delivered
-    # itself the moment it actually splices PQ_TEXT into its own envelope,
-    # so by the time finish("injected"/"lookback-injected"/"nudge-only")
-    # runs here, PQ_EMITTED is already set and this block is a no-op for
-    # those three outcomes; it only ever fires for a turn that would
-    # otherwise print nothing at all. On a real print, the outcome token
-    # itself becomes "prompt-query-only" (Addendum C: a standalone guess
-    # is not a nudge -- this must never sit silently under whatever the
-    # turn's own would-be outcome was, e.g. "no-evidence"), and `extra`
+    # close write just below (same stdout-first reasoning pre-edit-chain.sh's
+    # own re-gate round 3, MAJOR 1 established: the close write's own lock
+    # deadline could still lose an already-computed guess to the watchdog
+    # if this ran after it). Guarded by PQ_EMITTED so this never
+    # double-prints -- every one of the three merge points below sets
+    # PQ_EMITTED=1 itself the moment it actually splices PQ_TEXT into its
+    # own envelope, so by the time finish("injected"/"lookback-injected"/
+    # "nudge-only") runs here, PQ_EMITTED is already set and this block is
+    # a no-op for those three outcomes; it only ever fires for a turn that
+    # would otherwise print nothing at all. On a real print, the outcome
+    # token itself becomes "prompt-query-only" (Addendum C: a standalone
+    # guess is not a nudge -- this must never sit silently under whatever
+    # the turn's own would-be outcome was, e.g. "no-evidence"), and `extra`
     # is dropped (it described the turn's own now-superseded silent
-    # reason). pq_mark_delivered (fix round 1, MAJOR) runs ONLY after the
-    # printf that actually delivered the guess -- never before -- so the
-    # search_fallbacks state write happens exactly once, exactly when the
-    # guess it titles was actually shown.
+    # reason). The search_fallbacks append itself no longer happens here --
+    # fix round 1b (see pq_mark_delivered's own header comment) moved it to
+    # AFTER the delivery_open close write below, run once at the bottom of
+    # this function for every outcome.
     if [ -n "$PQ_TEXT" ] && [ -z "$PQ_EMITTED" ]; then
         PQ_STANDALONE_JSON="$(env PYTHONPATH= "$MC_PY" -c '
 import json, sys
@@ -260,7 +274,7 @@ print(json.dumps({
 ' "$PQ_TEXT" 2>>"$MC_LOG")"
         if [ -n "$PQ_STANDALONE_JSON" ]; then
             printf '%s\n' "$PQ_STANDALONE_JSON"
-            pq_mark_delivered
+            PQ_EMITTED=1
             outcome="prompt-query-only"
             extra=""
         fi
@@ -286,6 +300,17 @@ print(json.dumps({
 state["delivery_open"] = False
 print(json.dumps(state))
 ' >>"$MC_LOG" 2>&1
+    fi
+    # Fix round 1b (TOP-0133 L2, was MAJOR): the search_fallbacks append for
+    # a delivered guess happens HERE, once, AFTER the close write just
+    # above -- for "injected"/"lookback-injected" the real close already
+    # ran in the caller's own bookkeeping write before finish() was even
+    # called, so this is still "after close" for every outcome. PQ_EMITTED
+    # is the only guard needed (finish() always exits, so this function
+    # body runs at most once per invocation) -- see pq_mark_delivered's own
+    # header comment for the full reasoning.
+    if [ -n "$PQ_EMITTED" ]; then
+        pq_mark_delivered
     fi
     [ -n "$DECIDE_TMP" ] && rm -f "$DECIDE_TMP" 2>/dev/null
     if [ -n "$extra" ]; then
@@ -638,17 +663,17 @@ if [ "$PQ_ON" = "1" ]; then
                 # `search surfaced <title> (<id>) for <file>` rendering
                 # names this channel's own hit correctly with no code
                 # change to that block at all. Never stores the terms.
-                # Fix round 1 (MAJOR): NOT written here any more --
-                # FB_HITS_FOR_STATE (already set by mc_fallback_parse
-                # above) stays a plain global variable, untouched, until
-                # pq_mark_delivered() (see finish()'s own header comment)
-                # performs this write from whichever of the three actual
-                # emission points below delivers PQ_TEXT this turn. A
+                # Fix round 1 (MAJOR), refined round 1b: NOT written here
+                # any more -- FB_HITS_FOR_STATE (already set by
+                # mc_fallback_parse above) stays a plain global variable,
+                # untouched, until finish() calls pq_mark_delivered() (see
+                # both of their own header comments) once, AFTER whichever
+                # write closes delivery_open for this turn's outcome. A
                 # write here, before any stdout, is exactly the ordering
-                # Grok's fixture broke: a kill landing after this append
-                # but before delivery_open closes turns the next same-
-                # prompt_id redelivery into a RETRY that re-searches with
-                # this id already excluded -- a second topic for one
+                # Grok's original fixture broke: a kill landing after this
+                # append but before delivery_open closes turns the next
+                # same-prompt_id redelivery into a RETRY that re-searches
+                # with this id already excluded -- a second topic for one
                 # prompt, or a swallowed guess on a single-match store.
             fi
         fi
@@ -1077,15 +1102,18 @@ print(json.dumps({
 
     if [ $OUT_RC -eq 0 ] && [ -n "$OUTPUT_JSON" ]; then
         printf '%s\n' "$OUTPUT_JSON"
-        # TOP-0133 L2 (fix round 1, MAJOR): the guess (if any) was already
-        # merged into OUTPUT_JSON above -- AFTER this printf actually
-        # delivered it, mark it delivered (finish() below never re-emits
-        # it standalone for THIS turn's own "injected"/"nudge-only"
-        # outcome) and write the search_fallbacks state entry for it, in
-        # the same call, so the two can never land on different sides of
-        # a watchdog kill. Serves both this and the nudge-only outcome --
-        # they share this one printf.
-        [ -n "$PQ_TEXT" ] && pq_mark_delivered
+        # TOP-0133 L2 (fix round 1b): the guess (if any) was already merged
+        # into OUTPUT_JSON above -- this printf is what actually delivered
+        # it, so mark PQ_EMITTED now (finish() below never re-emits it
+        # standalone for THIS turn's own "injected"/"nudge-only" outcome).
+        # The search_fallbacks state append itself is deferred to finish()
+        # -- it runs AFTER whichever write closes delivery_open for this
+        # outcome (the phase-3 write a few lines below on the CANDIDATE=1
+        # branch, or finish()'s own close write on the nudge-only branch),
+        # never before -- see pq_mark_delivered's own header comment.
+        # Serves both this and the nudge-only outcome -- they share this
+        # one printf.
+        [ -n "$PQ_TEXT" ] && PQ_EMITTED=1
 
         if [ "${CANDIDATE:-0}" = "1" ]; then
             # Phase 3 (locked): commit the injection bookkeeping now that we
@@ -1254,22 +1282,24 @@ fi
 
 printf '%s\n' "$LB_OUTPUT_JSON"
 
-# TOP-0133 L2 (fix round 1, MAJOR): the guess (if any) was already merged
-# into LB_OUTPUT_JSON above -- AFTER the printf that actually delivered
-# it, mark it delivered (finish() below never re-emits it standalone for
-# this turn's own "lookback-injected" outcome) and write the
-# search_fallbacks state entry for it, in the same call. This is also
-# what fixes the double-mention Grok measured: the old write ran right
-# after the search, long before this look-back block even read
-# search_fallbacks to render its own "search surfaced ... for prompt"
-# lines a few statements above -- an exit-3 candidate that was also
-# look-back eligible used to see the SAME hit twice in one envelope (the
-# look-back list line AND the guess itself, both computed off a state
-# file the fresh hit had already landed in). Writing only after this
-# printf means the hit cannot appear in that same turn's own look-back
-# list -- it lands in state only once this turn's own guess is already
-# on its way out, so the NEXT look-back turn is the first one to list it.
-[ -n "$PQ_TEXT" ] && pq_mark_delivered
+# TOP-0133 L2 (fix round 1b): the guess (if any) was already merged into
+# LB_OUTPUT_JSON above -- this printf is what actually delivered it, so
+# mark PQ_EMITTED now (finish() below never re-emits it standalone for
+# this turn's own "lookback-injected" outcome). The search_fallbacks
+# append itself is deferred to finish() -- it runs AFTER the bookkeeping
+# write just below closes delivery_open, never before -- see
+# pq_mark_delivered's own header comment. Deferring the append past this
+# printf (fix round 1) is also what fixes the double-mention Grok
+# measured: the old write ran right after the search, long before this
+# look-back block even read search_fallbacks to render its own "search
+# surfaced ... for prompt" lines a few statements above -- an exit-3
+# candidate that was also look-back eligible used to see the SAME hit
+# twice in one envelope (the look-back list line AND the guess itself,
+# both computed off a state file the fresh hit had already landed in).
+# The append landing only once this turn's own guess is already on its
+# way out (now later still: after delivery_open closes) keeps that
+# property -- the NEXT look-back turn is still the first one to list it.
+[ -n "$PQ_TEXT" ] && PQ_EMITTED=1
 
 export MC_TURN_NUM="${TURN:-0}"
 export MC_NOW
