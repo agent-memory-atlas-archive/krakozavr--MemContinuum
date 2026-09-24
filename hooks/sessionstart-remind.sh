@@ -186,11 +186,22 @@ STATE_FILE="$(mc_state_file_for "$MC_PROJECT" "$SESSION_ID")"
 # grep STANDING_HEADER in memidx.py before ever changing either.
 # Bash 3.2: no associative arrays, no `local -n`; globals by convention
 # (this file is a leaf script, never sourced elsewhere).
+# STANDING_IDS_CSV (TOP-0133 L2, Addendum B): comma-joined, deduped TOPIC
+# ids (never link ids) behind every pointer this call's own digest would
+# deliver -- so the prompt-query channel can treat "already surfaced by
+# the standing digest" the same as "already surfaced by a search
+# fallback" and never re-guess a topic the model already has in context.
+# Derived from `standing --json`'s own "lines" (never a second query):
+# each line is `standing_line`'s own rendering, `f"{topic_id} {link_id}
+# (...): ..."`, so the FIRST whitespace-delimited token of a line is
+# always that pointer's topic id -- see memidx.py's standing_line before
+# ever changing either.
 STANDING_STATUS=""
 STANDING_TEXT=""
 STANDING_HASH=""
 STANDING_LINKS=0
 STANDING_BYTES=0
+STANDING_IDS_CSV=""
 
 mc_compute_standing() {
     STANDING_STATUS="skipped-unavailable"
@@ -198,6 +209,7 @@ mc_compute_standing() {
     STANDING_HASH=""
     STANDING_LINKS=0
     STANDING_BYTES=0
+    STANDING_IDS_CSV=""
 
     local args
     args=(standing --project "$MC_PROJECT" --db "$MC_DB_PATH")
@@ -230,20 +242,34 @@ if "hash" in obj:
             f.write(text)
     except OSError:
         pass
-    print("ok - %d %s %d" % (obj.get("links", 0), obj.get("hash", "-"), obj.get("bytes", 0)))
+    # TOP-0133 L2, Addendum B: the delivered TOPIC ids, deduped
+    # (first-occurrence order), comma-joined -- each line own first
+    # whitespace-delimited token is always its topic id (standing_line
+    # own rendering in memidx.py, "{topic_id} {link_id} (...): ..."; a
+    # topic id itself never contains a space or a comma). "-" when there
+    # is nothing to join (mirrors this same line own "-" placeholder for
+    # a missing hash), so the field is never empty/ambiguous for the
+    # fixed-field `read` below.
+    _seen_ids = []
+    for _l in lines:
+        _tid = _l.split(" ", 1)[0] if _l else ""
+        if _tid and _tid not in _seen_ids:
+            _seen_ids.append(_tid)
+    ids_csv = ",".join(_seen_ids) if _seen_ids else "-"
+    print("ok - %d %s %d %s" % (obj.get("links", 0), obj.get("hash", "-"), obj.get("bytes", 0), ids_csv))
 elif "reason" in obj:
     # Fix-round MINOR (Grok): the over-cap envelope carries "reason":
     # "over-cap" and no "state" at all -- falling into the generic
     # obj.get("state", "unknown") branch below used to report this as
     # `standing=skipped-unknown`, losing the one piece of information
     # (the store is over its own cap) an operator most needs to see.
-    print("refused %s 0 - 0" % obj.get("reason", "unknown"))
+    print("refused %s 0 - 0 -" % obj.get("reason", "unknown"))
 else:
-    print("refused %s 0 - 0" % obj.get("state", "unknown"))
+    print("refused %s 0 - 0 -" % obj.get("state", "unknown"))
 ' "$json_out" "$text_tmp" >"$meta_tmp" 2>>"$MC_LOG"
 
-    local kind rstate links hash nbytes
-    read -r kind rstate links hash nbytes <"$meta_tmp" 2>/dev/null
+    local kind rstate links hash nbytes ids
+    read -r kind rstate links hash nbytes ids <"$meta_tmp" 2>/dev/null
     rm -f "$meta_tmp" 2>/dev/null
 
     if [ "${kind:-}" != "ok" ]; then
@@ -262,6 +288,7 @@ else:
     STANDING_HASH="$hash"
     STANDING_LINKS="$links"
     STANDING_BYTES="$nbytes"
+    [ -n "${ids:-}" ] && [ "$ids" != "-" ] && STANDING_IDS_CSV="$ids"
     STANDING_STATUS="ready"
 }
 
@@ -484,6 +511,7 @@ print(json.dumps(state))
             # equals a real hash, so clear always injects (when there is
             # something to inject) without needing its own branch here.
             export MC_STANDING_HASH="$STANDING_HASH"
+            export MC_STANDING_IDS="$STANDING_IDS_CSV"
             STANDING_VERDICT_TMP="$(mktemp 2>/dev/null)"
             export MC_STANDING_VERDICT_OUT="${STANDING_VERDICT_TMP:-}"
             mc_update_state_json "$STATE_FILE" '
@@ -493,6 +521,14 @@ _new_hash = os.environ.get("MC_STANDING_HASH", "")
 _verdict = "dedup"
 if state.get("standing_hash") != _new_hash:
     state["standing_hash"] = _new_hash
+    # TOP-0133 L2, Addendum B: the delivered topic ids ride the SAME
+    # locked write as standing_hash, and only when this comparison
+    # actually decides to inject -- a "dedup" turn (the digest was
+    # already shown, unchanged) writes neither, since nothing new was
+    # delivered for the prompt-query channel to treat as surfaced.
+    state["standing_ids"] = [
+        _i for _i in (os.environ.get("MC_STANDING_IDS", "") or "").split(",") if _i
+    ]
     _verdict = "inject"
 _out = os.environ.get("MC_STANDING_VERDICT_OUT")
 if _out:
@@ -559,9 +595,16 @@ print(json.dumps(state))
             # nothing to dedupe against and re-injected the identical
             # digest a second time.
             export MC_STANDING_HASH="$STANDING_HASH"
+            export MC_STANDING_IDS="$STANDING_IDS_CSV"
             mc_update_state_json "$STATE_FILE" '
 import os
 state["standing_hash"] = os.environ.get("MC_STANDING_HASH", "")
+# TOP-0133 L2, Addendum B: same locked write as standing_hash -- a
+# compact always injects when ready (no dedup branch here, see the
+# header comment above), so the ids ride unconditionally too.
+state["standing_ids"] = [
+    _i for _i in (os.environ.get("MC_STANDING_IDS", "") or "").split(",") if _i
+]
 print(json.dumps(state))
 ' >>"$MC_LOG" 2>&1
         elif [ "$STANDING_STATUS" = "skipped-upgrade-required" ]; then
