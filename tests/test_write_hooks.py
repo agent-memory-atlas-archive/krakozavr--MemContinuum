@@ -476,18 +476,32 @@ class HookTestBase(unittest.TestCase):
 
     def user_prompt_payload(
         self, session_id, source=None, agent_id=None, agent_type=None, prompt_id=None,
-        prompt_key="user_input",
+        prompt_key="prompt", prompt_text=None,
     ):
         """Real-shaped by default (fix-round 2026-08-31): a live
         UserPromptSubmit payload carries no `source` field at all -- that
         field belongs to SessionStart -- so `source` is omitted unless a
         test explicitly passes one (to prove its presence, if it ever
-        shows up again, is a no-op the hook ignores)."""
+        shows up again, is a no-op the hook ignores).
+
+        `prompt_key` defaults to "prompt" (TOP-0133 L2, Addendum A): real
+        UserPromptSubmit payloads on this machine carry the prompt under
+        `prompt`, never `user_input` -- hook.log's own `payload_keys=`
+        lines are the evidence (see docs/INTERNALS.md). A test that needs
+        the OTHER key (proving that one is equally never dereferenced)
+        passes prompt_key="user_input" explicitly.
+
+        `prompt_text` (TOP-0133 L2): the value at `prompt_key`, default a
+        sentinel string standing in for real content ("this text must
+        never be read by the hook") for every test that predates the
+        prompt-query channel and just needs SOME string there. A
+        prompt-query test passes a real (or deliberately term-poor/
+        stopword-only) sentence instead."""
         d = {
             "session_id": session_id,
             "hook_event_name": "UserPromptSubmit",
             "cwd": str(self.code_root),
-            prompt_key: "this text must never be read by the hook",
+            prompt_key: prompt_text if prompt_text is not None else "this text must never be read by the hook",
         }
         if source is not None:
             d["source"] = source
@@ -3355,23 +3369,41 @@ class TestUserPromptRemind(HookTestBase):
         script -- the point of this test is a real, running hook that still
         never touches user_input, not an absent one that trivially can't):
 
-        1. Static: the script source never references the `user_input` key
-           at all (docs/DESIGN.md ruling B forbids reading it).
+        1. Static: the script source never DEREFERENCES the payload's
+           `user_input` key -- `.get("user_input"` / `["user_input"]`
+           shapes (either python quote style). TOP-0133 L2 amends ruling B
+           (the prompt-query channel may derive query TERMS from the
+           prompt, opt-in only -- see test_never_reads_prompt_key_either
+           below), but that derivation happens ENTIRELY inside
+           hooks/memlib.sh's mc_extract_fields, behind the "_prompt_terms"
+           field NAME -- this script itself never touches the payload's
+           raw `user_input`/`prompt` VALUE, on any turn, on or off. Plain
+           substring checks would now false-positive on this script's own
+           legitimate uses of the bare word (outcome names like
+           `prompt-query`, the `prompt-query.projects` switch file, the
+           literal FILE_PATH string "prompt" passed to
+           mc_fallback_write_state) -- the dereference-shape regex is
+           precise about what ruling B actually forbids.
         2. Dynamic: with a real payload whose user_input carries a poison
-           string, the hook still runs successfully (rc=0, actually injects,
-           since evidence exists) and never leaks that string into its own
-           log.
+           string (channel OFF, the default -- prompt_key explicit here so
+           this keeps testing that exact key), the hook still runs
+           successfully (rc=0, actually injects, since evidence exists)
+           and never leaks that string into its own log.
         """
+        import re
+
         code_lines = [
             line for line in USERPROMPT_HOOK.read_text().splitlines()
             if not line.strip().startswith("#")
         ]
-        offending = [line for line in code_lines if "user_input" in line]
-        self.assertEqual(offending, [], f"script code (not comments) references user_input: {offending}")
+        deref_pattern = re.compile(r'''\.get\(\s*["']user_input["']|\[\s*["']user_input["']\s*\]''')
+        offending = [line for line in code_lines if deref_pattern.search(line)]
+        self.assertEqual(offending, [], f"script code (not comments) dereferences user_input: {offending}")
 
         session_id = "s-prompt-nouserinput"
         self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
-        proc, _ = run_script(USERPROMPT_HOOK, self.user_prompt_payload(session_id), self.base_env())
+        payload = self.user_prompt_payload(session_id, prompt_key="user_input")
+        proc, _ = run_script(USERPROMPT_HOOK, payload, self.base_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(proc.stdout.strip(), "expected a real injection (evidence exists)")
 
@@ -3381,19 +3413,24 @@ class TestUserPromptRemind(HookTestBase):
 
     def test_never_reads_prompt_key_either(self):
         """Payload contract addendum (Codex): accept BOTH `user_input` and
-        `prompt` as the payload's prompt-text key -- the not-read invariant
-        must cover both names. Word-boundary regex so `prompt_id` (the
-        dedupe field this addendum adds) and `UserPromptSubmit` don't
-        false-positive."""
+        `prompt` as the payload's prompt-text key -- the not-DEREFERENCE
+        invariant must cover both names (same dereference-shape regex as
+        test_never_reads_user_input above; a bare word-boundary check on
+        `prompt` no longer works post-TOP-0133-L2 -- this script's own
+        code legitimately says `prompt-query`/`prompt-query.projects`/
+        `prompt-query-only` now). Channel OFF (the default, `base_env()`
+        sets neither MEMCONTINUUM_PROMPT_QUERY nor the projects file), so
+        this still proves the unconditional case: even a `prompt`-keyed
+        payload is never dereferenced by this script's own code."""
         import re
 
         code_lines = [
             line for line in USERPROMPT_HOOK.read_text().splitlines()
             if not line.strip().startswith("#")
         ]
-        pattern = re.compile(r"\bprompt\b")
-        offending = [line for line in code_lines if pattern.search(line)]
-        self.assertEqual(offending, [], f"script code (not comments) references bare `prompt`: {offending}")
+        deref_pattern = re.compile(r'''\.get\(\s*["'](?:user_input|prompt)["']|\[\s*["'](?:user_input|prompt)["']\s*\]''')
+        offending = [line for line in code_lines if deref_pattern.search(line)]
+        self.assertEqual(offending, [], f"script code (not comments) dereferences user_input/prompt: {offending}")
 
         session_id = "s-prompt-nopromptkey"
         self.seed_ledger(session_id, [(str(self.code_root / "src" / "unmapped.py"), "code")])
