@@ -2913,37 +2913,13 @@ def vector_ranked(
 # of silently rotting the reasoning above.
 FTS_STEP_ASIDE_COVERAGE = 0.25
 
-_STOPWORDS = frozenset("""
-a an the is are was were be been being do does did doing have has had having
-i you he she it we they me him her us them my your his its our their this
-that these those to of in on at by for with about against between into
-through during before after above below from up down out off over under
-again further then once here there when where why how all any both each
-few more most other some such no nor not only own same so than too very
-can will just don should now what which who whom or and but if because as
-until while
-""".split())
-_CONTENT_TOKEN_RE = re.compile(r"[a-z0-9]+")
-
-
-def _content_terms(text: str) -> set[str]:
-    """INC-0115: non-stopword, length>1 tokens -- the same definition
-    tests/test_bench.py's paraphrase-independence check uses to verify a
-    paraphrase query shares no vocabulary with its target, now reused (not
-    duplicated) here to decide, at query time, whether the FTS channel's
-    own top hit actually shares any.
-
-    STATED LIMIT (not fixed here -- the owner wants real query data before
-    touching tokenization): `_CONTENT_TOKEN_RE` (`[a-z0-9]+`) drops every
-    1-character and non-ASCII token, on both the query side and the
-    document side. FTS5's own tokenizer keeps 1-character tokens (a bare
-    digit, a single letter used as an identifier), so a query anchored on
-    one -- "the 6 attempts limit", "an x coordinate" -- never puts that
-    anchor into `qtok` at all, even when FTS5 itself matched on it and the
-    document contains it verbatim. Coverage is computed only over the
-    tokens this function keeps; a short, anchor-heavy query can therefore
-    read a lower coverage than FTS5's own match actually earned it."""
-    return {w for w in _CONTENT_TOKEN_RE.findall(text.lower()) if w not in _STOPWORDS and len(w) > 1}
+# _STOPWORDS / _CONTENT_TOKEN_RE / _content_terms: moved to mc_text.py
+# (TOP-0133 L2) so hooks/memlib.sh's `_prompt_terms` field can tokenize a
+# prompt with the SAME content-term definition without importing this whole
+# ~9,000-line module from a hook one-liner. Re-exported here, not copied --
+# `memidx._content_terms is mc_text._content_terms` (see tests/test_bench.py)
+# -- every existing caller in this file keeps working unchanged.
+from mc_text import _STOPWORDS, _CONTENT_TOKEN_RE, _content_terms  # noqa: E402
 
 
 def _fts_top_hit_coverage(conn, project: str, query: str, top_fts_path: str) -> float | None:
