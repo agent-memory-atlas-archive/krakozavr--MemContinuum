@@ -5036,12 +5036,19 @@ Body prose about widget regression throttling handling in detail.
         misread as a retry and take a SECOND topic). Forcing that
         specific separate-close-failed shape is not exercisable from
         outside the process; this instead pins the postcondition the fix
-        guarantees end-to-end, on the ONE outcome (a standalone guess)
-        that has no separate close write of its own at all -- the append
-        is the ONLY write that could possibly close delivery_open here:
-        a normal standalone-guess turn still ends with delivery_open
-        false, and the identical prompt_id resubmitted afterward reads as
-        a plain duplicate, never a retry."""
+        guarantees end-to-end. NOTE (fix round 3, Codex final26 review):
+        a standalone guess is NOT the one outcome with no separate close
+        write of its own -- finish() DOES perform one, for any outcome
+        other than "injected"/"lookback-injected" (a standalone guess's
+        own outcome, "prompt-query-only", is neither), strictly before
+        calling pq_mark_delivered. The CLOSE_DELIVERY arg is a SECOND,
+        REDUNDANT close covering that first one failing (a lock timeout,
+        a skipped branch), not the only close on this path -- this test
+        still ends up asserting the right thing (delivery_open false
+        after a standalone guess) because BOTH the ordinary close and the
+        redundant one succeed in the common case this test exercises; it
+        is not, by itself, proof the redundant close is what did the
+        work."""
         session_id = "s-pq-append-closes"
         self.seed_ledger(session_id, [])
         payload = self.user_prompt_payload(
@@ -5176,18 +5183,25 @@ Body prose about widget regression throttling handling in detail.
         self.assertEqual(on_log.count("_prompt_terms"), 1, on_log)
 
     def test_retry_after_kill_before_stdout_delivers_once_not_twice(self):
-        """Fix round 1 (MAJOR, Grok): the state write for a prompt-query
-        hit now happens only AFTER the stdout that delivered it (see
-        pq_mark_delivered() in userprompt-remind.sh) -- a kill landing
-        between phase 1's commit (hash+turn stamped, delivery_open=True)
-        and that stdout leaves search_fallbacks untouched by THIS run.
-        The redelivered prompt_id is then a RETRY (delivery_open still
-        true): it re-runs the query, TOP-8001 is not yet excluded, and
-        the SAME guess is delivered again -- never a second topic, never
-        a swallowed "already-surfaced" on a single-match store. Simulated
-        by running once for real, then rewinding state to exactly that
-        kill-before-stdout shape (undo this run's own append, reopen
-        delivery_open) before resubmitting the identical prompt_id."""
+        """Fix round 3 (MAJOR, Codex final26): a RETRY turn (delivery_open
+        still true because a kill landed before either close write could
+        run) now skips the prompt-query search ENTIRELY instead of re-
+        running it -- RETRY is exported from the one-shot decision reader
+        and checked before anything else inside `if [ "$PQ_ON" = "1" ]`
+        (userprompt-remind.sh). This is a deliberate contract change from
+        fix round 1: a retry used to re-search and redeliver the SAME
+        guess (safe only because nothing had been excluded yet); Codex
+        showed that guarantee breaks the moment an intervening write
+        excludes the original hit before the redelivery, since re-
+        searching then surfaces a DIFFERENT topic for the same prompt.
+        Skipping the search on every retry makes "at most one topic per
+        prompt" hold by construction instead: the first delivery either
+        reached stdout (one topic) or it did not (zero) -- a retry never
+        selects, so it can never select a second, different one either.
+        Simulated by running once for real, then rewinding state to
+        exactly the kill-before-close shape (undo this run's own append,
+        reopen delivery_open) before resubmitting the identical
+        prompt_id."""
         session_id = "s-pq-retry"
         self.seed_ledger(session_id, [])
         payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT, prompt_id="pq-retry-1")
@@ -5207,12 +5221,15 @@ Body prose about widget regression throttling handling in detail.
 
         proc2, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
         self.assertEqual(proc2.returncode, 0, proc2.stderr)
-        self.assertIn("TOP-8001", proc2.stdout, "a retry must redeliver the SAME guess, not a second topic")
-        self.assertNotIn("TOP-8002", proc2.stdout)
+        self.assertNotIn("TOP-8001", proc2.stdout, "a retry must never re-select any topic, not even the original")
+        self.assertNotIn("TOP-8002", proc2.stdout, "a retry must never select a second, different topic")
 
         state2 = self.load_state(session_id)
         self.assertFalse(state2.get("delivery_open"))
-        self.assertEqual(len(state2.get("search_fallbacks") or []), 1, "one entry, not two")
+        self.assertEqual(
+            len(state2.get("search_fallbacks") or []), 0,
+            "a retry runs no search at all -- nothing new is ever appended",
+        )
         self.assertEqual(
             state2.get("user_turn_count"), turn_after_first,
             "a retry must not double-advance the turn counter",
@@ -5223,7 +5240,59 @@ Body prose about widget regression throttling handling in detail.
             l for l in log_text.splitlines()
             if " outcome=prompt-query " in l or l.rstrip().endswith("outcome=prompt-query")
         ]
-        self.assertEqual(len(pq_lines), 2, log_text)
+        self.assertEqual(len(pq_lines), 1, "a retry must never search: still exactly one real hit line, from run 1")
+        self.assertIn("outcome=prompt-query-empty reason=retry", log_text)
+
+    def test_codex_finding_retry_never_yields_second_topic_even_with_intervening_fallback(self):
+        """Codex's own reproduction (final26 review, MAJOR): a kill after
+        the guess already reached stdout but before EITHER close write
+        (finish()'s own, or pq_mark_delivered's) lands leaves
+        delivery_open true with NOTHING written to search_fallbacks for
+        that hit. If, in that same window, an UNRELATED L1 fallback hook
+        (pre-edit-chain.sh/newfile-nudge.sh's own shape) independently
+        appends the SAME id to search_fallbacks for a different file --
+        a real, legitimate event this fix must not depend on the absence
+        of -- the redelivered prompt_id must still read as a RETRY and
+        select nothing new: never TOP-8002, regardless of what
+        search_fallbacks already holds by the time it runs."""
+        session_id = "s-pq-retry-codex"
+        self.seed_ledger(session_id, [])
+        payload = self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT, prompt_id="pq-retry-codex-1")
+        proc1, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+        self.assertIn("TOP-8001", proc1.stdout)
+
+        # Simulate: both the normal close and pq_mark_delivered's own
+        # append were lost to a kill -- delivery_open reopened, this
+        # run's own search_fallbacks entry undone.
+        state_file = self.state_file(session_id)
+        state = json.loads(state_file.read_text())
+        state["delivery_open"] = True
+        # An unrelated L1 hook independently surfaces the SAME id for a
+        # DIFFERENT file, in the SAME session, moments later -- a real
+        # event, not this run's own (undone) append.
+        state["search_fallbacks"] = [{
+            "file": "somewhere/else/unrelated1.py",
+            "id": "TOP-8001",
+            "title": "Widget caching policy",
+            "hook": "pre-edit",
+        }]
+        state_file.write_text(json.dumps(state))
+
+        proc2, _ = run_script(USERPROMPT_HOOK, payload, self.pq_env())
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertNotIn("TOP-8001", proc2.stdout)
+        self.assertNotIn("TOP-8002", proc2.stdout, "must never surface a second topic for the same prompt")
+
+        log_text = (self.home / "hook.log").read_text()
+        self.assertIn("outcome=prompt-query-empty reason=retry", log_text)
+
+        state2 = self.load_state(session_id)
+        self.assertFalse(state2.get("delivery_open"))
+        self.assertEqual(
+            len(state2.get("search_fallbacks") or []), 1,
+            "the intervening L1 entry is left exactly as it was -- a retry adds nothing",
+        )
 
     def test_grep_qxf_project_name_with_dot_is_literal_not_regex(self):
         """Fix round 1 (MINOR, Grok): grep -qx treats $MC_PROJECT as a
@@ -5318,6 +5387,58 @@ class TestMcFallbackParseExcludeIdsMaxHits(unittest.TestCase):
         out = self._parse(self.TWO_HIT_JSON, max_hits="1")
         self.assertEqual(out["HITS"], "1")
         self.assertEqual(out["IDS"], "TOP-1")
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestMcFallbackWriteStateCloseDelivery(unittest.TestCase):
+    """Direct library test (fix round 3, TOP-0133 L2, Codex final26 MINOR):
+    mc_fallback_write_state's 6th arg (CLOSE_DELIVERY) proven in isolation
+    against a pre-seeded state file, rather than only end to end through a
+    full hook run. Seeds delivery_open=true, calls the function with the
+    6th arg "1" and confirms it flips to false in the SAME locked write; a
+    control call omitting the 6th arg (the 5-arg form) proves delivery_open
+    is left untouched otherwise -- the two together are what the library
+    comment above the function now claims (a REDUNDANT close, not the only
+    one), not a no-op."""
+
+    FB_LIB = HOOKS_DIR / "mc-fallback-lib.sh"
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-fbwrite-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+
+    def _seed_state(self, name: str) -> Path:
+        state_file = Path(self.td) / f"{name}.json"
+        state_file.write_text(json.dumps({"delivery_open": True, "user_turn_count": 3}))
+        return state_file
+
+    def _call(self, state_file: Path, close_delivery_arg: str) -> subprocess.CompletedProcess:
+        script = (
+            f'source {shlex.quote(str(MEMLIB))}\n'
+            f'source {shlex.quote(str(self.FB_LIB))}\n'
+            f'mc_fallback_write_state {shlex.quote(str(state_file))} "prompt" "[]" "userprompt" 2.0'
+            + (f" {close_delivery_arg}" if close_delivery_arg is not None else "")
+            + "\n"
+            'echo "RC=$?"\n'
+        )
+        env = clean_env(MEMCONTINUUM_HOME=self.td, MEMCONTINUUM_PYTHON=VENV_PYTHON)
+        return subprocess.run([MC_BASH, "-c", script], capture_output=True, text=True, env=env, timeout=10)
+
+    def test_sixth_arg_one_closes_delivery_open(self):
+        state_file = self._seed_state("close")
+        proc = self._call(state_file, '"1"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout)
+        state = json.loads(state_file.read_text())
+        self.assertFalse(state.get("delivery_open"), "CLOSE_DELIVERY=1 must set delivery_open false")
+
+    def test_five_arg_form_leaves_delivery_open_untouched(self):
+        state_file = self._seed_state("control")
+        proc = self._call(state_file, None)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout)
+        state = json.loads(state_file.read_text())
+        self.assertTrue(state.get("delivery_open"), "omitting the 6th arg must never touch delivery_open")
 
 
 # ---------------------------------------------------------------------------

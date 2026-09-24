@@ -51,11 +51,17 @@ _CONTENT_TOKEN_RE = re.compile(r"[a-z0-9]+")
 # from this list -- this store's own "look-back" (the feature name)
 # tokenizes to `look` + `back`, and `look` is the distinctive half; a
 # prompt asking about it (e.g. "please explain the look-back reminder
-# design") must keep `look` as a searchable term.
+# design") must keep `look` as a searchable term. Fix round 3 (TOP-0133
+# L2, Codex final26 review): `still` dropped too, same reasoning -- it
+# occurs across 15 of this store's own topic files, carrying real
+# currentness/supersession intent ("is TOP-xxxx still the ruling",
+# "does this still apply"), not pure filler; keeping it out of this list
+# lets a short, otherwise-borderline prompt that hinges on that one word
+# still clear the four-term gate and still be searchable.
 _PROMPT_FILLER = frozenset("""
 please explain want need help tell show thanks thank let lets like think
 know see make sure just also really actually maybe something anything
-everything nothing thing things way well okay yes yeah right hmm still
+everything nothing thing things way well okay yes yeah right hmm
 """.split())
 
 

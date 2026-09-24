@@ -239,6 +239,21 @@ PQ_EMITTED=""
 # after this append itself (guaranteed atomic with the close, one lock)
 # now only ever loses the search_fallbacks TITLING entry (the look-back
 # list simply omits this hit one turn longer).
+#
+# Fix round 3 (TOP-0133 L2, was MAJOR, Codex final26): rounds 1b/2 above
+# ordered TWO writes relative to each other, but a kill can also land
+# BEFORE either one runs at all -- after the printf already delivered the
+# guess, but before this function (or finish()'s own close write) gets to
+# execute or complete. That leaves delivery_open true with NOTHING
+# written to search_fallbacks, so the actual guarantee against a second
+# topic no longer lives here: it lives in the RETRY check near the top of
+# the `if [ "$PQ_ON" = "1" ]` block, which skips the search outright on
+# any redelivered prompt_id that finds delivery_open still true -- see
+# that check's own comment. This ordering (append after whichever close,
+# atomic with its own close) is still correct and still worth keeping: it
+# is what makes search_fallbacks/look-back TITLING match what genuinely
+# went to stdout. It just does not, by itself, bound how many topics one
+# prompt can ever show -- the retry skip does that now, by construction.
 pq_mark_delivered() {
     if [ -n "${SESSION_ID:-}" ] && [ -n "${FB_HITS_FOR_STATE:-}" ]; then
         mc_fallback_write_state "$STATE_FILE" "prompt" "$FB_HITS_FOR_STATE" "userprompt" 0.25 1
@@ -564,9 +579,13 @@ fi
 
 # One shot: read every scalar the rest of this script needs out of the
 # decision file (duplicate/candidate/turn/lookback_eligible/since_turn/
-# delivery_open) --
+# delivery_open/retry) --
 # kept to a single call so the happy path doesn't add spawns on top of the
-# 2s outer budget above.
+# 2s outer budget above. RETRY (fix round 3, TOP-0133 L2, was MAJOR,
+# Codex): phase 1 already computed `retry` (a same-prompt_hash redelivery
+# while delivery_open was still true) -- exported here so the prompt-query
+# block below can skip the search entirely on a retry turn instead of
+# re-selecting. See that block's own comment for why.
 eval "$(env PYTHONPATH= "$MC_PY" -c '
 import json, sys, shlex
 with open(sys.argv[1]) as f:
@@ -578,6 +597,7 @@ out = {
     "LB_ELIGIBLE": "1" if d.get("lookback_eligible") else "0",
     "SINCE_TURN": str(d.get("since_turn", 0)),
     "DELIVERY_OPEN": "1" if d.get("delivery_open") else "0",
+    "RETRY": "1" if d.get("retry") else "0",
     "SURFACED_IDS": ",".join(d.get("surfaced_ids") or []),
 }
 for k, v in out.items():
@@ -601,10 +621,33 @@ fi
 # zero terms or 1-3 of them -- this hook cannot and need not tell those
 # apart, both log the same reason). PQ_TEXT stays "" (the channel found
 # nothing, or never ran) unless a real hit survives below.
+#
+# RETRY (fix round 3, TOP-0133 L2, was MAJOR, Codex final26): checked
+# FIRST, before even the term/root checks, and unconditionally skips the
+# search. Codex reproduced a real gap in the close/append ORDERING fix
+# (fix rounds 1b/2): a kill landing after the guess already reached
+# stdout but before EITHER close write (finish()'s own, or
+# pq_mark_delivered's atomic append+close) can still leave delivery_open
+# true with the hit's own search_fallbacks entry never written -- the
+# redelivered prompt_id then read as a RETRY, re-ran the search with
+# nothing excluded, and could surface a SECOND, different topic
+# (TOP-8002) for what is really the SAME prompt. The close/append
+# ordering those earlier rounds built still matters -- it is what keeps
+# search_fallbacks/look-back TITLING consistent with what actually went
+# out on stdout -- but it can never by itself guarantee "at most one
+# topic per prompt", because the kill window sits BEFORE either close
+# write runs at all, not between them. Skipping the search on every
+# RETRY turn closes that gap by construction instead: the first delivery
+# either reached stdout (one topic, period) or it did not (zero); a
+# retry never selects, so it can never add a second one. The cost is
+# that a retry no longer redelivers the original guess either -- an
+# acceptable trade (a lost guess, never a doubled one).
 if [ "$PQ_ON" = "1" ]; then
     PQ_TERMS_LOGGED="${PROMPT_TERMS:-}"
     PQ_TERMS_LOGGED="${PQ_TERMS_LOGGED// /+}"
-    if [ -z "${PROMPT_TERMS:-}" ]; then
+    if [ "${RETRY:-0}" = "1" ]; then
+        mc_log "userprompt outcome=prompt-query-empty reason=retry q=$PQ_TERMS_LOGGED session=${SESSION_ID:-}"
+    elif [ -z "${PROMPT_TERMS:-}" ]; then
         mc_log "userprompt outcome=prompt-query-empty reason=too-few-terms q= session=${SESSION_ID:-}"
     elif [ -z "${MEMCONTINUUM_ROOT:-}" ]; then
         mc_log "userprompt outcome=prompt-query-empty reason=store-root-unset q=$PQ_TERMS_LOGGED session=${SESSION_ID:-}"
@@ -682,9 +725,13 @@ if [ "$PQ_ON" = "1" ]; then
                 # write here, before any stdout, is exactly the ordering
                 # Grok's original fixture broke: a kill landing after this
                 # append but before delivery_open closes turns the next
-                # same-prompt_id redelivery into a RETRY that re-searches
-                # with this id already excluded -- a second topic for one
-                # prompt, or a swallowed guess on a single-match store.
+                # same-prompt_id redelivery into a RETRY. Fix round 3
+                # (Codex final26) is what actually bounds that RETRY to
+                # never selecting a second topic -- it never reaches this
+                # search call at all (see the RETRY check near the top of
+                # this `if` block); this comment's own ordering only keeps
+                # the eventual search_fallbacks entry consistent with what
+                # stdout actually carried, never a second topic on its own.
             fi
         fi
     fi

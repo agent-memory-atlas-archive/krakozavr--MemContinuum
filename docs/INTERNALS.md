@@ -281,6 +281,10 @@ milliseconds an embedding call needs. `memidx.py search --mode fts
 above in every other respect. At most one topic per prompt: the search
 asks for up to 3 hits so the exclusion filter below has room to skip past
 an already-surfaced one, but only the FIRST surviving hit is ever shown.
+A redelivered prompt (a RETRY — the same `prompt_id` resubmitted while
+`delivery_open` is still true, e.g. after a killed run) never searches at
+all: the guess a prior run may have already computed can be lost, but one
+prompt is never allowed to yield two topics.
 
 Per-session dedup: a topic already surfaced this session — by a search
 fallback (`search_fallbacks`, written by `pre-edit-chain.sh`,
@@ -319,7 +323,8 @@ this is the "the prompt was never read" proof for every other project):
 
 `reason` is one of `too-few-terms` / `no-hits` / `already-surfaced` /
 `store-root-unset` / `lib-missing` / `search-failed rc=N` / `bad-json` /
-an index state name. `q=` is `+`-joined, not space-joined — the same
+`retry` (a redelivered prompt_id, delivery_open still open — see above;
+the search never ran) / an index state name. `q=` is `+`-joined, not space-joined — the same
 reason the search-fallback query above is (`memidx.py stats`' generic
 `key=value` field scan has no quote-awareness, so a space-containing value
 would truncate at the first space); this is the one place a term is

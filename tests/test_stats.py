@@ -1273,6 +1273,24 @@ class TestStatsPromptQueryBucket(StatsTestBase):
         self.assertIsNone(pq["ms_p50"])
         self.assertIsNone(pq["ms_p95"])
 
+    def test_retry_reason_is_tallied_like_any_other(self):
+        """Fix round 3 (TOP-0133 L2, Codex final26): `reason=retry`
+        (userprompt-remind.sh, a redelivered prompt_id that skipped the
+        search outright) needs no new code here -- the `reasons` tally
+        already reads any `reason=<value>` off a `prompt-query-empty`
+        line generically. This just confirms that generic reading
+        actually covers the new value."""
+        lines = [
+            f"{ts(1)} userprompt outcome=prompt-query-empty "
+            "reason=retry q=widget+cache session=s1 project=demo",
+        ]
+        self.write_log(lines)
+        rc, out = run_stats_json(home=str(self.home), project="demo")
+        self.assertEqual(rc, 0)
+        pq = out["prompt_query"]
+        self.assertEqual(pq["prompt_query_empty"], 1)
+        self.assertEqual(pq["reasons"], {"retry": 1})
+
     def test_text_mode_prints_a_prompt_query_line(self):
         lines = [
             f"{ts(1)} userprompt outcome=prompt-query hits=1 ids=TOP-1 "

@@ -200,18 +200,27 @@ for field in fields:
 # passes it -- pre-edit-chain.sh and newfile-nudge.sh never touch
 # delivery_open at all and always omit it (empty/unset here is a no-op).
 # pq_mark_delivered calls this function strictly AFTER the prompt-query
-# guess has already gone out on stdout (PQ_EMITTED is its only guard), so
-# closing delivery_open again here is always correct -- it either repeats
-# a close that already happened moments earlier in the SAME invocation
-# (the common case: coverage/look-back's own bookkeeping write, or
-# finish()'s own silent-turn close, already ran first), or, on the one
-# path with no separate close write of its own (the standalone guess),
-# performs the close for the first and only time. Folding it into this
-# append closes the one residual window a re-gate found: if the SEPARATE
-# close write's own lock wait were ever skipped or lost between it and
-# this append, delivery_open would still end up false here regardless,
-# so a killed-and-redelivered prompt_id can never read as an open retry
-# once its guess has actually been delivered.
+# guess has already gone out on stdout (PQ_EMITTED is its only guard) AND
+# after finish()'s own SEPARATE delivery_open close write, which runs for
+# every outcome that reaches pq_mark_delivered at all -- including the
+# standalone "prompt-query-only" outcome: finish() closes delivery_open
+# for any outcome other than "injected"/"lookback-injected" (whose own
+# caller-side bookkeeping write already closed it before finish() was
+# even called), and a standalone guess's own outcome is neither of those
+# two. So this is a SECOND, REDUNDANT close, not the only one -- every
+# path pq_mark_delivered can be reached from already had one close write
+# attempt moments earlier in the SAME invocation. It exists to cover that
+# first attempt failing: a lock-wait timeout, or a skipped close on some
+# future outcome branch, could otherwise leave delivery_open still open
+# by the time this append runs. Folding a second, redundant close into
+# this SAME locked write removes that risk entirely -- delivery_open ends
+# up false here regardless of whether the first close write landed, so a
+# killed-and-redelivered prompt_id can never read as an open retry once
+# its guess has actually been delivered (fix round 3, TOP-0133 L2, Codex
+# final26: a kill BEFORE either close write even runs is a separate gap
+# this cannot cover by itself -- closed instead by skipping the search
+# outright on every retry turn; see userprompt-remind.sh's own RETRY
+# check for the actual "at most one topic per prompt" guarantee).
 mc_fallback_write_state() {
     local state_file="$1" fb_file="$2" hits_json="$3" hook_name="$4" deadline_s="${5:-2.0}" close_delivery="${6:-}"
     export MC_FB_FILE="$fb_file"
