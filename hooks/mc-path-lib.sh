@@ -446,8 +446,11 @@ EOF2
 # trailing slash removed, empty entries dropped. The roots argument of
 # mc_remap_worktree_gated / mc_remap_worktree_path.
 mc_strip_prefix_roots() {
-    local prefixes="$1" prefix root out="" IFS=':'
-    for prefix in $prefixes; do
+    local prefixes="$1" prefix root out="" parts=()
+    # read -a, never an unquoted word split: a root containing * ? [ must
+    # stay literal, not pathname-expand against sibling directories.
+    IFS=: read -r -a parts <<< "$prefixes"
+    for prefix in ${parts[@]+"${parts[@]}"}; do
         root="${prefix%/}"
         [ -z "$root" ] && continue
         out="${out:+$out

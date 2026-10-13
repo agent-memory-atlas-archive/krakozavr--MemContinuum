@@ -79,12 +79,14 @@ Notes:
 Lives in this repo (`hooks/newfile-nudge.sh`), wired into the same project settings as
 `pre-edit-chain.sh` above but as a SEPARATE `PreToolUse` matcher group (`"Write"`, never
 `"Edit|Write"` — this hook only ever fires on a path that does not exist yet; an edit to an
-existing file is `pre-edit-chain.sh`'s job, not this one's). Deliberately minimal: no
-`MEMCONTINUUM_ROOT`/`STRIP_PREFIX`, since this hook never calls `memidx.py` or reads the index at
-all — it only checks that the write target is new, under a configured code root, and has an
-indexed source extension, then injects one reminder line. It DOES carry `MEMCONTINUUM_PROJECT`
-— identity only, so `scripts/repo-init.sh`'s merge step can tell this project's nudge entry apart
-from a different project's sharing the same `--claude-dir`; the hook itself never reads it. A
+existing file is `pre-edit-chain.sh`'s job, not this one's). Deliberately minimal wiring: no
+`MEMCONTINUUM_ROOT`/`STRIP_PREFIX` is rendered. The hook checks that the write target is new, under a
+configured code root, and has an indexed source extension, then injects one reminder line. When the path yields a query it also makes one read-only `memidx.py search` against the project's index (found
+from `MEMCONTINUUM_PROJECT` and `MEMCONTINUUM_HOME`) on the path's own words and appends the nearest
+decisions as a guess; because `MEMCONTINUUM_ROOT` is not exported, that call carries no `--root` and
+reports no staleness. It DOES carry `MEMCONTINUUM_PROJECT`
+— identity (and the index file name for that search), so `scripts/repo-init.sh`'s merge step can tell this project's nudge entry apart
+from a different project's sharing the same `--claude-dir`; the hook reads it only to locate that index. A
 nudge entry carrying no `MEMCONTINUUM_PROJECT` at all (wired before this marker existed) stays
 sweepable by ANY project's re-run until the project that owns it re-runs `repo-init.sh` — see the
 note at the end of this file.

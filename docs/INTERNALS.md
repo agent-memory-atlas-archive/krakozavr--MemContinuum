@@ -91,11 +91,17 @@ duplicate-detection's job, out of scope here).
 
 The query: the path is relativized first. Both hooks apply the same
 worktree remap before building the query (`mc_remap_worktree_gated` in
-`hooks/mc-path-lib.sh`), so a worktree path's `.worktrees/x/...` segment is
-never spelled into it; `newfile-nudge.sh` builds its query after that remap
-too, and strips its configured code root (`MEMCONTINUUM_CODE_ROOT`, plus any
+`hooks/mc-path-lib.sh`), so the `.worktrees/x/...` segment of a wired
+worktree path is not spelled into it. Two cases keep extra words: an
+unwired worktree parked inside the code root is deliberately not remapped,
+so its path words remain; and when the session cwd is a proper ancestor of
+the code root, the query is relative to that cwd and keeps the repo
+directory name. `newfile-nudge.sh` builds its query after that remap too,
+and strips its configured code root (`MEMCONTINUUM_CODE_ROOT`, plus any
 `MEMCONTINUUM_STRIP_PREFIX`) rather than relying on the session cwd, which
-need not be inside the code root. Then its extension is stripped, `\` is normalized as a path
+need not be inside the code root. The colon-separated strip-prefix list is
+split without pathname expansion, so a root containing `*`, `?` or `[` stays
+literal. Then its extension is stripped, `\` is normalized as a path
 separator alongside `/ _ - .`, and the result is split into words on
 those separators and on camelCase boundaries, lowercased, deduped, and
 filtered: tokens shorter than 3 characters and a fixed generic-stem list
@@ -108,14 +114,18 @@ whose meaningful words are non-ASCII degrades to "no query" or a
 partial/garbled one, a stated limit, not a bug this feature fixes). An
 empty query after filtering never runs a search.
 
-The search itself is ONE `memidx.py search --read-only --root <store>
+The search itself is ONE `memidx.py search --read-only [--root <store>]
 --limit 2 --json --hydrate` call. `--read-only` (new) opens the index
 strictly read-only (`open_db_readonly`, mode=ro) and never migrates a
 schema behind the current generation to answer a guess — a schema generation gap refuses by name
 (`state=upgrade-required reason=index-needs-migration`) instead of the
 ordinary rw path's silent migrate-on-open. `--root` (new) makes on-disk
 staleness visible instead of silently swallowed, same warning `for-path`
-already surfaces on the match path. `--hydrate` adds a `chain_text` field
+already surfaces on the match path. It is passed only when
+`MEMCONTINUUM_ROOT` is set: the pre-edit and prompt-query channels' rendered
+wiring exports it, but the rendered new-file command exports neither
+`MEMCONTINUUM_ROOT` nor `MEMCONTINUUM_STRIP_PREFIX`, so the new-file channel
+runs without `--root` and staleness is not reported there. `--hydrate` adds a `chain_text` field
 to each JSON hit, reusing `topic_chain_lines_capped` (the same rendering
 `chain` produces, capped — see below), so no second `chain`/`for-path`
 call per hit is ever needed. `--decisions-only` restricts results to
