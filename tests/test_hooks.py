@@ -1330,6 +1330,25 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         self.assertTrue(matching, log_text)
         return matching[-1]
 
+    def test_miss_never_returns_readme_or_sources_records(self):
+        """The fallback guesses a DECISION: a store README and a sources/
+        record that match the file's words far better than the topic are
+        never returned."""
+        (self.store / "sources").mkdir()
+        (self.store / "README.md").write_text("# Store\n" + "needle " * 20 + "\n")
+        (self.store / "sources" / "sitting.md").write_text(
+            "---\ntype: source\nid: SITTING-1\ntitle: needle needle\n---\n" + "needle " * 20 + "\n")
+        memidx.cmd_reindex(type("Args", (), dict(
+            root=str(self.store), project=self.project,
+            db=str(Path(self.memtool_home) / f"{self.project}.sqlite"),
+            full=True, no_embed=True))())
+        proc, _ = run_hook(self._payload(str(self.repo / "src" / "needle.py")), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_line = self._last_outcome_line((Path(self.memtool_home) / "hook.log").read_text())
+        self.assertIn("ids=TOP-7001", log_line)
+        self.assertNotIn("README", log_line)
+        self.assertNotIn("SITTING", log_line)
+
     def test_miss_with_hit_label_and_chain_never_snippet(self):
         target = str(self.repo / "src" / "needle.py")
         proc, _ = run_hook(self._payload(target), self._env())

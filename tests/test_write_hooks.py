@@ -4565,6 +4565,31 @@ Body prose about widget regression throttling handling in detail.
         self.assertTrue(matching, log_text)
         return matching[-1]
 
+    def test_prompt_query_never_returns_readme_or_sources_records(self):
+        """Decision records only: a store README and a sources/ record that
+        match the prompt's words better than either topic are never
+        returned."""
+        _write(self.store_root / "README.md", "# Store\n" + "widget caching regression carefully " * 10 + "\n")
+        _write(self.store_root / "sources" / "sitting.md",
+               "---\ntype: source\nid: SITTING-1\ntitle: widget caching regression\n---\n"
+               + "widget caching regression carefully " * 10 + "\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.store_root, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "add readme and source"], cwd=self.store_root, check=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            reindex(self.store_root, self.home / f"{self.project}.sqlite", project=self.project)
+        session_id = "s-pq-decisions-only"
+        self.seed_ledger(session_id, [])
+        proc, _ = run_script(
+            USERPROMPT_HOOK,
+            self.user_prompt_payload(session_id, prompt_text=self.MATCH_PROMPT),
+            self.pq_env(),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = self._last_pq_line((self.home / "hook.log").read_text())
+        self.assertIn("ids=TOP-8001", line)
+        self.assertNotIn("README", line)
+        self.assertNotIn("SITTING", line)
+
     def test_setup_ranking_is_as_expected(self):
         """Not a spec requirement -- pins this fixture's own FTS ranking
         (TOP-8001 first, TOP-8002 second on MATCH_PROMPT) so a future
@@ -7815,6 +7840,83 @@ class TestNewFileNudgeHook(unittest.TestCase):
         self.assertTrue(fallbacks)
         self.assertEqual(fallbacks[0]["id"], "TOP-7002")
         self.assertEqual(fallbacks[0]["hook"], "newfile-nudge")
+
+    def _git_code_root_with_worktree(self):
+        """code_root as a real git repo with a linked worktree checked out
+        INSIDE it (`<code_root>/.worktrees/x`) -- the only worktree layout
+        the settings `if` glob (Write(//<code_root>/**)) ever admits."""
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        for cmd in (
+            ["git", "init", "-q"],
+            ["git", "commit", "-q", "--allow-empty", "-m", "init"],
+            ["git", "worktree", "add", "-q", "-b", "wt-x", str(self.code_root / ".worktrees" / "x")],
+        ):
+            subprocess.run(cmd, cwd=self.code_root, check=True, env=env)
+
+    def _fb_q(self, target, cwd):
+        payload = json.loads(self.payload_for(str(target)))
+        payload["cwd"] = str(cwd)
+        proc, _ = run_script(NEWFILE_NUDGE_HOOK, json.dumps(payload), self.base_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (self.home / "hook.log").read_text()
+        m = re.search(r"\bfb_q=(\S*)", log_text.splitlines()[-1])
+        self.assertIsNotNone(m, log_text)
+        return m.group(1)
+
+    def test_fallback_query_uses_the_worktree_remapped_path_with_cwd_outside_the_code_root(self):
+        """Measured defect: a new file in an in-root worktree, session cwd
+        OUTSIDE the code root, queried on the raw machine path (home user dev
+        ... worktrees x ...). The query is built after the same remap
+        pre-edit-chain.sh applies, so it is the file's own words only --
+        exactly what pre-edit-chain.sh's q= is for the same file."""
+        self._git_code_root_with_worktree()
+        outside = Path(self.td) / "launch-dir"
+        outside.mkdir()
+        target = self.code_root / ".worktrees" / "x" / "Sources" / "Foo" / "BarBaz.swift"
+        fb_q = self._fb_q(target, outside)
+        self.assertEqual(fb_q, "foo+bar+baz")
+        for noise in ("worktrees", "wt-x", "code", "home", "memcontinuum", "tmp", "newfile"):
+            self.assertNotIn(noise, fb_q.split("+"))
+
+    def test_fallback_query_strips_the_code_root_for_a_plain_file_with_cwd_outside(self):
+        """Same cwd-outside layout, no worktree: the code root is the
+        configured root (the nudge's settings entry carries no STRIP_PREFIX),
+        so the machine path above it never reaches the query."""
+        outside = Path(self.td) / "launch-dir"
+        outside.mkdir()
+        target = self.code_root / "Sources" / "Foo" / "BarBaz.swift"
+        self.assertEqual(self._fb_q(target, outside), "foo+bar+baz")
+
+    def test_search_fallback_returns_decision_records_only(self):
+        """The fallback is a guess about a DECISION: a store README, an
+        inbox README and a sources/ record that match the file's words far
+        better than the real topic are never returned."""
+        store = Path(self.td) / "store"
+        (store / "topics").mkdir(parents=True)
+        (store / "sources").mkdir()
+        (store / "inbox" / "codex").mkdir(parents=True)
+        (store / "README.md").write_text("# Store\n" + "needle " * 20 + "\n")
+        (store / "inbox" / "codex" / "README.md").write_text("needle " * 20 + "\n")
+        (store / "sources" / "sitting.md").write_text(
+            "---\ntype: source\nid: SITTING-1\ntitle: needle needle\n---\n" + "needle " * 20 + "\n")
+        (store / "topics" / "needle.md").write_text(
+            "---\ntype: topic\nid: TOP-7003\ntitle: Needle handling policy three\n"
+            "links:\n"
+            '  - link: L1\n    status: active\n    '
+            'ruling: {text: "handle the needle case three", authority: owner-verbatim, source: s}\n'
+            "---\nBody.\n"
+        )
+        # With MEMCONTINUUM_ROOT set the hook's project is the store dir's name.
+        reindex(store, self.home / "store.sqlite", project="store")
+        target = self.code_root / "Sources" / "needle.swift"
+        env = self.base_env(MEMCONTINUUM_FALLBACK_MODE="fts", MEMCONTINUUM_ROOT=str(store))
+        proc, _ = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_line = (self.home / "hook.log").read_text().splitlines()[-1]
+        self.assertIn("fb_ids=TOP-7003", log_line)
+        self.assertNotIn("README", log_line)
+        self.assertNotIn("SITTING", log_line)
 
     def test_search_fallback_empty_still_leaves_reminder_one_line(self):
         """No index at all (this class's base_env sets no project/root, so

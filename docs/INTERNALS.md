@@ -89,10 +89,13 @@ labelled as a guess, never as a match. Both hooks skip this entirely for a
 path under `$MEMCONTINUUM_ROOT` (the store itself — that is
 duplicate-detection's job, out of scope here).
 
-The query: the path is relativized first (`pre-edit-chain.sh` uses the
-worktree-remapped main-checkout-equivalent path when one exists, so a
-worktree path's `.worktrees/x/...` segment is never spelled into the
-query), then its extension is stripped, `\` is normalized as a path
+The query: the path is relativized first. Both hooks apply the same
+worktree remap before building the query (`mc_remap_worktree_gated` in
+`hooks/mc-path-lib.sh`), so a worktree path's `.worktrees/x/...` segment is
+never spelled into it; `newfile-nudge.sh` builds its query after that remap
+too, and strips its configured code root (`MEMCONTINUUM_CODE_ROOT`, plus any
+`MEMCONTINUUM_STRIP_PREFIX`) rather than relying on the session cwd, which
+need not be inside the code root. Then its extension is stripped, `\` is normalized as a path
 separator alongside `/ _ - .`, and the result is split into words on
 those separators and on camelCase boundaries, lowercased, deduped, and
 filtered: tokens shorter than 3 characters and a fixed generic-stem list
@@ -115,8 +118,13 @@ staleness visible instead of silently swallowed, same warning `for-path`
 already surfaces on the match path. `--hydrate` adds a `chain_text` field
 to each JSON hit, reusing `topic_chain_lines_capped` (the same rendering
 `chain` produces, capped — see below), so no second `chain`/`for-path`
-call per hit is ever needed. No `--status`/`--authority` filter (the
-engine's own defaults apply); mode is `MEMCONTINUUM_FALLBACK_MODE`
+call per hit is ever needed. `--decisions-only` restricts results to
+decision records — index types `topic`, `link` (a topic's per-link rows),
+`incident` and `investigation` — so the store README, `sources/` records,
+inbox drops and concepts are never offered as a guess; a plain `search`
+still returns them, and an explicit `--type` narrows within the decision set
+rather than widening it. The prompt-query channel passes the same flag. No
+`--status`/`--authority` filter (the engine's own defaults apply); mode is `MEMCONTINUUM_FALLBACK_MODE`
 (`hybrid`/`vector`/`fts`) when set, else the engine's own default
 (`hybrid`) — an unrecognized value falls back to that same default. A
 drvfs-backed store (SQLite WAL locking is unreliable there — see this

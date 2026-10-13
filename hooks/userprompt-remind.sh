@@ -678,7 +678,7 @@ if [ "$PQ_ON" = "1" ]; then
             # L1's own `--limit 2`, since an already-surfaced hit can
             # still consume a slot the exclusion filter below then has to
             # skip past).
-            PQ_ARGS=(search "$PROMPT_TERMS" --mode fts --project "$MC_PROJECT" --db "$MC_DB_PATH" --limit 3 --json --hydrate --read-only)
+            PQ_ARGS=(search "$PROMPT_TERMS" --mode fts --project "$MC_PROJECT" --db "$MC_DB_PATH" --limit 3 --json --hydrate --read-only --decisions-only)
             if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
                 PQ_ARGS+=(--root "$MEMCONTINUUM_ROOT")
             fi

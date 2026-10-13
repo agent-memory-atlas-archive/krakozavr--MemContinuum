@@ -572,80 +572,46 @@ done
 # walk actually finds a nested `.git` FILE between FILE_PATH and the
 # matching root.
 if [ -z "$MATCHED_CANDIDATE" ] && [ "$ANY_QUERY_SUCCEEDED" -eq 1 ] && [ -n "${MEMCONTINUUM_STRIP_PREFIX:-}" ]; then
-    WT_ROOTS=""
+    # shellcheck source=mc-path-lib.sh
+    source "$SCRIPT_DIR/mc-path-lib.sh"
+    WT_ROOTS="$(mc_strip_prefix_roots "$MEMCONTINUUM_STRIP_PREFIX")"
     declare -a WT_ROOT_ARR=()
-    IFS=':' read -r -a WT_PREFIXES <<<"$MEMCONTINUUM_STRIP_PREFIX"
-    for wt_prefix in "${WT_PREFIXES[@]}"; do
-        [ -z "$wt_prefix" ] && continue
-        wt_root="${wt_prefix%/}"
-        [ -z "$wt_root" ] && continue
-        WT_ROOT_ARR+=("$wt_root")
-        WT_ROOTS="${WT_ROOTS:+$WT_ROOTS
-}$wt_root"
-    done
+    while IFS= read -r wt_root; do
+        [ -n "$wt_root" ] && WT_ROOT_ARR+=("$wt_root")
+    done <<EOF2
+$WT_ROOTS
+EOF2
 
     if [ -n "$WT_ROOTS" ]; then
-        # shellcheck source=mc-path-lib.sh
-        source "$SCRIPT_DIR/mc-path-lib.sh"
-        # WT_IN_ROOT: the matching root's own string when FILE_PATH is
-        # physically under one of WT_ROOT_ARR, else empty. Kept (not just
-        # a 0/1 flag) because a nonzero mc_remap_worktree_path rc for an
-        # IN-ROOT path must fall through to today's plain outcome rather
-        # than `finish` a worktree-* outcome (see the case below) -- an
-        # in-root path with no nested worktree, or with a nested gitfile
-        # that mc_remap_worktree_path could not resolve, is not a
-        # worktree-gap situation the caller should report as one; it is
-        # exactly the pre-fix "in root, no decision bound to it" miss.
-        WT_IN_ROOT=""
-        for wt_root in "${WT_ROOT_ARR[@]}"; do
-            mc_path_under_root "$FILE_PATH" "$wt_root"
-            if [ $? -eq 0 ]; then
-                WT_IN_ROOT="$wt_root"
-                break
-            fi
-        done
-
-        WT_TRY_REMAP=1
-        if [ -n "$WT_IN_ROOT" ]; then
-            mc_nested_worktree_gitfile "$FILE_PATH" "$WT_IN_ROOT"
-            [ $? -eq 0 ] || WT_TRY_REMAP=0
-        fi
-
-        if [ "$WT_TRY_REMAP" -eq 1 ]; then
-            WT_REMAPPED="$(mc_remap_worktree_path "$FILE_PATH" "$WT_ROOTS")"
-            WT_REMAP_RC=$?
-            case $WT_REMAP_RC in
-                0)
-                    # Feed the remapped (main-checkout) path through the
-                    # EXISTING candidate machinery -- the bare relative
-                    # form (what code_refs are actually written in) plus
-                    # every STRIP_PREFIX form, same as a raw FILE_PATH
-                    # would get above -- and reuse try_candidate rather
-                    # than a second query implementation.
-                    if ! try_candidate "$WT_REMAPPED"; then
-                        for wt_root in "${WT_ROOT_ARR[@]}"; do
-                            wt_rel="${WT_REMAPPED#"$wt_root"/}"
-                            if [ "$wt_rel" != "$WT_REMAPPED" ]; then
-                                try_candidate "$wt_rel" && break
-                            fi
-                        done
-                    fi
-                    ;;
-                1)
-                    # worktree-unwired only when FILE_PATH itself was NOT
-                    # already under a configured root -- an in-root path
-                    # whose nested gitfile still resolved to "unwired"
-                    # (some OTHER, unwired repo's worktree parked inside
-                    # this root) falls through unchanged, same as an
-                    # in-root path with no nested worktree at all.
-                    [ -z "$WT_IN_ROOT" ] && finish "worktree-unwired"
-                    ;;
-                2)
-                    [ -z "$WT_IN_ROOT" ] && finish "worktree-unresolved"
-                    ;;
-                *) ;; # 3: not applicable (not a worktree, or no .git at all)
-            esac
-        fi
+        # An in-root path with no nested worktree, or whose nested gitfile
+        # could not be resolved, is not a worktree-gap situation: the
+        # helper reports it as rc 3, exactly the plain "in root, no
+        # decision bound to it" miss.
+        # The in-root gate and the remap itself live in mc_remap_worktree_gated
+        # (hooks/mc-path-lib.sh), shared with hooks/newfile-nudge.sh.
+        WT_REMAPPED="$(mc_remap_worktree_gated "$FILE_PATH" "$WT_ROOTS")"
+        WT_REMAP_RC=$?
+        case $WT_REMAP_RC in
+            0)
+                # Feed the remapped (main-checkout) path through the
+                # EXISTING candidate machinery -- the bare relative
+                # form (what code_refs are actually written in) plus
+                # every STRIP_PREFIX form, same as a raw FILE_PATH
+                # would get above -- and reuse try_candidate rather
+                # than a second query implementation.
+                if ! try_candidate "$WT_REMAPPED"; then
+                    for wt_root in "${WT_ROOT_ARR[@]}"; do
+                        wt_rel="${WT_REMAPPED#"$wt_root"/}"
+                        if [ "$wt_rel" != "$WT_REMAPPED" ]; then
+                            try_candidate "$wt_rel" && break
+                        fi
+                    done
+                fi
+                ;;
+            1) finish "worktree-unwired" ;;
+            2) finish "worktree-unresolved" ;;
+            *) ;; # 3: not applicable (not a worktree, in-root with nothing to remap, or no .git at all)
+        esac
     fi
 fi
 
@@ -715,7 +681,7 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     # genuinely current miss from a stale one; `_decision_warn`'s own
     # stderr line for it is discarded below same as every other subprocess
     # stderr (MINOR item: routed to /dev/null, never hook.log).
-    FB_ARGS=(search "$FALLBACK_QUERY" --mode "$FALLBACK_MODE" --project "$PROJECT" --db "$DB_PATH" --limit 2 --json --hydrate --read-only)
+    FB_ARGS=(search "$FALLBACK_QUERY" --mode "$FALLBACK_MODE" --project "$PROJECT" --db "$DB_PATH" --limit 2 --json --hydrate --read-only --decisions-only)
     if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
         FB_ARGS+=(--root "$MEMCONTINUUM_ROOT")
     fi

@@ -3067,6 +3067,52 @@ class TestF5LinkRows(unittest.TestCase):
             out = json.loads(buf.getvalue())
             self.assertEqual(out, [], "an explicit --status active must not widen to NULL-status records")
 
+    def test_decisions_only_drops_readme_sources_inbox_and_concepts_default_search_keeps_them(self):
+        """Fallback channels (hooks) pass --decisions-only: the store README,
+        a sources/ record, an inbox README and a concept record -- each
+        matching the query word far better than the real decision -- are
+        never returned; a plain default search still returns them."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"
+            (root / "sources").mkdir(parents=True)
+            (root / "inbox" / "codex").mkdir(parents=True)
+            (root / "concepts").mkdir(parents=True)
+            (root / "topics").mkdir(parents=True)
+            (root / "README.md").write_text("# Store\nzorblax zorblax zorblax zorblax zorblax readme.\n")
+            (root / "sources" / "sitting.md").write_text(
+                "---\ntype: source\nid: SITTING-1\ntitle: zorblax sitting\n---\nzorblax zorblax zorblax zorblax.\n")
+            (root / "inbox" / "codex" / "README.md").write_text("zorblax zorblax zorblax zorblax inbox.\n")
+            (root / "concepts" / "README.md").write_text("zorblax zorblax zorblax zorblax concepts.\n")
+            (root / "topics" / "z.md").write_text(
+                "---\ntype: topic\nid: TOP-9100\ntitle: Zorblax policy\n"
+                "links:\n  - link: L1\n    status: active\n    "
+                'ruling: {text: "handle the zorblax case", authority: owner-verbatim, source: s}\n'
+                "---\nBody.\n"
+            )
+            root = root.resolve()
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            def run(**extra):
+                kw = dict(project=memidx.DEFAULT_PROJECT, db=str(db), query="zorblax", mode="fts",
+                          status=[], type=[], area=None, topic=None, authority=None, limit=20,
+                          include_inbox=True, json=True)
+                kw.update(extra)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    memidx.cmd_search(ns(**kw))
+                return json.loads(buf.getvalue())
+
+            default_ids = {r["id"] for r in run()}
+            self.assertIn("SITTING-1", default_ids)
+            self.assertTrue(any(i in default_ids for i in ("README", "README.md")), default_ids)
+            only = run(decisions_only=True)
+            self.assertTrue(only)
+            self.assertEqual({r["id"] for r in only}, {"TOP-9100"}, only)
+            # An explicit --type narrows inside the decision set, never widens it.
+            self.assertEqual(run(decisions_only=True, type=["source"]), [])
+            self.assertTrue(run(decisions_only=True, type=["topic"]))
+
     def test_inbox_exclusion_uses_a_bounded_parameter_count_not_one_per_inbox_file(self):
         """Codex 3 fix, defensive design point: a concrete `source_path NOT
         IN (paths...)` list -- one bound SQL parameter per inbox/ file --
