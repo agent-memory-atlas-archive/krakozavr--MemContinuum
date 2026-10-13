@@ -2222,7 +2222,8 @@ Topic-chain rules:
 | frontmatter `current:` does not equal the newest link with `status: active` | error (names the correct value) |
 | a topic in area `processing/*` or `deletion/*` has no `code_refs` | warning |
 | a topic's `code_refs` entry is empty (`""`) or fragment-only (`"#Foo"`) — names no path | error |
-| a `status`/`authority`/`kind` value outside the schema enums | error |
+| a `status`/`authority` value outside the schema enums | error |
+| a `kind` value outside the schema enum, or an `owner-verbatim` `ruling.text` ending in `?` (active/provisional) | warning in plain mode for every link (earlier links stay committable); error under `--against-ref` for links absent at REF (all links of a new file) — `_new_link_errors` is the one definition |
 | an edge `rel` outside the seven enumerated relations | error |
 | a `standing:` entry names a link id not in that topic | error |
 | a `standing:` entry's link is not `status: active` | error — even a valid successor does not clear it; the supersession and the pointer's own update/removal must land in the same commit |

@@ -109,6 +109,34 @@ def _is_topic_frontmatter(fm: dict) -> bool:
     return bool(fm.get("links")) or fm.get("type") == "topic"
 
 
+def _new_link_errors(prefix: str, link: dict) -> list[str]:
+    """The two grandfathered link checks (owner ruling 2026-10-13): unknown
+    `kind`, and a question-form `owner-verbatim` ruling text. Returns plain
+    messages; the CALLER picks severity -- lint_topic (plain mode) reports
+    them as warnings for every link, check_append_only (`--against-ref`)
+    as errors for links absent at REF, including every link of a brand-new
+    file. `kind` is append-only frozen and owner quotes may not be altered,
+    so an old link can never be repaired in place; a new one is written
+    correctly from the start.
+
+    A question is not a ruling, whoever asked it (SCHEMA section 3/5);
+    `owner-ratified` is the orchestrator's own paraphrase, so it is not
+    covered. Trailing quote/bracket characters and whitespace are trimmed
+    before looking for the final "?". Scoped to status active/provisional:
+    a superseded link is history and can never be cleared by superseding
+    (ruling 149)."""
+    out: list[str] = []
+    kind = link.get("kind")
+    if kind is not None and kind not in KINDS:
+        out.append(f"{prefix}: unknown kind {kind!r} (must be one of {sorted(KINDS)})")
+    ruling = link.get("ruling") or {}
+    if ruling.get("authority") == "owner-verbatim" and link.get("status") in ("active", "provisional"):
+        text = ruling.get("text")
+        if text and str(text).strip(" \t\r\n\"')]}").endswith("?"):
+            out.append(f"{prefix}: owner-verbatim text is a question, not a ruling")
+    return out
+
+
 def lint_topic(
     path: Path,
     fm: dict,
@@ -139,9 +167,16 @@ def lint_topic(
         if status is not None and status not in STATUSES:
             errors.append(f"{prefix}: unknown status {status!r} (must be one of {sorted(STATUSES)})")
 
-        kind = link.get("kind")
-        if kind is not None and kind not in KINDS:
-            errors.append(f"{prefix}: unknown kind {kind!r} (must be one of {sorted(KINDS)})")
+        # Grandfathered pair (owner, 2026-10-13): the kind-vocabulary check
+        # and the question-form owner-verbatim check are WARNINGS here (plain
+        # mode re-judges every recorded link, and history cannot be edited
+        # to satisfy a later-stricter rule); they are ERRORS for links NEW
+        # relative to the committed state, enforced by `--against-ref`
+        # (check_append_only -> _new_link_errors). One definition, both modes.
+        warnings.extend(
+            f"{e} [grandfathered: an error for new links under --against-ref]"
+            for e in _new_link_errors(prefix, link)
+        )
 
         ruling = link.get("ruling") or {}
         auth = ruling.get("authority")
@@ -154,32 +189,6 @@ def lint_topic(
                 errors.append(
                     f"{prefix}: {auth} ruling missing required field(s) {missing} "
                     f"(owner-verbatim/owner-ratified rulings must carry ruling.text and ruling.source)"
-                )
-
-        # lint-question-mark-verbatim: owner-verbatim is a literal
-        # transcript of the owner's own words (SCHEMA section 3/5) -- a
-        # question is not a ruling, whoever asked it, so a
-        # question-mark-terminated owner-verbatim text is schema-usage
-        # laundering, not a citable decision. owner-ratified is the
-        # orchestrator's own paraphrase of what the owner affirmed, never a
-        # literal transcript, so it is not covered by this rule. Trim
-        # trailing quote/bracket characters and whitespace first (a
-        # copy-paste artifact can leave a stray quote, space, or closing
-        # bracket after the real "?" -- whole-branch-review MODERATE-2:
-        # `)]}` joined the strip set so "...decisionmaking?)" is still
-        # caught, not silently passed because of one trailing paren);
-        # skip when text is falsy -- the missing-field error above already
-        # covers that case. Ruling 149 (whole-branch-review MODERATE-2):
-        # scoped to status active/provisional only -- a superseded link is
-        # history, and the append-only guard already forbids rewriting it,
-        # so flagging it here can never be cleared by superseding (the
-        # exact permanently-red-store bug the finding reproduced on both
-        # real stores).
-        if auth == "owner-verbatim" and status in ("active", "provisional"):
-            text = ruling.get("text")
-            if text and str(text).strip(" \t\r\n\"')]}").endswith("?"):
-                errors.append(
-                    f"{prefix}: owner-verbatim text is a question, not a ruling"
                 )
 
         if status == "superseded" and not link.get("superseded_by"):
@@ -2368,6 +2377,27 @@ def _link_bytes_changed(old_span: str, new_span: str) -> bool:
     return old_span != new_span
 
 
+def _read_added_blob(toplevel: Path, root: Path, relpath: str, path_in_root: str, staged: bool):
+    """Parse the NEW side of an added file (index when staged, else the
+    working tree); None when unreadable."""
+    blob = _git_show(toplevel, f":{relpath}") if staged else _read_worktree(root / path_in_root)
+    if blob is None:
+        return None
+    return _parse_git_blob(blob, path_in_root)
+
+
+def _added_links_errors(full_path: Path, links: list, old_ids: set) -> list[str]:
+    """Grandfathered-check errors for every link whose id is not in
+    `old_ids` (the ids recorded at REF)."""
+    errs: list[str] = []
+    for l in links:
+        lid = l.get("link")
+        if lid is None or str(lid) in old_ids:
+            continue
+        errs.extend(_new_link_errors(f"{full_path}:{lid}", l))
+    return errs
+
+
 def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], int, list[str]]:
     """Returns (errors, changed, notes) -- `changed` is the number of
     topic files the diff actually concerned (topic-relevant at REF),
@@ -2405,7 +2435,12 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
 
         if status == "A":
             # Nothing existed at REF for this path -- no history to
-            # protect; a brand-new topic (or a brand-new anything) is free.
+            # protect; a brand-new topic (or a brand-new anything) is free
+            # of append-only rules -- but every one of its links is NEW, so
+            # the two grandfathered link checks apply to all of them.
+            added = _read_added_blob(toplevel, root, relpath, path_in_root, staged)
+            if added is not None and added.valid and _is_topic_like(added):
+                errors.extend(_added_links_errors(full_path, added.frontmatter.get("links") or [], set()))
             continue
 
         old_blob = _git_show(toplevel, f"{ref}:{relpath}")
@@ -2541,6 +2576,7 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         # ids themselves, which is a separate, unasked-for check.
         old_ids = {str(l.get("link")) for l in old_links if l.get("link") is not None}
         seen_old_id = False
+        errors.extend(_added_links_errors(full_path, new_links_full, old_ids))
         for l in new_links_full:
             nid = l.get("link")
             if nid is None:

@@ -171,7 +171,9 @@ copied inline.
 
 - `owner-verbatim` or `owner-ratified` without `ruling.text` and `source` → error
 - an `owner-verbatim` `ruling.text` ending in `?` (after trimming quotes/whitespace) → error, a
-  question is not a ruling (`owner-ratified` is the orchestrator's own paraphrase, not covered)
+  question is not a ruling (`owner-ratified` is the orchestrator's own paraphrase, not covered).
+  Enforced for new links only: an error under `--against-ref` for links absent at REF (every link of
+  a new file); a warning in plain mode, so links recorded before the check do not block commits
 - `status: superseded` without `superseded_by` → error
 - `reverses:` without `reason_for_change` → error
 - a `kind: reversed` link whose `reverses:` target's `status` is still `active` or `provisional` →
@@ -180,6 +182,8 @@ copied inline.
 - `current` not equal to the newest link with `status: active` → error (names the correct value)
 - a topic in area `processing/*` or `deletion/*` with no `code_refs` → warning
 - any `status` / `authority` / `kind` value outside the five/five/five enumerated above → error
+  (`kind` is the exception: like the question-form check above it is a warning for links recorded
+  before the check and an error for new links under `--against-ref`, since `kind` cannot be edited)
 - a `standing:` entry naming a link id not in that topic → error
 - a `standing:` entry whose link is not `status: active` → error, even when the link was superseded
   by a valid successor — the supersession and the pointer update (or removal) must land together
