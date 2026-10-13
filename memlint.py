@@ -2439,6 +2439,12 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
             # of append-only rules -- but every one of its links is NEW, so
             # the two grandfathered link checks apply to all of them.
             added = _read_added_blob(toplevel, root, relpath, path_in_root, staged)
+            if added is not None and not _is_topic_like(added):
+                # Re-gate (Codex BLOCK on 2cbff87): a non-topic-typed file
+                # that still carries a recoverable `links:` list is topic
+                # data to memidx; judge its links whatever its `type` says.
+                errors.extend(_added_links_errors(
+                    full_path, _recovered_old_links(added.frontmatter) or [], set()))
             if added is not None and _is_topic_like(added):
                 if not added.valid:
                     # A new topic that fails parse/shape validation must not
@@ -2455,6 +2461,22 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
         old_blob = _git_show(toplevel, f"{ref}:{relpath}")
         old_result = _parse_git_blob(old_blob, f"{relpath} (at {ref})")
         if not _is_topic_like(old_result):
+            # Re-gate (Grok): a path that was not topic-like at REF (an
+            # incident, an empty note) may be promoted/edited into one
+            # carrying links; every recovered link whose id REF did not
+            # already record is new and judged by the grandfathered checks.
+            if status == "M":
+                nb = _git_show(toplevel, f":{relpath}") if staged else _read_worktree(root / path_in_root)
+                if nb is not None:
+                    ref_ids = {
+                        str(l.get("link"))
+                        for l in (_recovered_old_links(old_result.frontmatter) or [])
+                        if l.get("link") is not None
+                    }
+                    errors.extend(_added_links_errors(
+                        full_path,
+                        _recovered_old_links(_parse_git_blob(nb, path_in_root).frontmatter) or [],
+                        ref_ids))
             continue
         changed += 1
 

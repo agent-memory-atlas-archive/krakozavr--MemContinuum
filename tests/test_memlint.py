@@ -86,7 +86,7 @@ class TestMemlintViolations(unittest.TestCase):
         self.assertEqual(errors, [], errors)
         self.assertTrue(any("code_refs" in w for w in warnings), warnings)
 
-    def test_owner_verbatim_question_mark_is_error(self):
+    def test_owner_verbatim_question_mark_is_a_warning_in_plain_mode(self):
         # lint-question-mark-verbatim: an owner-verbatim ruling whose text
         # ends with "?" is a question, not a ruling -- schema-usage
         # laundering (a question dressed up as a citable owner ruling).
@@ -2080,11 +2080,11 @@ class TestQuestionMarkRuleScope(unittest.TestCase):
             _write(root / "topics" / "t.md", text)
             return memlint.lint_root(root)
 
-    def test_active_question_mark_is_an_error(self):
+    def test_active_question_mark_is_a_warning_in_plain_mode(self):
         _, warnings = self._lint(self._topic("active", "should we do X?"))
         self.assertTrue(any("question, not a ruling" in w for w in warnings), warnings)
 
-    def test_provisional_question_mark_is_an_error(self):
+    def test_provisional_question_mark_is_a_warning_in_plain_mode(self):
         _, warnings = self._lint(self._topic("provisional", "should we do X?"))
         self.assertTrue(any("question, not a ruling" in w for w in warnings), warnings)
 
@@ -3032,6 +3032,7 @@ class TestGrandfatheredLinkChecks(unittest.TestCase):
                 self._with_new_link(self.OLD_BAD, self._new_link(kind="verified")))
             errors, warnings = memlint.lint_root(root)
             self.assertEqual(errors, [], errors)
+            self.assertTrue(any("unknown kind 'verified'" in w for w in warnings), warnings)
 
     # --- Codex BLOCK on d117f5e: a malformed ADDED file must not be skipped ---
 
@@ -3091,6 +3092,83 @@ class TestGrandfatheredLinkChecks(unittest.TestCase):
             _git(["add", "-A"], cwd=root)
             rc_plain, rc_ref, out = self._hook_passes(root)
             self.assertEqual((rc_plain, rc_ref), (0, 0), out)
+
+
+    # --- re-gate on 2cbff87: recovered links are judged in ANY staged A/M
+    # file, whatever its declared `type` (Codex BLOCK + Grok) ---
+
+    @staticmethod
+    def _typed(rtype, rid, kind="verified", text="a real ruling", broken=True):
+        return (
+            f"---\ntype: {rtype}\nid: {rid}\ntitle: N\narea: memory\n"
+            f"tags: {'not-a-list' if broken else '[]'}\nlinks:\n"
+            "  - link: L1\n    date: '2024-01-01'\n    status: active\n"
+            f"    kind: {kind}\n"
+            f"    ruling: {{text: \"{text}\", authority: owner-verbatim, source: s}}\n"
+            "---\n\nBody.\n"
+        )
+
+    def _stage_then_clean_worktree(self, td, relname, staged_text, base_files=None):
+        root = self._store(td, self.OLD_BAD)
+        for name, text in (base_files or {}).items():
+            (root / name).parent.mkdir(exist_ok=True)
+            (root / name).write_text(text)
+        if base_files:
+            _commit_all(root, "base2")
+        path = root / relname
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(staged_text)
+        _git(["add", "-A"], cwd=root)
+        path.write_text(self.CLEAN_TMPL)
+        return root
+
+    def test_added_malformed_incident_with_bad_kind_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._stage_then_clean_worktree(
+                td, "incidents/INC-9700.md", self._typed("incident", "INC-9700"))
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("unknown kind 'verified'", out)
+
+    def test_added_concept_with_question_owner_verbatim_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._stage_then_clean_worktree(
+                td, "concepts/CON-9701.md",
+                self._typed("concept", "CON-9701", kind="adopted", text="should we ship it?"))
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("question, not a ruling", out)
+
+    def test_modified_incident_promoted_to_topic_with_bad_link_fails_against_ref(self):
+        inc = "---\ntype: incident\nid: TOP-9702\ntitle: N\narea: memory\n---\n\nBody.\n"
+        with tempfile.TemporaryDirectory() as td:
+            root = self._stage_then_clean_worktree(
+                td, "topics/promo.md",
+                self.CLEAN_TMPL.replace("TOP-9600", "TOP-9702").replace("kind: adopted", "kind: verified"),
+                base_files={"topics/promo.md": inc})
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("unknown kind 'verified'", out)
+
+    def test_renamed_topic_carrying_a_new_bad_link_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store(td, self.OLD_BAD)
+            _git(["mv", "topics/foo.md", "topics/renamed.md"], cwd=root)
+            (root / "topics" / "renamed.md").write_text(
+                self._with_new_link(self.OLD_BAD, self._new_link(kind="verified")))
+            _git(["add", "-A"], cwd=root)
+            rc, out = _run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+            self.assertEqual(rc, 1, out)
+
+    def test_linkless_malformed_incident_behaviour_is_unchanged(self):
+        """No links to judge: a malformed linkless incident is still not
+        refused by against-ref (nothing recoverable, not topic-like)."""
+        inc = ("---\ntype: incident\nid: INC-9703\ntitle: N\narea: memory\n"
+               "tags: not-a-list\n---\n\nBody.\n")
+        with tempfile.TemporaryDirectory() as td:
+            root = self._stage_then_clean_worktree(td, "incidents/INC-9703.md", inc)
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_ref, 0, out)
 
 
 if __name__ == "__main__":
