@@ -2519,6 +2519,15 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                         f"parsed ({old_reasons}); the new blob parses cleanly, so there is "
                         "no recorded link history here to protect"
                     )
+                    # Re-gate (Grok BLOCK on 90f3960): nothing to freeze,
+                    # but every link in the repaired blob is NEW -- judge
+                    # them (ids recoverable from REF are not new).
+                    errors.extend(_added_links_errors(
+                        full_path,
+                        new_result.frontmatter.get("links") or [],
+                        {str(l.get("link"))
+                         for l in (_recovered_old_links(old_result.frontmatter) or [])
+                         if l.get("link") is not None}))
                     continue
                 # Both sides unparseable: still fail closed (test_j: malformed
                 # -> malformed is still refused), reported from the OLD side's

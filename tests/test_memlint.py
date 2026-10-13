@@ -3159,6 +3159,39 @@ class TestGrandfatheredLinkChecks(unittest.TestCase):
             _git(["add", "-A"], cwd=root)
             rc, out = _run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
             self.assertEqual(rc, 1, out)
+            # The rename's D alone already gives rc 1; the NEW link on the
+            # NEW path must be named too (re-gate note, Codex + Grok).
+            self.assertRegex(out, r"renamed\.md:L3: unknown kind 'verified'")
+
+    def _repaired_topic_with_new_link(self, td, kind, text):
+        root = self._store(td, self.OLD_BAD)
+        path = root / "topics" / "bad.md"
+        path.write_text("---\ntype: topic\nid: TOP-9650\nlinks: [\n---\nBody.\n")
+        _commit_all(root, "base (unparseable topic)")
+        path.write_text(
+            self.CLEAN_TMPL.replace("TOP-9600", "TOP-9650")
+            .replace("kind: adopted", f"kind: {kind}")
+            .replace("a real ruling", text))
+        _git(["add", "-A"], cwd=root)
+        return root
+
+    def test_repaired_topic_with_new_bad_kind_link_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repaired_topic_with_new_link(td, "verified", "a real ruling")
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_plain, 0)  # warning only in plain mode
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("bad.md:L1", out)
+            self.assertIn("unknown kind 'verified'", out)
+            self.assertIn("repaired", out)
+
+    def test_repaired_topic_with_new_question_owner_verbatim_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repaired_topic_with_new_link(td, "adopted", "should we ship it?")
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_plain, 0)
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("question, not a ruling", out)
 
     def test_linkless_malformed_incident_behaviour_is_unchanged(self):
         """No links to judge: a malformed linkless incident is still not
