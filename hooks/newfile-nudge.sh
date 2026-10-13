@@ -12,13 +12,14 @@
 # extension gets a different, multi-line decision point instead -- see
 # MEMCONTINUUM_KNOWN_EXTS in the Env section below, not this one line.)
 #
-# Deliberately separate from pre-edit-chain.sh, and deliberately minimal:
-# no vector, no index read, no memidx.py call of any kind (unlike every
-# other hook in this repo). Whether the code index is actually
+# Deliberately separate from pre-edit-chain.sh, and deliberately minimal
+# on its own path: it never reads the CODE index, and whether that index is
 # initialized/current is left to the agent to confirm via `code-search`
-# itself -- this hook cannot know that without paying for a python+sqlite
-# read on every single Write, for a question code-search's own `state`
-# field (finding 1) already answers on demand.
+# itself (code-search's own `state` field answers it on demand). Its one
+# memidx.py call is the search fallback below: a read-only
+# `search --decisions-only` against the decision index when a new file is
+# created, run without `--root` because the rendered new-file command does
+# not export MEMCONTINUUM_ROOT (see docs/INTERNALS.md).
 #
 # Contract:
 #   - reads the PreToolUse JSON payload on stdin, extracts tool_input.file_path
