@@ -2439,8 +2439,17 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
             # of append-only rules -- but every one of its links is NEW, so
             # the two grandfathered link checks apply to all of them.
             added = _read_added_blob(toplevel, root, relpath, path_in_root, staged)
-            if added is not None and added.valid and _is_topic_like(added):
-                errors.extend(_added_links_errors(full_path, added.frontmatter.get("links") or [], set()))
+            if added is not None and _is_topic_like(added):
+                if not added.valid:
+                    # A new topic that fails parse/shape validation must not
+                    # be skipped (Codex BLOCK on d117f5e): refuse it, and
+                    # still judge whatever links could be recovered.
+                    for field, message in added.diagnostics:
+                        errors.append(f"{full_path}: {field}: {message} (added file)")
+                    links = _recovered_old_links(added.frontmatter) or []
+                else:
+                    links = added.frontmatter.get("links") or []
+                errors.extend(_added_links_errors(full_path, links, set()))
             continue
 
         old_blob = _git_show(toplevel, f"{ref}:{relpath}")

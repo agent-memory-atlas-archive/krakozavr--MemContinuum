@@ -2941,10 +2941,6 @@ class TestStandingGateMutation(unittest.TestCase):
             self._assert_defeated("test_cap_overflow_on_byte_count_is_caught_even_under_the_link_cap")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestGrandfatheredLinkChecks(unittest.TestCase):
     """Owner ruling 2026-10-13: the kind-vocabulary check and the
     question-form owner-verbatim check apply only to links NEW relative to
@@ -3036,3 +3032,66 @@ class TestGrandfatheredLinkChecks(unittest.TestCase):
                 self._with_new_link(self.OLD_BAD, self._new_link(kind="verified")))
             errors, warnings = memlint.lint_root(root)
             self.assertEqual(errors, [], errors)
+
+    # --- Codex BLOCK on d117f5e: a malformed ADDED file must not be skipped ---
+
+    BAD_ADDED_TMPL = (
+        "---\ntype: topic\nid: TOP-9600\ntitle: N\narea: memory\ncurrent: L1\n"
+        "tags: not-a-list\nlinks:\n"
+        "  - link: L1\n    date: '2024-01-01'\n    status: active\n    kind: {kind}\n"
+        "    ruling: {{text: \"{text}\", authority: owner-verbatim, source: s}}\n"
+        "---\n\nBody.\n"
+    )
+    CLEAN_TMPL = BAD_ADDED_TMPL.replace("tags: not-a-list", "tags: []").format(
+        kind="adopted", text="a real ruling")
+
+    def _hook_passes(self, root):
+        """Both memlint invocations pre-commit-append-only.sh makes: plain
+        mode on the WORKING TREE, then --against-ref HEAD --staged (INDEX)."""
+        rc_plain, out_plain = _run_memlint([str(root)])
+        rc_ref, out_ref = _run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+        return rc_plain, rc_ref, out_ref
+
+    def _stage_bad_then_clean_worktree(self, td, kind, text):
+        root = self._store(td, self.OLD_BAD)
+        path = root / "topics" / "baz.md"
+        path.write_text(self.BAD_ADDED_TMPL.format(kind=kind, text=text))
+        _git(["add", "-A"], cwd=root)
+        path.write_text(self.CLEAN_TMPL)  # clean unstaged working-tree version
+        return root
+
+    def test_malformed_added_file_with_bad_kind_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._stage_bad_then_clean_worktree(td, "verified", "a real ruling")
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_plain, 0)  # working tree is clean
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("baz.md", out)
+            self.assertIn("unknown kind 'verified'", out)
+
+    def test_malformed_added_file_with_question_quote_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._stage_bad_then_clean_worktree(td, "adopted", "should we ship it?")
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_plain, 0)
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("question, not a ruling", out)
+
+    def test_malformed_added_file_alone_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._stage_bad_then_clean_worktree(td, "adopted", "a real ruling")
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("baz.md", out)
+
+    def test_valid_added_file_still_passes_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store(td, self.OLD_BAD)
+            (root / "topics" / "baz.md").write_text(self.CLEAN_TMPL)
+            _git(["add", "-A"], cwd=root)
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual((rc_plain, rc_ref), (0, 0), out)
+
+
+if __name__ == "__main__":
+    unittest.main()
