@@ -10,8 +10,11 @@ Rules implemented, a subset of docs/SCHEMA.md section 7:
   * frontmatter `current`, if present, must equal the newest link whose
     status is active; mismatch names the correct value                -> error
   * a topic in area processing/* or deletion/* with no code_refs       -> warning
-  * any status / authority / kind value outside the five/five/five
-    enumerated in docs/SCHEMA.md section 3                                  -> error
+  * any status / authority value outside the enumerated five/five in
+    docs/SCHEMA.md section 3                                                -> error
+  * an unknown `kind` value, or an owner-verbatim ruling.text ending in `?`
+    -> warning for links recorded before the check; error under
+    `--against-ref` for links new relative to REF (kind cannot be edited)
   * a topic's `standing:` pointer names a link not in that topic, not
     active, or not owner-verbatim/owner-ratified (TOP-0132 L2)        -> error
   * a topic's `standing:` pointer whose link's ruling.text has a CR/LF -> error
@@ -2432,6 +2435,10 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
     for status, relpath in entries:
         path_in_root = relpath[len(prefix):] if prefix and relpath.startswith(prefix) else relpath
         full_path = root / path_in_root
+        if status == "T":
+            # Type change (symlink/gitlink <-> regular file): the path exists
+            # on both sides, so it is judged exactly like a modification.
+            status = "M"
 
         if status == "A":
             # Nothing existed at REF for this path -- no history to
@@ -2520,14 +2527,11 @@ def check_append_only(root: Path, ref: str, staged: bool) -> tuple[list[str], in
                         "no recorded link history here to protect"
                     )
                     # Re-gate (Grok BLOCK on 90f3960): nothing to freeze,
-                    # but every link in the repaired blob is NEW -- judge
-                    # them (ids recoverable from REF are not new).
+                    # but every link in the repaired blob is NEW -- judge them.
+                    # old_links is None here: REF recorded no recoverable
+                    # link ids, so every link in the new blob is new.
                     errors.extend(_added_links_errors(
-                        full_path,
-                        new_result.frontmatter.get("links") or [],
-                        {str(l.get("link"))
-                         for l in (_recovered_old_links(old_result.frontmatter) or [])
-                         if l.get("link") is not None}))
+                        full_path, new_result.frontmatter.get("links") or [], set()))
                     continue
                 # Both sides unparseable: still fail closed (test_j: malformed
                 # -> malformed is still refused), reported from the OLD side's

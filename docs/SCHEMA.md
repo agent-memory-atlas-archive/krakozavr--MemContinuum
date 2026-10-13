@@ -181,9 +181,10 @@ copied inline.
   purpose — not covered)
 - `current` not equal to the newest link with `status: active` → error (names the correct value)
 - a topic in area `processing/*` or `deletion/*` with no `code_refs` → warning
-- any `status` / `authority` / `kind` value outside the five/five/five enumerated above → error
-  (`kind` is the exception: like the question-form check above it is a warning for links recorded
-  before the check and an error for new links under `--against-ref`, since `kind` cannot be edited)
+- any `status` or `authority` value outside the five/five enumerated above → error
+- a `kind` value outside the five enumerated above → warning for links recorded before the check
+  and an error for new links under `--against-ref` (like the question-form check above, since
+  `kind` cannot be edited)
 - a `standing:` entry naming a link id not in that topic → error
 - a `standing:` entry whose link is not `status: active` → error, even when the link was superseded
   by a valid successor — the supersession and the pointer update (or removal) must land together

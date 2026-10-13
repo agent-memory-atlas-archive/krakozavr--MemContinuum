@@ -3163,6 +3163,26 @@ class TestGrandfatheredLinkChecks(unittest.TestCase):
             # NEW path must be named too (re-gate note, Codex + Grok).
             self.assertRegex(out, r"renamed\.md:L3: unknown kind 'verified'")
 
+    def test_type_change_symlink_to_topic_with_new_bad_link_fails_against_ref(self):
+        """Re-gate (Codex BLOCK): git status T (symlink -> regular file) must
+        get the same new-link judgement as M."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store(td, self.OLD_BAD)
+            link = root / "topics" / "sym.md"
+            link.symlink_to("foo.md")
+            _commit_all(root, "base (symlink)")
+            link.unlink()
+            link.write_text(self.CLEAN_TMPL.replace("TOP-9600", "TOP-9660")
+                            .replace("kind: adopted", "kind: verified"))
+            _git(["add", "-A"], cwd=root)
+            status = _git(["diff", "--no-renames", "--name-status", "--cached", "HEAD"],
+                          cwd=root).stdout
+            self.assertIn("T\ttopics/sym.md", status)
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_plain, 0)  # warning only in plain mode
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("unknown kind 'verified'", out)
+
     def _repaired_topic_with_new_link(self, td, kind, text):
         root = self._store(td, self.OLD_BAD)
         path = root / "topics" / "bad.md"
