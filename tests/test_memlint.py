@@ -86,13 +86,15 @@ class TestMemlintViolations(unittest.TestCase):
         self.assertEqual(errors, [], errors)
         self.assertTrue(any("code_refs" in w for w in warnings), warnings)
 
-    def test_owner_verbatim_question_mark_is_error(self):
+    def test_owner_verbatim_question_mark_is_a_warning_in_plain_mode(self):
         # lint-question-mark-verbatim: an owner-verbatim ruling whose text
         # ends with "?" is a question, not a ruling -- schema-usage
         # laundering (a question dressed up as a citable owner ruling).
-        errors, _warnings = lint_single_file("bad_owner_verbatim_question.md")
+        # Grandfathered (2026-10-13): a warning in plain mode; an error for
+        # NEW links under --against-ref (TestGrandfatheredLinkChecks).
+        _errors, warnings = lint_single_file("bad_owner_verbatim_question.md")
         self.assertTrue(
-            any("owner-verbatim" in e and "question" in e for e in errors), errors
+            any("owner-verbatim" in w and "question" in w for w in warnings), warnings
         )
 
     def test_owner_verbatim_question_mark_trims_quotes_and_whitespace_first(self):
@@ -100,9 +102,9 @@ class TestMemlintViolations(unittest.TestCase):
         # artifact) in the raw YAML value -- the check must trim that
         # before deciding the text ends with "?", not require the
         # question mark to be the literal last character.
-        errors, _warnings = lint_single_file("bad_owner_verbatim_question_trailing_quote.md")
+        _errors, warnings = lint_single_file("bad_owner_verbatim_question_trailing_quote.md")
         self.assertTrue(
-            any("owner-verbatim" in e and "question" in e for e in errors), errors
+            any("owner-verbatim" in w and "question" in w for w in warnings), warnings
         )
 
     def test_owner_ratified_question_mark_is_not_flagged(self):
@@ -2078,24 +2080,24 @@ class TestQuestionMarkRuleScope(unittest.TestCase):
             _write(root / "topics" / "t.md", text)
             return memlint.lint_root(root)
 
-    def test_active_question_mark_is_an_error(self):
-        errors, _ = self._lint(self._topic("active", "should we do X?"))
-        self.assertTrue(any("question, not a ruling" in e for e in errors), errors)
+    def test_active_question_mark_is_a_warning_in_plain_mode(self):
+        _, warnings = self._lint(self._topic("active", "should we do X?"))
+        self.assertTrue(any("question, not a ruling" in w for w in warnings), warnings)
 
-    def test_provisional_question_mark_is_an_error(self):
-        errors, _ = self._lint(self._topic("provisional", "should we do X?"))
-        self.assertTrue(any("question, not a ruling" in e for e in errors), errors)
+    def test_provisional_question_mark_is_a_warning_in_plain_mode(self):
+        _, warnings = self._lint(self._topic("provisional", "should we do X?"))
+        self.assertTrue(any("question, not a ruling" in w for w in warnings), warnings)
 
     def test_superseded_question_mark_is_clean(self):
         """A superseded link is history -- flagging it can never be
         cleared (append-only forbids rewriting a superseded link's own
         body), so the rule must not fire on it at all."""
-        errors, _ = self._lint(self._topic("superseded", "should we do X instead?"))
-        self.assertFalse(any("question, not a ruling" in e for e in errors), errors)
+        errors, warnings = self._lint(self._topic("superseded", "should we do X instead?"))
+        self.assertFalse(any("question, not a ruling" in m for m in errors + warnings), errors + warnings)
 
     def test_trailing_bracket_after_question_mark_is_still_caught(self):
-        errors, _ = self._lint(self._topic("active", "does this affect decisionmaking?)"))
-        self.assertTrue(any("question, not a ruling" in e for e in errors), errors)
+        _, warnings = self._lint(self._topic("active", "does this affect decisionmaking?)"))
+        self.assertTrue(any("question, not a ruling" in w for w in warnings), warnings)
 
 
 def _marker_topic(tid: str, code_refs: list, link_yaml: str, area: str = "memory") -> str:
@@ -2937,6 +2939,289 @@ class TestStandingGateMutation(unittest.TestCase):
     def test_raising_the_byte_cap_defeats_the_overflow_case(self):
         with mock.patch.object(memlint, "STANDING_CAP_BYTES", 100000):
             self._assert_defeated("test_cap_overflow_on_byte_count_is_caught_even_under_the_link_cap")
+
+
+class TestGrandfatheredLinkChecks(unittest.TestCase):
+    """Owner ruling 2026-10-13: the kind-vocabulary check and the
+    question-form owner-verbatim check apply only to links NEW relative to
+    the committed state. Plain mode reports them as warnings for every
+    link; `--against-ref REF [--staged]` (the store pre-commit hook's
+    second run) reports them as errors for links absent at REF -- including
+    every link of a brand-new file."""
+
+    OLD_BAD = (
+        "---\ntype: topic\nid: TOP-9500\ntitle: T\narea: memory\ncurrent: L2\ntags: []\nlinks:\n"
+        "  - link: L2\n    date: '2024-01-02'\n    status: active\n    kind: deferred\n"
+        "    ruling: {text: \"is this a ruling?\", authority: owner-verbatim, source: s}\n"
+        "  - link: L1\n    date: '2024-01-01'\n    status: historical\n    kind: adopted\n"
+        "    ruling: {text: \"first\", authority: agent-inference}\n"
+        "---\n\nBody.\n"
+    )
+
+    @staticmethod
+    def _new_link(kind="adopted", text="a real ruling", auth="owner-verbatim"):
+        return (
+            "  - link: L3\n    date: '2024-01-03'\n    status: active\n"
+            f"    kind: {kind}\n"
+            f"    ruling: {{text: \"{text}\", authority: {auth}, source: s}}\n"
+        )
+
+    def _with_new_link(self, base, link_yaml):
+        return base.replace("current: L2\n", "current: L3\n").replace("links:\n", "links:\n" + link_yaml, 1)
+
+    def _store(self, td, text):
+        root = _git_store(td)
+        (root / "topics").mkdir()
+        (root / "topics" / "foo.md").write_text(text)
+        _commit_all(root, "base")
+        return root
+
+    def test_a_old_bad_links_do_not_fail_plain_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store(td, self.OLD_BAD)
+            errors, warnings = memlint.lint_root(root)
+            self.assertEqual(errors, [], errors)
+            self.assertTrue(any("unknown kind" in w for w in warnings), warnings)
+            self.assertTrue(any("question, not a ruling" in w for w in warnings), warnings)
+            self.assertEqual(_run_memlint([str(root)])[0], 0)
+
+    def test_a_old_bad_links_survive_an_unrelated_staged_append(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store(td, self.OLD_BAD)
+            (root / "topics" / "foo.md").write_text(self._with_new_link(self.OLD_BAD, self._new_link()))
+            _git(["add", "-A"], cwd=root)
+            rc, out = _run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+            self.assertEqual(rc, 0, out)
+
+    def test_b_new_link_with_bad_kind_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store(td, self.OLD_BAD)
+            (root / "topics" / "foo.md").write_text(
+                self._with_new_link(self.OLD_BAD, self._new_link(kind="verified")))
+            _git(["add", "-A"], cwd=root)
+            rc, out = _run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("unknown kind 'verified'", out)
+            self.assertIn("L3", out)
+            self.assertNotIn(":L2", out)  # the old bad link is not re-judged
+
+    def test_c_new_link_with_question_quote_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store(td, self.OLD_BAD)
+            (root / "topics" / "foo.md").write_text(
+                self._with_new_link(self.OLD_BAD, self._new_link(text="should we ship it?")))
+            _git(["add", "-A"], cwd=root)
+            rc, out = _run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("question, not a ruling", out)
+
+    def test_b_c_brand_new_file_is_all_new_links(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store(td, self.OLD_BAD)
+            (root / "topics" / "bar.md").write_text(self.OLD_BAD.replace("TOP-9500", "TOP-9501"))
+            _git(["add", "-A"], cwd=root)
+            rc, out = _run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("unknown kind 'deferred'", out)
+            self.assertIn("question, not a ruling", out)
+
+    def test_new_link_still_only_a_warning_in_plain_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store(td, self.OLD_BAD)
+            (root / "topics" / "foo.md").write_text(
+                self._with_new_link(self.OLD_BAD, self._new_link(kind="verified")))
+            errors, warnings = memlint.lint_root(root)
+            self.assertEqual(errors, [], errors)
+            self.assertTrue(any("unknown kind 'verified'" in w for w in warnings), warnings)
+
+    # --- Codex BLOCK on d117f5e: a malformed ADDED file must not be skipped ---
+
+    BAD_ADDED_TMPL = (
+        "---\ntype: topic\nid: TOP-9600\ntitle: N\narea: memory\ncurrent: L1\n"
+        "tags: not-a-list\nlinks:\n"
+        "  - link: L1\n    date: '2024-01-01'\n    status: active\n    kind: {kind}\n"
+        "    ruling: {{text: \"{text}\", authority: owner-verbatim, source: s}}\n"
+        "---\n\nBody.\n"
+    )
+    CLEAN_TMPL = BAD_ADDED_TMPL.replace("tags: not-a-list", "tags: []").format(
+        kind="adopted", text="a real ruling")
+
+    def _hook_passes(self, root):
+        """Both memlint invocations pre-commit-append-only.sh makes: plain
+        mode on the WORKING TREE, then --against-ref HEAD --staged (INDEX)."""
+        rc_plain, out_plain = _run_memlint([str(root)])
+        rc_ref, out_ref = _run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+        return rc_plain, rc_ref, out_ref
+
+    def _stage_bad_then_clean_worktree(self, td, kind, text):
+        root = self._store(td, self.OLD_BAD)
+        path = root / "topics" / "baz.md"
+        path.write_text(self.BAD_ADDED_TMPL.format(kind=kind, text=text))
+        _git(["add", "-A"], cwd=root)
+        path.write_text(self.CLEAN_TMPL)  # clean unstaged working-tree version
+        return root
+
+    def test_malformed_added_file_with_bad_kind_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._stage_bad_then_clean_worktree(td, "verified", "a real ruling")
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_plain, 0)  # working tree is clean
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("baz.md", out)
+            self.assertIn("unknown kind 'verified'", out)
+
+    def test_malformed_added_file_with_question_quote_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._stage_bad_then_clean_worktree(td, "adopted", "should we ship it?")
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_plain, 0)
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("question, not a ruling", out)
+
+    def test_malformed_added_file_alone_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._stage_bad_then_clean_worktree(td, "adopted", "a real ruling")
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("baz.md", out)
+
+    def test_valid_added_file_still_passes_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store(td, self.OLD_BAD)
+            (root / "topics" / "baz.md").write_text(self.CLEAN_TMPL)
+            _git(["add", "-A"], cwd=root)
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual((rc_plain, rc_ref), (0, 0), out)
+
+
+    # --- re-gate on 2cbff87: recovered links are judged in ANY staged A/M
+    # file, whatever its declared `type` (Codex BLOCK + Grok) ---
+
+    @staticmethod
+    def _typed(rtype, rid, kind="verified", text="a real ruling", broken=True):
+        return (
+            f"---\ntype: {rtype}\nid: {rid}\ntitle: N\narea: memory\n"
+            f"tags: {'not-a-list' if broken else '[]'}\nlinks:\n"
+            "  - link: L1\n    date: '2024-01-01'\n    status: active\n"
+            f"    kind: {kind}\n"
+            f"    ruling: {{text: \"{text}\", authority: owner-verbatim, source: s}}\n"
+            "---\n\nBody.\n"
+        )
+
+    def _stage_then_clean_worktree(self, td, relname, staged_text, base_files=None):
+        root = self._store(td, self.OLD_BAD)
+        for name, text in (base_files or {}).items():
+            (root / name).parent.mkdir(exist_ok=True)
+            (root / name).write_text(text)
+        if base_files:
+            _commit_all(root, "base2")
+        path = root / relname
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(staged_text)
+        _git(["add", "-A"], cwd=root)
+        path.write_text(self.CLEAN_TMPL)
+        return root
+
+    def test_added_malformed_incident_with_bad_kind_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._stage_then_clean_worktree(
+                td, "incidents/INC-9700.md", self._typed("incident", "INC-9700"))
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("unknown kind 'verified'", out)
+
+    def test_added_concept_with_question_owner_verbatim_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._stage_then_clean_worktree(
+                td, "concepts/CON-9701.md",
+                self._typed("concept", "CON-9701", kind="adopted", text="should we ship it?"))
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("question, not a ruling", out)
+
+    def test_modified_incident_promoted_to_topic_with_bad_link_fails_against_ref(self):
+        inc = "---\ntype: incident\nid: TOP-9702\ntitle: N\narea: memory\n---\n\nBody.\n"
+        with tempfile.TemporaryDirectory() as td:
+            root = self._stage_then_clean_worktree(
+                td, "topics/promo.md",
+                self.CLEAN_TMPL.replace("TOP-9600", "TOP-9702").replace("kind: adopted", "kind: verified"),
+                base_files={"topics/promo.md": inc})
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("unknown kind 'verified'", out)
+
+    def test_renamed_topic_carrying_a_new_bad_link_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store(td, self.OLD_BAD)
+            _git(["mv", "topics/foo.md", "topics/renamed.md"], cwd=root)
+            (root / "topics" / "renamed.md").write_text(
+                self._with_new_link(self.OLD_BAD, self._new_link(kind="verified")))
+            _git(["add", "-A"], cwd=root)
+            rc, out = _run_memlint(["--against-ref", "HEAD", "--staged", str(root)])
+            self.assertEqual(rc, 1, out)
+            # The rename's D alone already gives rc 1; the NEW link on the
+            # NEW path must be named too (re-gate note, Codex + Grok).
+            self.assertRegex(out, r"renamed\.md:L3: unknown kind 'verified'")
+
+    def test_type_change_symlink_to_topic_with_new_bad_link_fails_against_ref(self):
+        """Re-gate (Codex BLOCK): git status T (symlink -> regular file) must
+        get the same new-link judgement as M."""
+        with tempfile.TemporaryDirectory() as td:
+            root = self._store(td, self.OLD_BAD)
+            link = root / "topics" / "sym.md"
+            link.symlink_to("foo.md")
+            _commit_all(root, "base (symlink)")
+            link.unlink()
+            link.write_text(self.CLEAN_TMPL.replace("TOP-9600", "TOP-9660")
+                            .replace("kind: adopted", "kind: verified"))
+            _git(["add", "-A"], cwd=root)
+            status = _git(["diff", "--no-renames", "--name-status", "--cached", "HEAD"],
+                          cwd=root).stdout
+            self.assertIn("T\ttopics/sym.md", status)
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_plain, 0)  # warning only in plain mode
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("unknown kind 'verified'", out)
+
+    def _repaired_topic_with_new_link(self, td, kind, text):
+        root = self._store(td, self.OLD_BAD)
+        path = root / "topics" / "bad.md"
+        path.write_text("---\ntype: topic\nid: TOP-9650\nlinks: [\n---\nBody.\n")
+        _commit_all(root, "base (unparseable topic)")
+        path.write_text(
+            self.CLEAN_TMPL.replace("TOP-9600", "TOP-9650")
+            .replace("kind: adopted", f"kind: {kind}")
+            .replace("a real ruling", text))
+        _git(["add", "-A"], cwd=root)
+        return root
+
+    def test_repaired_topic_with_new_bad_kind_link_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repaired_topic_with_new_link(td, "verified", "a real ruling")
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_plain, 0)  # warning only in plain mode
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("bad.md:L1", out)
+            self.assertIn("unknown kind 'verified'", out)
+            self.assertIn("repaired", out)
+
+    def test_repaired_topic_with_new_question_owner_verbatim_fails_against_ref(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repaired_topic_with_new_link(td, "adopted", "should we ship it?")
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_plain, 0)
+            self.assertEqual(rc_ref, 1, out)
+            self.assertIn("question, not a ruling", out)
+
+    def test_linkless_malformed_incident_behaviour_is_unchanged(self):
+        """No links to judge: a malformed linkless incident is still not
+        refused by against-ref (nothing recoverable, not topic-like)."""
+        inc = ("---\ntype: incident\nid: INC-9703\ntitle: N\narea: memory\n"
+               "tags: not-a-list\n---\n\nBody.\n")
+        with tempfile.TemporaryDirectory() as td:
+            root = self._stage_then_clean_worktree(td, "incidents/INC-9703.md", inc)
+            rc_plain, rc_ref, out = self._hook_passes(root)
+            self.assertEqual(rc_ref, 0, out)
 
 
 if __name__ == "__main__":
