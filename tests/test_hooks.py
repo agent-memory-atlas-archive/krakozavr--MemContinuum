@@ -1126,6 +1126,34 @@ class TestPreEditChainWorktreeGap(unittest.TestCase):
         out = json.loads(proc.stdout)
         self.assertIn("TOP-0042", out["hookSpecificOutput"]["additionalContext"])
 
+    def test_glob_characters_in_a_configured_root_stay_literal(self):
+        """The colon-separated MEMCONTINUUM_STRIP_PREFIX is split without
+        pathname expansion: a root spelled `<...>/code-star*` is a literal
+        root name, never a glob matching the real `code-star` and a sibling
+        `code-starX`. Literal root => the in-root worktree below is not
+        under any configured root => worktree-unwired, exactly as before
+        the root split was factored into mc_strip_prefix_roots."""
+        star_root = Path(self.tmp) / "code-star"
+        star_root.mkdir()
+        (Path(self.tmp) / "code-starX").mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=star_root, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.local"], cwd=star_root, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=star_root, check=True)
+        (star_root / "Sources").mkdir()
+        (star_root / "Sources" / "Foo.swift").write_text("// x\n")
+        subprocess.run(["git", "add", "-A"], cwd=star_root, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=star_root, check=True)
+        star_wt = star_root / ".worktrees" / "x"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "wt-star", str(star_wt)], cwd=star_root, check=True,
+        )
+        env = self._env(MEMCONTINUUM_STRIP_PREFIX=str(star_root) + "*")
+        proc, _ = run_hook(self._payload(str(star_wt / "Sources" / "Foo.swift")), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        self.assertIn("outcome=worktree-unwired", self._last_outcome_line(log_text))
+
     def test_separate_git_dir_root_remaps_worktree(self):
         """A configured root created via `git init --separate-git-dir`
         also has a `.git` FILE at its own top, the same layout defect as
@@ -1329,6 +1357,25 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         matching = [l for l in log_text.splitlines() if "outcome=" in l]
         self.assertTrue(matching, log_text)
         return matching[-1]
+
+    def test_miss_never_returns_readme_or_sources_records(self):
+        """The fallback guesses a DECISION: a store README and a sources/
+        record that match the file's words far better than the topic are
+        never returned."""
+        (self.store / "sources").mkdir()
+        (self.store / "README.md").write_text("# Store\n" + "needle " * 20 + "\n")
+        (self.store / "sources" / "sitting.md").write_text(
+            "---\ntype: source\nid: SITTING-1\ntitle: needle needle\n---\n" + "needle " * 20 + "\n")
+        memidx.cmd_reindex(type("Args", (), dict(
+            root=str(self.store), project=self.project,
+            db=str(Path(self.memtool_home) / f"{self.project}.sqlite"),
+            full=True, no_embed=True))())
+        proc, _ = run_hook(self._payload(str(self.repo / "src" / "needle.py")), self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_line = self._last_outcome_line((Path(self.memtool_home) / "hook.log").read_text())
+        self.assertIn("ids=TOP-7001", log_line)
+        self.assertNotIn("README", log_line)
+        self.assertNotIn("SITTING", log_line)
 
     def test_miss_with_hit_label_and_chain_never_snippet(self):
         target = str(self.repo / "src" / "needle.py")

@@ -12,13 +12,14 @@
 # extension gets a different, multi-line decision point instead -- see
 # MEMCONTINUUM_KNOWN_EXTS in the Env section below, not this one line.)
 #
-# Deliberately separate from pre-edit-chain.sh, and deliberately minimal:
-# no vector, no index read, no memidx.py call of any kind (unlike every
-# other hook in this repo). Whether the code index is actually
+# Deliberately separate from pre-edit-chain.sh, and deliberately minimal
+# on its own path: it never reads the CODE index, and whether that index is
 # initialized/current is left to the agent to confirm via `code-search`
-# itself -- this hook cannot know that without paying for a python+sqlite
-# read on every single Write, for a question code-search's own `state`
-# field (finding 1) already answers on demand.
+# itself (code-search's own `state` field answers it on demand). Its one
+# memidx.py call is the search fallback below: a read-only
+# `search --decisions-only` against the decision index when a new file is
+# created, run without `--root` because the rendered new-file command does
+# not export MEMCONTINUUM_ROOT (see docs/INTERNALS.md).
 #
 # Contract:
 #   - reads the PreToolUse JSON payload on stdin, extracts tool_input.file_path
@@ -689,7 +690,21 @@ print(d.get("cwd", "") or "")
 ' 2>/dev/null)"
         fi
     fi
-    FB_QUERY_REL_PATH="$(mc_query_source_path "$FILE_PATH" "$FB_CWD" "${MEMCONTINUUM_STRIP_PREFIX:-}")"
+    # Query on the worktree-remapped path (the same remap pre-edit-chain.sh
+    # applies, hooks/mc-path-lib.sh), never the raw `.worktrees/x/...` path
+    # whose machine-path words name where the file sits, not what it is.
+    # The settings entry for this hook carries MEMCONTINUUM_CODE_ROOT (the
+    # one root its `if` filter is scoped to) and no STRIP_PREFIX, so the
+    # code root IS the configured root here; an explicit STRIP_PREFIX, when
+    # present, is honoured as well.
+    FB_ROOT_PREFIXES="${CODE_ROOT}${MEMCONTINUUM_STRIP_PREFIX:+:$MEMCONTINUUM_STRIP_PREFIX}"
+    FB_QUERY_SRC_PATH="$FILE_PATH"
+    FB_WT_ROOTS="$(mc_strip_prefix_roots "$FB_ROOT_PREFIXES")"
+    if [ -n "$FB_WT_ROOTS" ]; then
+        FB_WT_REMAPPED="$(mc_remap_worktree_gated "$FILE_PATH" "$FB_WT_ROOTS")"
+        [ $? -eq 0 ] && [ -n "$FB_WT_REMAPPED" ] && FB_QUERY_SRC_PATH="$FB_WT_REMAPPED"
+    fi
+    FB_QUERY_REL_PATH="$(mc_query_source_path "$FB_QUERY_SRC_PATH" "$FB_CWD" "$FB_ROOT_PREFIXES")"
     FB_QUERY="$(mc_query_tokens "$FB_QUERY_REL_PATH")"
     if [ -z "$FB_QUERY" ]; then
         FB_EXTRA="fb_outcome=search-fallback-empty fb_reason=no-query"
@@ -723,7 +738,7 @@ print(d.get("cwd", "") or "")
         # index to answer a guess, never migrates or writes it, and a
         # stale store is now visible instead of silently swallowed.
         if [ -f "$FB_DB_PATH" ]; then
-            FB_ARGS=(search "$FB_QUERY" --mode "$FB_MODE" --project "$PROJECT" --db "$FB_DB_PATH" --limit 2 --json --hydrate --read-only)
+            FB_ARGS=(search "$FB_QUERY" --mode "$FB_MODE" --project "$PROJECT" --db "$FB_DB_PATH" --limit 2 --json --hydrate --read-only --decisions-only)
             if [ -n "${MEMCONTINUUM_ROOT:-}" ]; then
                 FB_ARGS+=(--root "$MEMCONTINUUM_ROOT")
             fi

@@ -3111,6 +3111,14 @@ def _search_hits(conn, args, extra_where: str, extra_params: list) -> tuple[list
     return results, contributing, embed_info
 
 
+# Record types (the `type` column) that carry rulings: the topic row, its
+# derived per-link rows, and incident / investigation records. Everything
+# else -- the store README ("README.md"), sources/ ("source"), inbox drops
+# ("inbox"), concepts ("concept") -- is findable by a human search but is not
+# a decision. Used by `search --decisions-only` (the hook fallback channels).
+DECISION_RECORD_TYPES = ("topic", "link", "incident", "investigation")
+
+
 def _resolve_search_status(status: list[str]) -> tuple[list[str], bool]:
     """search-default-active: no `--status` given at all (an empty list --
     argparse's own `default=[]`, and every direct-Namespace caller that
@@ -3219,6 +3227,18 @@ def cmd_search(args) -> int:
     resolved_status, status_is_default = _resolve_search_status(getattr(args, "status", None) or [])
     effective_args = copy.copy(args)
     effective_args.status = [] if status_is_default else resolved_status
+    if getattr(args, "decisions_only", False):
+        # Fallback channels only (hooks pass --decisions-only): a guess
+        # handed to an agent must be a decision, never a store README, a
+        # sources/ record, an inbox drop or a concept. An explicit --type
+        # narrows within the decision set (intersection), never widens it;
+        # an empty intersection matches nothing (an empty type list would
+        # mean "no type filter").
+        asked = list(getattr(args, "type", None) or [])
+        if asked:
+            effective_args.type = [t for t in asked if t in DECISION_RECORD_TYPES] or ["-none-"]
+        else:
+            effective_args.type = list(DECISION_RECORD_TYPES)
     extra_where, extra_params = build_filter_clause(effective_args, include_project=False)
     if status_is_default:
         placeholders = ",".join("?" * len(resolved_status))
@@ -9285,6 +9305,13 @@ def main(argv=None) -> int:
              "active/provisional/superseded/historical/declined explicitly",
     )
     p_search.add_argument("--type", action="append", default=[])
+    p_search.add_argument(
+        "--decisions-only", action="store_true",
+        help="restrict results to decision records (types topic, link, "
+             "incident, investigation); excludes the store README, sources/, "
+             "inbox drops and concepts. Used by the hook fallback channels; "
+             "the default search is unchanged",
+    )
     p_search.add_argument("--area", default=None)
     p_search.add_argument("--topic", default=None)
     p_search.add_argument("--authority", default=None)

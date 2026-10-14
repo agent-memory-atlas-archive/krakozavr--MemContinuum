@@ -3067,6 +3067,147 @@ class TestF5LinkRows(unittest.TestCase):
             out = json.loads(buf.getvalue())
             self.assertEqual(out, [], "an explicit --status active must not widen to NULL-status records")
 
+    def test_decisions_only_drops_readme_sources_inbox_and_concepts_default_search_keeps_them(self):
+        """Fallback channels (hooks) pass --decisions-only: the store README,
+        a sources/ record, an inbox README and a concept record -- each
+        matching the query word far better than the real decision -- are
+        never returned; a plain default search still returns them."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"
+            (root / "sources").mkdir(parents=True)
+            (root / "inbox" / "codex").mkdir(parents=True)
+            (root / "concepts").mkdir(parents=True)
+            (root / "topics").mkdir(parents=True)
+            (root / "README.md").write_text("# Store\nzorblax zorblax zorblax zorblax zorblax readme.\n")
+            (root / "sources" / "sitting.md").write_text(
+                "---\ntype: source\nid: SITTING-1\ntitle: zorblax sitting\n---\nzorblax zorblax zorblax zorblax.\n")
+            (root / "inbox" / "codex" / "README.md").write_text("zorblax zorblax zorblax zorblax inbox.\n")
+            (root / "concepts" / "README.md").write_text("zorblax zorblax zorblax zorblax concepts.\n")
+            (root / "topics" / "z.md").write_text(
+                "---\ntype: topic\nid: TOP-9100\ntitle: Zorblax policy\n"
+                "links:\n  - link: L1\n    status: active\n    "
+                'ruling: {text: "handle the zorblax case", authority: owner-verbatim, source: s}\n'
+                "---\nBody.\n"
+            )
+            root = root.resolve()
+            db = Path(td) / "idx.sqlite"
+            reindex(root, db, no_embed=True)
+
+            def run(**extra):
+                kw = dict(project=memidx.DEFAULT_PROJECT, db=str(db), query="zorblax", mode="fts",
+                          status=[], type=[], area=None, topic=None, authority=None, limit=20,
+                          include_inbox=True, json=True)
+                kw.update(extra)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    memidx.cmd_search(ns(**kw))
+                return json.loads(buf.getvalue())
+
+            default_ids = {r["id"] for r in run()}
+            self.assertIn("SITTING-1", default_ids)
+            self.assertTrue(any(i in default_ids for i in ("README", "README.md")), default_ids)
+            only = run(decisions_only=True)
+            self.assertTrue(only)
+            self.assertEqual({r["id"] for r in only}, {"TOP-9100"}, only)
+            # An explicit --type narrows inside the decision set, never widens it.
+            self.assertEqual(run(decisions_only=True, type=["source"]), [])
+            self.assertTrue(run(decisions_only=True, type=["topic"]))
+
+    def _decisions_only_store(self, td):
+        """A store whose README, sources/ record, inbox README and concept
+        all match the query word far better than the one real topic."""
+        root = Path(td) / "store"
+        for d in ("sources", "inbox/codex", "concepts", "topics"):
+            (root / d).mkdir(parents=True)
+        (root / "README.md").write_text("# Store\nzorblax zorblax zorblax zorblax readme.\n")
+        (root / "sources" / "sitting.md").write_text(
+            "---\ntype: source\nid: SITTING-1\ntitle: zorblax sitting\n---\nzorblax zorblax zorblax.\n")
+        (root / "inbox" / "codex" / "README.md").write_text("zorblax zorblax zorblax inbox.\n")
+        (root / "concepts" / "c.md").write_text(
+            "---\ntype: concept\nid: CON-1\ntitle: zorblax concept\n---\nzorblax zorblax zorblax.\n")
+        (root / "topics" / "z.md").write_text(
+            "---\ntype: topic\nid: TOP-9100\ntitle: Zorblax policy\n"
+            "links:\n  - link: L1\n    status: active\n    "
+            'ruling: {text: "handle the zorblax case", authority: owner-verbatim, source: s}\n'
+            "---\nBody.\n"
+        )
+        return root.resolve()
+
+    def _search_json(self, db, **extra):
+        kw = dict(project=memidx.DEFAULT_PROJECT, db=str(db), query="zorblax", mode="fts",
+                  status=[], type=[], area=None, topic=None, authority=None, limit=20,
+                  include_inbox=True, json=True)
+        kw.update(extra)
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            memidx.cmd_search(ns(**kw))
+        self._search_stderr = err.getvalue()
+        out = json.loads(buf.getvalue())
+        # hybrid mode wraps the hits in an envelope carrying fusion metadata
+        return out["results"] if isinstance(out, dict) else out
+
+    def test_decisions_only_holds_in_fts_vector_and_hybrid_modes(self):
+        """Every ranking channel gets the decision-type predicate, not just
+        FTS. Vector determinism: compute_embeddings returns one constant
+        vector for every text, the model loader and the query embedding are
+        patched to a fake fingerprint -- no real embedding backend, and with
+        identical vectors the README/source/concept rows would rank right
+        beside the topic if the filter were missing (the default-search
+        control below proves they are present in the vector index)."""
+        fp = "model=fake;dim=4;pipeline=1;prefix=none;norm=l2;fastembed=0.0.0;revision=rev1"
+        with tempfile.TemporaryDirectory() as td:
+            root = self._decisions_only_store(td)
+            db = Path(td) / "idx.sqlite"
+            with mock.patch.object(memidx, "compute_embeddings",
+                                   side_effect=lambda texts, model=None: [[0.1, 0.2, 0.3, 0.4] for _ in texts]), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=lambda: (object(), fp)):
+                reindex(root, db, no_embed=False)
+            with mock.patch.object(memidx, "load_embedding_model", side_effect=lambda: (object(), fp)), \
+                 mock.patch.object(memidx, "compute_query_embedding",
+                                   side_effect=lambda text, model=None: [0.1, 0.2, 0.3, 0.4]), \
+                 mock.patch.object(memidx, "embedding_fingerprint", return_value=fp):
+                for mode in ("fts", "vector", "hybrid"):
+                    with self.subTest(mode=mode):
+                        default_ids = {r["id"] for r in self._search_json(db, mode=mode)}
+                        # the vector channel really ran (no silent FTS fallback)
+                        self.assertNotIn("falling back", self._search_stderr)
+                        self.assertNotIn("different model", self._search_stderr)
+                        self.assertIn("SITTING-1", default_ids, (mode, default_ids))
+                        only = self._search_json(db, mode=mode, decisions_only=True)
+                        ids = {r["id"] for r in only}
+                        self.assertEqual(ids, {"TOP-9100"}, (mode, only))
+                        self.assertNotIn("falling back", self._search_stderr)
+                        self.assertFalse({"SITTING-1", "CON-1"} & ids)
+                        self.assertFalse({r["type"] for r in only} & {"source", "concept", "inbox", "README.md"})
+
+    def test_decisions_only_hydrate_of_an_explicit_link_hit_uses_the_parent_topic_chain(self):
+        """A hit that is a per-link row (only a non-current active link's
+        ruling matches the query) still hydrates chain_text from its parent
+        topic."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "store"
+            (root / "topics").mkdir(parents=True)
+            (root / "topics" / "t.md").write_text(
+                "---\ntype: topic\nid: TOP-9200\ntitle: Plain topic\nlinks:\n"
+                "  - link: L1\n    status: active\n"
+                '    ruling: {text: "first ruling", authority: owner-verbatim, source: s}\n'
+                "  - link: L2\n    status: active\n"
+                '    ruling: {text: "quibblexyz second ruling", authority: owner-verbatim, source: s}\n'
+                "---\nBody.\n"
+            )
+            db = Path(td) / "idx.sqlite"
+            reindex(root.resolve(), db, no_embed=True)
+            hits = self._search_json(db, query="quibblexyz", decisions_only=True, hydrate=True, type=["link"])
+            self.assertTrue(hits)
+            hit = hits[0]
+            self.assertEqual(hit["type"], "link", hit)
+            conn = memidx.open_db_noncreating(db, project=memidx.DEFAULT_PROJECT)
+            parent = memidx.record_row_by_path(conn, hit["path"])
+            expected = "\n".join(memidx.topic_chain_lines(conn, parent))
+            conn.close()
+            self.assertIn("TOP-9200", hit["chain_text"])
+            self.assertEqual(hit["chain_text"], expected)
+
     def test_inbox_exclusion_uses_a_bounded_parameter_count_not_one_per_inbox_file(self):
         """Codex 3 fix, defensive design point: a concrete `source_path NOT
         IN (paths...)` list -- one bound SQL parameter per inbox/ file --

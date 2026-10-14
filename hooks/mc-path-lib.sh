@@ -399,3 +399,63 @@ EOF
 
     return 1
 }
+
+# mc_remap_worktree_gated FILE_PATH ROOTS
+#
+# The worktree remap exactly as the search-capable hooks apply it
+# (hooks/pre-edit-chain.sh, hooks/newfile-nudge.sh): ROOTS is the
+# newline-separated list of configured code roots (no trailing slashes).
+# Wraps mc_remap_worktree_path with the in-root gate -- a FILE_PATH already
+# physically under one of the roots pays for the remap only when a nested
+# `.git` FILE (a worktree checked out inside the root) sits between it and
+# that root (mc_nested_worktree_gitfile), and an in-root path whose remap
+# comes back unwired/unresolved is an ordinary in-root file, not a worktree
+# gap. Return codes are mc_remap_worktree_path's, with that in-root
+# downgrade applied:
+#   0  remapped -- stdout is the main-checkout-equivalent absolute path
+#   1  worktree-unwired    (FILE_PATH is NOT under any root)
+#   2  worktree-unresolved (FILE_PATH is NOT under any root)
+#   3  not applicable (ordinary file, or in-root with nothing to remap)
+mc_remap_worktree_gated() {
+    local file_path="$1" roots="$2" root in_root="" out rc
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        if mc_path_under_root "$file_path" "$root"; then
+            in_root="$root"
+            break
+        fi
+    done <<EOF2
+$roots
+EOF2
+    if [ -n "$in_root" ]; then
+        mc_nested_worktree_gitfile "$file_path" "$in_root" || return 3
+    fi
+    out="$(mc_remap_worktree_path "$file_path" "$roots")"
+    rc=$?
+    case $rc in
+        0) printf '%s\n' "$out"; return 0 ;;
+        1 | 2) [ -n "$in_root" ] && return 3 ;;
+    esac
+    return $rc
+}
+
+# mc_strip_prefix_roots STRIP_PREFIXES
+#
+# The configured code roots a hook knows about, read from its
+# colon-separated MEMCONTINUUM_STRIP_PREFIX: one root per line on stdout,
+# trailing slash removed, empty entries dropped. The roots argument of
+# mc_remap_worktree_gated / mc_remap_worktree_path.
+mc_strip_prefix_roots() {
+    local prefixes="$1" prefix root out="" parts=()
+    # read -a, never an unquoted word split: a root containing * ? [ must
+    # stay literal, not pathname-expand against sibling directories.
+    IFS=: read -r -a parts <<< "$prefixes"
+    for prefix in ${parts[@]+"${parts[@]}"}; do
+        root="${prefix%/}"
+        [ -z "$root" ] && continue
+        out="${out:+$out
+}$root"
+    done
+    [ -n "$out" ] && printf '%s\n' "$out"
+    return 0
+}
