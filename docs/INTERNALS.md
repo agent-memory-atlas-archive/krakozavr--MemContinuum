@@ -144,6 +144,27 @@ backend at all; this is a per-installation recommendation only — the
 shipped default stays `hybrid` — ship on the engine's own default,
 measure real queries before changing it.
 
+Second-hit score floor (TOP-0133 L5, `MEMCONTINUUM_FALLBACK_SECOND_FLOOR`):
+the file-miss channels (`pre-edit-chain.sh`, `newfile-nudge.sh`) ask for two
+hits, but the first always shows and the second shows only if its fused
+hybrid (RRF) `score` is at least the floor — default `0.0314`, a
+**provisional** value measured on a 346-case replay (unrelated guesses
+~32% → ~23%, cases with at least one relevant guess ~90% → ~86%) and due a
+re-check on fresh data. The env var takes a non-negative decimal; `0`
+disables the floor; an unparseable or negative value falls back to the
+default (never fails the hook). The floor is an RRF value, so it applies
+**only when the search `--json` envelope proves RRF scores**: a dict with
+`fusion: "rrf"` and no `embedding` / `dimension_mismatch_rows` key (those
+mean the vector channel was missing or partial, so the score is on a
+single-channel scale). A bare list (`fts`/`vector` mode), `fusion:
+"vector-only"` (cosine) or any degraded envelope shows hits exactly as
+before. A missing or non-numeric score counts as below the floor; the first
+hit is never dropped. A dropped hit is logged as `floor_dropped=<id>`
+(`fb_floor_dropped=<id>` on the new-file nudge's outcome line) and is not
+written to session state, so it can still surface later. The prompt-query
+channel (max 1 hit) does not use the floor. The default and the env read live
+once, in `hooks/mc-fallback-lib.sh` (`mc_fallback_second_floor`).
+
 Each hit's `chain_text` is capped at `MEMCONTINUUM_FALLBACK_MAX_BYTES`
 (default 2000 UTF-8 bytes, `--hydrate-max-bytes`): the active/current link
 renders in full, older links are added newest-first until the cap, then

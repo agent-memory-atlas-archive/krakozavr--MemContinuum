@@ -1377,6 +1377,62 @@ class TestPreEditChainSearchFallback(unittest.TestCase):
         self.assertNotIn("README", log_line)
         self.assertNotIn("SITTING", log_line)
 
+    def _run_with_fake_search(self, envelope, **env_overrides):
+        """Run pre-edit-chain.sh on a miss with `memidx.py search` replaced
+        by a fixed --json envelope (for-path etc. stay real)."""
+        # The envelope goes through a file: the wrapper body is embedded in
+        # a bash single-quoted string, so a repr() literal would break it.
+        env_file = Path(self.tmp) / "fake-search-envelope.json"
+        env_file.write_text(json.dumps(envelope))
+        wrapper = memidx_wrapper_python(
+            self.tmp, "fake-search",
+            'if sys.argv[1] == "search":\n'
+            f'    print(open("{env_file}").read())\n'
+            '    sys.exit(0)\n',
+        )
+        env = self._env(MEMCONTINUUM_PYTHON=str(wrapper), **env_overrides)
+        proc, _ = run_hook(self._payload(str(self.repo / "src" / "floorcase.py")), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log_text = (Path(self.memtool_home) / "hook.log").read_text()
+        return proc, self._last_outcome_line(log_text)
+
+    @staticmethod
+    def _floor_envelope(second_score, **extra):
+        return {"results": [
+            {"id": "TOP-9201", "title": "First", "chain_text": "chain nine-two-oh-one", "score": 0.0328},
+            {"id": "TOP-9202", "title": "Second", "chain_text": "chain nine-two-oh-two", "score": second_score},
+        ], **extra}
+
+    def test_second_floor_drops_a_below_floor_second_hit_end_to_end(self):
+        """TOP-0133 L5: RRF envelope, second score below the 0.0314 floor ->
+        one hit rendered, `floor_dropped=` logged, dropped id absent from
+        session state."""
+        proc, line = self._run_with_fake_search(self._floor_envelope(0.0200, fusion="rrf"))
+        ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("chain nine-two-oh-one", ctx)
+        self.assertNotIn("chain nine-two-oh-two", ctx)
+        self.assertIn("hits=1 ids=TOP-9201", line)
+        self.assertIn("floor_dropped=TOP-9202", line)
+        state_file = Path(self.memtool_home) / "sessions" / self.project / "sess-fb-1.json"
+        state = json.loads(state_file.read_text())
+        self.assertEqual([e["id"] for e in state["search_fallbacks"]], ["TOP-9201"])
+
+    def test_second_floor_env_zero_and_custom_value(self):
+        env = self._floor_envelope(0.0200, fusion="rrf")
+        proc, line = self._run_with_fake_search(env, MEMCONTINUUM_FALLBACK_SECOND_FLOOR="0")
+        self.assertIn("hits=2", line)
+        self.assertNotIn("floor_dropped", line)
+        proc, line = self._run_with_fake_search(env, MEMCONTINUUM_FALLBACK_SECOND_FLOOR="0.01")
+        self.assertIn("hits=2", line)
+        proc, line = self._run_with_fake_search(env, MEMCONTINUUM_FALLBACK_SECOND_FLOOR="bogus")
+        self.assertIn("hits=1", line)
+        self.assertIn("floor_dropped=TOP-9202", line)
+
+    def test_second_floor_not_applied_to_a_non_rrf_envelope(self):
+        proc, line = self._run_with_fake_search(self._floor_envelope(0.0200, fusion="vector-only"))
+        self.assertIn("hits=2", line)
+        self.assertNotIn("floor_dropped", line)
+
     def test_miss_with_hit_label_and_chain_never_snippet(self):
         target = str(self.repo / "src" / "needle.py")
         proc, _ = run_hook(self._payload(target), self._env())

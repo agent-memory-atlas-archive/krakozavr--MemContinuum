@@ -744,6 +744,7 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
     FB_TEXT=""
     FB_HITS_FOR_STATE=""
     FB_REASON=""
+    FB_FLOOR_DROPPED=""
     if [ -n "$FALLBACK_JSON" ] || [ "$FALLBACK_RC" -ne 0 ]; then
         # Re-gate round 4 NIT: guarded (2>/dev/null, checked) -- an
         # unguarded `source` of a MISSING/unreadable file would otherwise
@@ -754,9 +755,12 @@ if [ -z "$MATCHED_CANDIDATE" ]; then
         # a few lines down fires with this reason instead of "no-hits").
         # shellcheck source=mc-fallback-lib.sh
         if source "$SCRIPT_DIR/mc-fallback-lib.sh" 2>/dev/null; then
+            # TOP-0133 L5: the second hit must clear the RRF score floor
+            # (mc_fallback_second_floor: default + MEMCONTINUUM_FALLBACK_
+            # SECOND_FLOOR env, one definition, hooks/mc-fallback-lib.sh).
             mc_fallback_parse "$PY" "$FALLBACK_RC" \
                 "$MC_FB_LABEL_FILE" \
-                1 "$FALLBACK_JSON"
+                1 "$FALLBACK_JSON" "" "" "$(mc_fallback_second_floor)"
         else
             FB_REASON="lib-missing"
         fi
@@ -841,7 +845,11 @@ print(d.get("session_id", "") or "")
 
     printf '%s\n' "$FB_TEXT"
 
-    finish "search-fallback" "hits=$FB_HITS ids=$FB_IDS mode=$FALLBACK_MODE q=$FALLBACK_QUERY_LOGGED$FB_MS_PART$FB_STATE_PART"
+    # TOP-0133 L5: `floor_dropped=<id>` names the second hit the RRF score
+    # floor withheld (absent when nothing was dropped) -- the re-check data.
+    FB_FLOOR_PART=""
+    [ -n "$FB_FLOOR_DROPPED" ] && FB_FLOOR_PART=" floor_dropped=$FB_FLOOR_DROPPED"
+    finish "search-fallback" "hits=$FB_HITS ids=$FB_IDS mode=$FALLBACK_MODE q=$FALLBACK_QUERY_LOGGED$FB_MS_PART$FB_STATE_PART$FB_FLOOR_PART"
 fi
 
 TOPIC_COUNT="$MATCHED_TOPIC_COUNT"

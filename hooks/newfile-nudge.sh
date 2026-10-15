@@ -770,6 +770,7 @@ print(d.get("cwd", "") or "")
         FB_TEXT=""
         FB_HITS_FOR_STATE=""
         FB_REASON=""
+        FB_FLOOR_DROPPED=""
         # Re-gate round 3, MINOR duplication: shared with hooks/pre-edit-
         # chain.sh via mc_fallback_parse, hooks/mc-fallback-lib.sh -- see
         # that file's own header for the full reason-vocabulary rationale.
@@ -789,9 +790,10 @@ print(d.get("cwd", "") or "")
             # empty since the parser never ran).
             # shellcheck source=mc-fallback-lib.sh
             if source "$SCRIPT_DIR/mc-fallback-lib.sh" 2>/dev/null; then
+                # TOP-0133 L5: second-hit RRF score floor, see pre-edit-chain.sh.
                 mc_fallback_parse "$PY" "$FB_RC" \
                     "$MC_FB_LABEL_FILE" \
-                    0 "$FB_JSON_RAW"
+                    0 "$FB_JSON_RAW" "" "" "$(mc_fallback_second_floor)"
             else
                 FB_REASON="lib-missing"
             fi
@@ -844,7 +846,10 @@ print(d.get("session_id", "") or "")
                     FB_STATE_PART=" fb_state=skipped-lock"
                 fi
             fi
-            FB_EXTRA="fb_outcome=search-fallback fb_hits=$FB_HITS fb_ids=$FB_IDS fb_mode=$FB_MODE fb_q=$FB_QUERY_LOGGED$FB_MS_PART$FB_STATE_PART"
+            # TOP-0133 L5: fb_floor_dropped=<id> -- see pre-edit-chain.sh.
+            FB_FLOOR_PART=""
+            [ -n "$FB_FLOOR_DROPPED" ] && FB_FLOOR_PART=" fb_floor_dropped=$FB_FLOOR_DROPPED"
+            FB_EXTRA="fb_outcome=search-fallback fb_hits=$FB_HITS fb_ids=$FB_IDS fb_mode=$FB_MODE fb_q=$FB_QUERY_LOGGED$FB_MS_PART$FB_STATE_PART$FB_FLOOR_PART"
         fi
     fi
 fi
