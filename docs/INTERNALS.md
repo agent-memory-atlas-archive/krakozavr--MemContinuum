@@ -155,8 +155,11 @@ disables the floor; an unparseable or negative value falls back to the
 default (never fails the hook). The floor is an RRF value, so it applies
 **only when the search `--json` envelope proves RRF scores**: a dict with
 `fusion: "rrf"` and no `embedding` / `dimension_mismatch_rows` key (those
-mean the vector channel was missing or partial, so the score is on a
-single-channel scale). A bare list (`fts`/`vector` mode), `fusion:
+mean the vector channel was missing or partial, so the scores may be
+single-channel or unevenly fused, and the floor stays off rather than
+guess). A run where one channel simply returned nothing still reports
+`fusion: "rrf"` with single-channel scores (at most 1/61), so its second hit
+is always hidden. A bare list (`fts`/`vector` mode), `fusion:
 "vector-only"` (cosine) or any degraded envelope shows hits exactly as
 before. A missing or non-numeric score counts as below the floor; the first
 hit is never dropped. A dropped hit is logged as `floor_dropped=<id>`
