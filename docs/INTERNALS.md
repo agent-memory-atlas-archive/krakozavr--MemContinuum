@@ -144,7 +144,7 @@ backend at all; this is a per-installation recommendation only — the
 shipped default stays `hybrid` — ship on the engine's own default,
 measure real queries before changing it.
 
-Second-hit score floor (TOP-0133 L5, `MEMCONTINUUM_FALLBACK_SECOND_FLOOR`):
+Second-hit score floor (`MEMCONTINUUM_FALLBACK_SECOND_FLOOR`):
 the file-miss channels (`pre-edit-chain.sh`, `newfile-nudge.sh`) ask for two
 hits, but the first always shows and the second shows only if its fused
 hybrid (RRF) `score` is at least the floor — default `0.0314`, a
