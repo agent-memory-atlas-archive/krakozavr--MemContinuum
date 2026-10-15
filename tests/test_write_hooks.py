@@ -5520,12 +5520,14 @@ class TestMcFallbackParseExcludeIdsMaxHits(unittest.TestCase):
         ]
     })
 
-    def _parse(self, raw_json, exclude_ids="", max_hits=""):
+    def _parse(self, raw_json, exclude_ids="", max_hits="", second_floor=None):
         script = (
             f'source {shlex.quote(str(self.FB_LIB))}; '
             f'mc_fallback_parse {shlex.quote(VENV_PYTHON)} 0 LABEL 1 '
-            f'{shlex.quote(raw_json)} {shlex.quote(exclude_ids)} {shlex.quote(max_hits)}; '
-            'echo "HITS=$FB_HITS"; echo "IDS=$FB_IDS"; echo "REASON=$FB_REASON"'
+            f'{shlex.quote(raw_json)} {shlex.quote(exclude_ids)} {shlex.quote(max_hits)}'
+            + (f' {shlex.quote(second_floor)}' if second_floor is not None else '')
+            + '; echo "HITS=$FB_HITS"; echo "IDS=$FB_IDS"; echo "REASON=$FB_REASON"; '
+            'echo "DROPPED=$FB_FLOOR_DROPPED"; echo "STATE=$FB_HITS_FOR_STATE"'
         )
         proc = subprocess.run([MC_BASH, "-c", script], capture_output=True, text=True, timeout=10)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -5565,6 +5567,103 @@ class TestMcFallbackParseExcludeIdsMaxHits(unittest.TestCase):
         out = self._parse(self.TWO_HIT_JSON, max_hits="1")
         self.assertEqual(out["HITS"], "1")
         self.assertEqual(out["IDS"], "TOP-1")
+
+    # --- TOP-0133 L5: second-hit RRF score floor -------------------------
+    FLOOR = "0.0314"
+
+    @staticmethod
+    def _env_json(scores, **envelope):
+        """A search --json envelope: one hit per score (None = no score key)."""
+        results = []
+        for i, sc in enumerate(scores, 1):
+            h = {"id": f"TOP-{i}", "title": f"t{i}", "chain_text": f"chain {i}"}
+            if sc is not None:
+                h["score"] = sc
+            results.append(h)
+        return json.dumps({"results": results, **envelope})
+
+    def test_floor_drops_a_below_floor_second_hit_and_names_it(self):
+        out = self._parse(self._env_json([0.0328, 0.0200], fusion="rrf"), second_floor=self.FLOOR)
+        self.assertEqual(out["HITS"], "1")
+        self.assertEqual(out["IDS"], "TOP-1")
+        self.assertEqual(out["DROPPED"], "TOP-2")
+        self.assertNotIn("TOP-2", out["STATE"])
+
+    def test_floor_keeps_a_second_hit_at_or_above_the_floor(self):
+        for sc in (0.0314, 0.0328):
+            out = self._parse(self._env_json([0.0328, sc], fusion="rrf"), second_floor=self.FLOOR)
+            self.assertEqual(out["HITS"], "2", sc)
+            self.assertEqual(out["IDS"], "TOP-1,TOP-2", sc)
+            self.assertEqual(out["DROPPED"], "", sc)
+
+    def test_floor_never_drops_the_first_hit(self):
+        out = self._parse(self._env_json([0.001, 0.0005], fusion="rrf"), second_floor=self.FLOOR)
+        self.assertEqual(out["IDS"], "TOP-1")
+        self.assertEqual(out["DROPPED"], "TOP-2")
+
+    def test_floor_missing_or_non_numeric_second_score_counts_as_below(self):
+        for sc in (None, "0.9", True):
+            out = self._parse(self._env_json([0.0328, sc], fusion="rrf"), second_floor=self.FLOOR)
+            self.assertEqual(out["IDS"], "TOP-1", sc)
+            self.assertEqual(out["DROPPED"], "TOP-2", sc)
+
+    def test_floor_applies_to_the_second_surviving_hit_after_exclusion(self):
+        """TOP-1 excluded: TOP-2 is the FIRST survivor (always shown),
+        TOP-3 the second (judged against the floor)."""
+        raw = self._env_json([0.0328, 0.0100, 0.0100], fusion="rrf")
+        out = self._parse(raw, exclude_ids="TOP-1", second_floor=self.FLOOR)
+        self.assertEqual(out["IDS"], "TOP-2")
+        self.assertEqual(out["DROPPED"], "TOP-3")
+
+    def test_floor_ignored_unless_the_envelope_proves_rrf(self):
+        low = [0.2, 0.1]
+        cases = {
+            "vector-only": self._env_json(low, fusion="vector-only"),
+            "no fusion key": self._env_json(low),
+            "bare list (fts/vector mode)": json.dumps(json.loads(self._env_json(low))["results"]),
+            "rrf but embeddings unavailable": self._env_json(low, fusion="rrf", embedding="unavailable"),
+            "rrf with dimension mismatch": self._env_json(low, fusion="rrf", dimension_mismatch_rows=3),
+        }
+        for name, raw in cases.items():
+            out = self._parse(raw, second_floor=self.FLOOR)
+            self.assertEqual(out["HITS"], "2", name)
+            self.assertEqual(out["DROPPED"], "", name)
+
+    def test_no_floor_arg_empty_or_zero_is_unchanged(self):
+        raw = self._env_json([0.0328, 0.0001], fusion="rrf")
+        for floor in (None, "", "0"):
+            out = self._parse(raw, second_floor=floor)
+            self.assertEqual(out["IDS"], "TOP-1,TOP-2", floor)
+            self.assertEqual(out["DROPPED"], "", floor)
+
+    def test_floor_with_max_hits_one_never_considers_a_second_hit(self):
+        """The prompt channel passes MAX_HITS=1 and no floor; even with one
+        the second hit is never reached."""
+        raw = self._env_json([0.0328, 0.0001], fusion="rrf")
+        out = self._parse(raw, max_hits="1", second_floor=self.FLOOR)
+        self.assertEqual(out["IDS"], "TOP-1")
+        self.assertEqual(out["DROPPED"], "")
+
+    def _floor_value(self, env_value):
+        env = dict(os.environ)
+        env.pop("MEMCONTINUUM_FALLBACK_SECOND_FLOOR", None)
+        if env_value is not None:
+            env["MEMCONTINUUM_FALLBACK_SECOND_FLOOR"] = env_value
+        proc = subprocess.run(
+            [MC_BASH, "-c", f'source {shlex.quote(str(self.FB_LIB))}; mc_fallback_second_floor'],
+            capture_output=True, text=True, timeout=10, env=env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def test_second_floor_env_default_override_disable_and_garbage(self):
+        self.assertEqual(self._floor_value(None), "0.0314")
+        self.assertEqual(self._floor_value(""), "0.0314")
+        self.assertEqual(self._floor_value("0.02"), "0.02")
+        self.assertEqual(self._floor_value(".5"), ".5")
+        self.assertEqual(self._floor_value("0"), "0")
+        for bad in ("abc", "-0.01", "0.03x", "1e-2", "0.0.3", " 0.03"):
+            self.assertEqual(self._floor_value(bad), "0.0314", bad)
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
@@ -8002,6 +8101,62 @@ class TestNewFileNudgeHook(unittest.TestCase):
         log_text = (self.home / "hook.log").read_text()
         self.assertIn("fb_outcome=search-fallback ", log_text)
         self.assertIn("fb_hits=1", log_text)
+
+    def _run_with_fake_search(self, payload_obj):
+        """Run the new-file hook with a fake memidx.py search that returns
+        payload_obj (a search --json envelope) regardless of argv."""
+        fake = Path(self.td) / "fake-memidx-floor.py"
+        fake.write_text(
+            "import json, sys\n"
+            "if sys.argv[1] == 'search':\n"
+            f"    print(json.dumps({payload_obj!r}))\n"
+            "    sys.exit(0)\n"
+            "sys.exit(1)\n"
+        )
+        wrapper = Path(self.td) / "fake-py-wrapper-floor"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            f'REAL_PY="{VENV_PYTHON}"\n'
+            'if [ "$1" = "-c" ]; then\n'
+            '    exec "$REAL_PY" "$@"\n'
+            'fi\n'
+            'shift\n'
+            f'exec "$REAL_PY" "{fake}" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        (self.home / "default.sqlite").write_bytes(b"")
+        target = self.code_root / "Sources" / "floorcase.swift"
+        env = self.base_env(MEMCONTINUUM_PYTHON=str(wrapper))
+        proc, _elapsed = run_script(NEWFILE_NUDGE_HOOK, self.payload_for(str(target)), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        return ctx, (self.home / "hook.log").read_text()
+
+    @staticmethod
+    def _floor_envelope(second_score, **extra):
+        return {"results": [
+            {"id": "TOP-9201", "title": "First", "path": "a.md", "chain_text": "chain nine-two-oh-one", "score": 0.0328},
+            {"id": "TOP-9202", "title": "Second", "path": "b.md", "chain_text": "chain nine-two-oh-two", "score": second_score},
+        ], **extra}
+
+    def test_second_floor_drops_a_below_floor_second_hit_end_to_end(self):
+        """TOP-0133 L5: RRF envelope, second score below the 0.0314 floor ->
+        only the first hit is rendered, the drop is logged, and the dropped
+        id is not recorded in session state."""
+        ctx, log_text = self._run_with_fake_search(self._floor_envelope(0.0200, fusion="rrf"))
+        self.assertIn("chain nine-two-oh-one", ctx)
+        self.assertNotIn("chain nine-two-oh-two", ctx)
+        self.assertIn("fb_hits=1", log_text)
+        self.assertIn("fb_ids=TOP-9201", log_text)
+        self.assertIn("fb_floor_dropped=TOP-9202", log_text)
+        state = json.loads((self.home / "sessions" / "default" / "s-newfile-nudge.json").read_text())
+        self.assertEqual([e["id"] for e in state["search_fallbacks"]], ["TOP-9201"])
+
+    def test_second_floor_keeps_both_hits_when_not_rrf(self):
+        ctx, log_text = self._run_with_fake_search(self._floor_envelope(0.0200, fusion="vector-only"))
+        self.assertIn("chain nine-two-oh-two", ctx)
+        self.assertIn("fb_hits=2", log_text)
+        self.assertNotIn("fb_floor_dropped", log_text)
 
     def test_silent_for_an_existing_file(self):
         target = self.code_root / "Existing.swift"

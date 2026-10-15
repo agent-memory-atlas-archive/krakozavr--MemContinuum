@@ -28,7 +28,28 @@
 MC_FB_LABEL_FILE='No recorded decision binds this file. Nearest by search -- may be unrelated:'
 MC_FB_LABEL_PROMPT="Nearest recorded decision by search on this prompt's words -- may be unrelated:"
 
-# mc_fallback_parse PY RC LABEL WANT_ENVELOPE RAW_JSON [EXCLUDE_IDS] [MAX_HITS]
+# MC_FB_SECOND_FLOOR_DEFAULT / mc_fallback_second_floor (TOP-0133 L5, owner-
+# ratified 2026-10-15): the minimum fused-RRF score the SECOND shown hit
+# must reach (the first hit always shows). 0.0314 was measured on a replay
+# of 346 cases (unrelated guesses ~32% -> ~23%, cases with >=1 relevant
+# guess ~90% -> ~86%) and is PROVISIONAL -- tuned on the same data, to be
+# re-checked on fresh data, hence env-tunable. Defined and read ONCE, here;
+# pre-edit-chain.sh and newfile-nudge.sh both call the function.
+# MEMCONTINUUM_FALLBACK_SECOND_FLOOR (documented in docs/INTERNALS.md): a
+# non-negative decimal; 0 disables the floor; anything else (garbage,
+# negative, empty) falls back to the default -- never fails the hook, same
+# policy as MEMCONTINUUM_FALLBACK_MODE.
+MC_FB_SECOND_FLOOR_DEFAULT="0.0314"
+mc_fallback_second_floor() {
+    local _v="${MEMCONTINUUM_FALLBACK_SECOND_FLOOR:-}" _re='^([0-9]+\.?[0-9]*|\.[0-9]+)$'
+    if [ -n "$_v" ] && [[ "$_v" =~ $_re ]]; then
+        printf '%s' "$_v"
+    else
+        printf '%s' "$MC_FB_SECOND_FLOOR_DEFAULT"
+    fi
+}
+
+# mc_fallback_parse PY RC LABEL WANT_ENVELOPE RAW_JSON [EXCLUDE_IDS] [MAX_HITS] [SECOND_FLOOR]
 #
 # Runs the search-fallback result parser (one python process) and sets,
 # as plain (non-local, so the caller reads them back) shell variables:
@@ -51,6 +72,7 @@ MC_FB_LABEL_PROMPT="Nearest recorded decision by search on this prompt's words -
 #                          every hit was in EXCLUDE_IDS), or "no-hits"
 #                          (parsed fine, zero real hits, no state worth
 #                          naming).
+#   FB_FLOOR_DROPPED    -- id of the hit the SECOND_FLOOR dropped, else "".
 #
 # RC is the exit code of the search subprocess that produced RAW_JSON
 # (its stdout, possibly empty). Runs even when RAW_JSON is empty -- a
@@ -71,9 +93,25 @@ MC_FB_LABEL_PROMPT="Nearest recorded decision by search on this prompt's words -
 # the 5-arg form's own unbounded behavior (pre-edit-chain.sh/
 # newfile-nudge.sh's own `--limit 2` already bounds the search call
 # itself, so neither existing caller has ever needed this).
+#
+# SECOND_FLOOR (TOP-0133 L5, optional 8th arg): the first surviving hit
+# always shows; the second surviving hit (after EXCLUDE_IDS) is dropped --
+# and nothing after it is considered -- unless its "score" is a number >=
+# SECOND_FLOOR (a missing/non-numeric score counts as below). The dropped
+# id lands in FB_FLOOR_DROPPED for the caller to log; it is NOT in FB_IDS/
+# FB_HITS_FOR_STATE, so it is never recorded as surfaced. The floor is an
+# RRF value, so it applies ONLY when the search envelope proves the scores
+# are fused RRF: a dict with fusion == "rrf" and neither `embedding` nor
+# `dimension_mismatch_rows` present (memidx.py cmd_search: those keys mean
+# the vector channel was missing/partial, so "rrf" is a single-channel
+# score on a different scale). A bare list (fts/vector mode), fusion ==
+# "vector-only" (cosine) or any other envelope shows hits exactly as
+# before. Omitted/empty/0/non-numeric = no floor, byte-identical to the
+# 7-arg form (see test_mc_fallback_parse_five_arg_form_unchanged).
 mc_fallback_parse() {
     local _py="$1" _rc="$2" _label="$3" _want_envelope="$4" _raw="$5"
-    local _exclude_ids="${6:-}" _max_hits="${7:-}"
+    local _exclude_ids="${6:-}" _max_hits="${7:-}" _second_floor="${8:-}"
+    FB_FLOOR_DROPPED=""
     FB_HITS=""
     FB_IDS=""
     FB_TEXT=""
@@ -84,14 +122,16 @@ mc_fallback_parse() {
     export MC_FB_WANT_ENVELOPE="$_want_envelope"
     export MC_FB_EXCLUDE_IDS="$_exclude_ids"
     export MC_FB_MAX_HITS="$_max_hits"
+    export MC_FB_SECOND_FLOOR="$_second_floor"
     {
         IFS= read -r -d '' FB_HITS
         IFS= read -r -d '' FB_IDS
         IFS= read -r -d '' FB_TEXT
         IFS= read -r -d '' FB_HITS_FOR_STATE
         IFS= read -r -d '' FB_REASON
+        IFS= read -r -d '' FB_FLOOR_DROPPED
     } < <(printf '%s' "$_raw" | PYTHONPATH= "$_py" -c '
-import json, os, sys
+import json, math, os, sys
 
 rc = int(os.environ.get("MC_FB_RC", "1") or "1")
 want_envelope = os.environ.get("MC_FB_WANT_ENVELOPE", "0") == "1"
@@ -100,6 +140,10 @@ try:
     max_hits = int(os.environ.get("MC_FB_MAX_HITS", "") or "0")
 except ValueError:
     max_hits = 0
+try:
+    second_floor = float(os.environ.get("MC_FB_SECOND_FLOOR", "") or "0")
+except ValueError:
+    second_floor = 0.0
 raw = sys.stdin.read()
 
 d = None
@@ -133,6 +177,16 @@ chain_texts = []
 ids = []
 for_state = []
 any_excluded = False
+# TOP-0133 L5: the floor is an RRF value -- apply it only when the
+# envelope proves the scores are fused RRF (see the header above).
+floor_on = (
+    second_floor > 0
+    and isinstance(d, dict)
+    and d.get("fusion") == "rrf"
+    and not d.get("embedding")
+    and not d.get("dimension_mismatch_rows")
+)
+floor_dropped = ""
 for h in hits:
     if not isinstance(h, dict):
         continue
@@ -143,6 +197,16 @@ for h in hits:
     if hid in exclude_ids:
         any_excluded = True
         continue
+    if floor_on and len(chain_texts) == 1:
+        sc = h.get("score")
+        if (
+            isinstance(sc, bool)
+            or not isinstance(sc, (int, float))
+            or not math.isfinite(sc)
+            or sc < second_floor
+        ):
+            floor_dropped = hid
+            break
     ids.append(hid)
     chain_texts.append(ct)
     for_state.append({"id": hid, "title": str(h.get("title", "") or "")})
@@ -158,7 +222,7 @@ if not chain_texts and not reason:
         reason = "no-hits"
 
 if not chain_texts:
-    fields = ("0", "", "", "", reason)
+    fields = ("0", "", "", "", reason, "")
 else:
     text = label + "\n\n" + "\n\n".join(chain_texts)
     if want_envelope:
@@ -168,7 +232,7 @@ else:
                 "additionalContext": text,
             }
         })
-    fields = (str(len(chain_texts)), ",".join(ids), text, json.dumps(for_state), "")
+    fields = (str(len(chain_texts)), ",".join(ids), text, json.dumps(for_state), "", floor_dropped)
 
 for field in fields:
     sys.stdout.write(field.replace(chr(0), ""))
