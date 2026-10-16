@@ -739,6 +739,14 @@ class TestInternalsDocumentsPreEditTopicsLogging(unittest.TestCase):
             "0.2.0rc5 must sit above the already-released rc4 section",
         )
 
+    def test_changelog_has_a_0_3_0_heading_above_0_2_0(self):
+        text = CHANGELOG.read_text()
+        self.assertIn("## [0.3.0] —", text)
+        self.assertLess(
+            text.index("## [0.3.0] —"), text.index("## [0.2.0] —"),
+            "0.3.0 must sit above the already-released 0.2.0 section",
+        )
+
     def test_changelog_rc5_section_mentions_topics_logging(self):
         text = CHANGELOG.read_text()
         rc5_idx = text.index("## [0.2.0rc5]")
