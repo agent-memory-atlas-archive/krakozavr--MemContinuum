@@ -59,14 +59,16 @@ Until then the session-start digest reports itself as skipped.
 - The new-file hook now queries the same remapped path the edit hook does,
   so a file written inside a worktree is searched on its real project path,
   not on the worktree's directory name. A strip-prefix containing `*`, `?` or
-  `[` is matched literally.
+  `[` is matched literally, never expanded against directories on disk.
 - The second hit now has to earn its place. A hit after the first is shown
   only if its fused (RRF) score is at least `MEMCONTINUUM_FALLBACK_SECOND_FLOOR`
   (default 0.0314, a provisional value due a re-check on fresh data); `0`
   disables the floor, and an unparseable or negative value falls back to the
   default. The floor applies only when the search proves RRF scores: it stays
-  off when the vector channel was missing or partial, and a run where one
-  channel returned nothing always hides the second hit. A dropped hit is
+  off when the vector channel was missing or partial. With the default floor,
+  a run where one channel returned nothing always hides the second hit
+  (single-channel scores cannot reach it); with `0` or a floor of 0.0161 or
+  less it is shown. A dropped hit is
   logged as `floor_dropped=<id>` (`fb_floor_dropped=<id>` on the new-file
   hook's line) and is not remembered as shown.
 - `MEMCONTINUUM_FALLBACK_MODE` (`hybrid`, `vector`, `fts`) overrides the
@@ -93,17 +95,18 @@ Until then the session-start digest reports itself as skipped.
   count towards that. The search is full-text only, and a topic already shown
   this session is never repeated. A prompt that is redelivered after an
   interrupted run never yields a second topic.
-- Messages that are not typed by you are never searched: subagent reports,
+- Machine-delivered messages are skipped, not searched: subagent reports,
   background-task notifications, cross-session messages, and harness framing
-  are recognised by their opening marker and skipped (`reason=non-user`).
+  are recognised by a fixed list of opening markers (`reason=non-user`). A
+  message whose framing the list does not know is treated as a typed prompt.
 - With the channel off, the prompt hook still never reads the prompt text.
   `memidx.py stats` gains a `prompt_query` block.
 
 ### Search ranking
 - Hybrid search now steps aside to vector-only ranking when the full-text
   channel's top hit shares almost no vocabulary with the query (content-term
-  coverage below 0.25). Previously noise from the full-text side could be
-  fused into an otherwise accurate vector ranking. `--mode fts` and
+  coverage below 0.25), so noise from the full-text side is not fused into an
+  otherwise accurate vector ranking. `--mode fts` and
   `--mode vector` are unchanged.
 - `memidx.py search --json` now says what happened on every hybrid search:
   `"fusion": "rrf"` or `"vector-only"`, and a step-aside prints a one-line
@@ -119,11 +122,11 @@ Until then the session-start digest reports itself as skipped.
   already recorded is refused as `link inserted out of order`.
 - A file under `topics/`, `incidents/`, or `investigations/` whose first line
   is not `---`, or whose frontmatter has no closing `---`, is now a lint
-  error. It used to parse silently as an empty note, with no schema check and
-  no append-only protection.
+  error, since without the fence the file would parse as an empty note with no
+  schema check and no append-only protection.
 - The store's `pre-commit` hook now also runs the plain schema check and
-  blocks the commit on any error (warnings pass). Previously it ran only the
-  append-only comparison, which cannot see a brand-new malformed file.
+  blocks the commit on any error (warnings pass), which catches a brand-new
+  malformed file that the append-only comparison alone cannot see.
 - Cited commits and `file:line` citations are verified when `memlint.py` is
   given `--code-root`. A citation that resolves to something wrong (the
   commit exists but its quoted subject differs, or the file has fewer lines
@@ -131,18 +134,20 @@ Until then the session-start digest reports itself as skipped.
   because it may cite another repository; an absolute-path citation is an
   error. `--strict-citations` promotes the unresolved warnings to errors, for
   a store that cites only the wired repository.
-- Two checks are now enforced for new links only, so records written before
-  them do not block commits: the allowed `kind` vocabulary, and the rule
-  that an `owner-verbatim` ruling is not a question. Under `--against-ref` a
-  violating new link is an error; in a plain run, and for links recorded
-  earlier, it is a warning until a later ruling supersedes the link.
+- Two checks judge new links only, so records written before them do not
+  block commits: the allowed `kind` vocabulary, and the rule that an
+  `owner-verbatim` ruling is not a question. Under `--against-ref` a
+  violating new link is an error; in a plain run it is a warning. An unknown
+  `kind` keeps warning whatever the link's status; the question-form warning
+  applies only while the link is `active` or `provisional`, so superseding
+  such a link clears it.
 
 ### Hooks
 - `hook.log` is now rotated with bounded retention. Once a session starts
   with the file over `MEMCONTINUUM_LOG_MAX_BYTES` (default 5242880 bytes), it
   becomes `hook.log.1`, older files shift up, and nothing beyond
-  `hook.log.$MEMCONTINUUM_LOG_KEEP` (default 12) is kept. Before this, only
-  one rotated file was kept, so a second rotation destroyed the first. Lowering `MEMCONTINUUM_LOG_KEEP` takes effect on the next
+  `hook.log.$MEMCONTINUUM_LOG_KEEP` (default 12) is kept, so a collection window
+  survives more than one rotation. Lowering `MEMCONTINUUM_LOG_KEEP` takes effect on the next
   rotation. A rotation interrupted by the session-start watchdog is
   recovered on the next one. `memidx.py stats` reads every retained file, so
   a `--days` window that spans rotations still sees all of it.
@@ -155,11 +160,11 @@ Until then the session-start digest reports itself as skipped.
   nothing.
 
 ### Documentation
-- The README describes the search fallback and the session-start standing
-  digest, and lists `memidx.py standing` in the command reference.
-  `docs/SCHEMA.md` documents `standing:`, the citation checks, and the
-  byte-level append-only rules; `docs/INTERNALS.md` documents every channel,
-  log key, and default above.
+- The README describes the search fallback, the opt-in prompt-derived
+  search, and the session-start standing digest, and lists `memidx.py
+  standing` in the command reference. The schema and internals documents
+  cover `standing:`, the citation checks, the byte-level append-only rules,
+  and every channel, log key, and default above.
 
 ## [0.2.0] — 2026-09-15
 

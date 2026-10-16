@@ -98,8 +98,9 @@ turns it on and `=0` forces it off). Once on, the prompt hook searches the
 store on the prompt's own words and hands over at most one nearest decision
 per prompt, labelled as a guess, never a match, and never one already shown
 in that session. A prompt with fewer than four content words searches
-nothing. The prompt text itself is never stored, logged or passed on: only
-the search terms and the ids of what came back are recorded.
+nothing. The prompt text itself is never stored or logged: it is read in
+process only to derive the search terms, and only those terms and the ids of
+what came back are recorded.
 
 A third channel needs no edit and no nudge at all. A handful of rulings hold
 for the whole project, always — marked standing on their own topic — and are
