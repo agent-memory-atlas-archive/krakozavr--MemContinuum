@@ -88,8 +88,18 @@ itself; a person or agent still decides whether it actually applies.
 The same idea runs in the other direction. When files have been edited under no
 decision topic at all, or when the conversation has moved on for a while right
 after real edits, the session gets **nudged** that something here might be worth
-writing down. Neither trigger reads what you typed. If a nudge fired just before
+writing down. Neither of these two nudges reads what you typed. If a nudge fired just before
 a compaction, it survives into the session on the other side.
+
+One further search channel does read your prompt, and it is off by default. A
+project opts in by listing its name, one per line, in
+`$MEMCONTINUUM_HOME/prompt-query.projects` (`MEMCONTINUUM_PROMPT_QUERY=1`
+turns it on and `=0` forces it off). Once on, the prompt hook searches the
+store on the prompt's own words and hands over at most one nearest decision
+per prompt, labelled as a guess, never a match, and never one already shown
+in that session. A prompt with fewer than four content words searches
+nothing. The prompt text itself is never stored, logged or passed on: only
+the search terms and the ids of what came back are recorded.
 
 A third channel needs no edit and no nudge at all. A handful of rulings hold
 for the whole project, always — marked standing on their own topic — and are
