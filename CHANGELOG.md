@@ -1,5 +1,166 @@
 # Changelog
 
+## [0.3.0] — 2026-10-15
+
+Upgrading: the decision index schema generation moves from 5 to 6 (it now
+stores which links are standing). A wired project's index is not migrated by
+the hooks that only read it, so run one `memidx.py reindex --root STORE
+--project NAME` per project after updating, or let
+`memcontinuum-update.sh --apply` do it (see "Standing decisions" below).
+Until then the session-start digest reports itself as skipped.
+
+### Standing decisions
+- A topic can now name which of its own links are true of the whole project,
+  always, with an optional `standing:` list in its frontmatter. Membership is
+  exactly that list: never inferred from a topic's area, its authority, or
+  whether it has `code_refs`.
+- Every session now starts with those rulings, unprompted, before any edit:
+  `sessionstart-remind.sh` injects a short digest of citations (each ruling's
+  own sentence, never a summary or rationale). A session that resumes with an
+  unchanged digest is not told twice; after a `clear` or a compaction it is
+  delivered again because the context is gone.
+- `memidx.py standing [--root DIR] [--json]` prints the same digest by hand.
+  It reads the index only, opens it strictly read-only, and refuses (rather
+  than serving something possibly out of date) when the index is not
+  current, including an index written by a newer engine than the one asked.
+  It also refuses rather than truncates when the set is over the cap.
+- The set is capped store-wide at 24 links or 4,800 bytes of the complete
+  digest, whichever is reached first. `memlint.py` rejects a store over the
+  cap, a `standing:` entry that points at a missing, non-active, or
+  non-owner-authority link, and a standing ruling whose text contains a raw
+  line break.
+- A topic already delivered in the digest is not repeated by the
+  prompt-derived search guess later in the same session.
+- The generation bump is not self-healing, so it is now surfaced:
+  `memcontinuum-update.sh` reports `index: upgrade-required` for every wired
+  project whose index is behind, and `--apply` reindexes it. An index that is
+  ahead of the running engine is reported but never touched. The session
+  start also tells the agent once, in one line, when it had to skip the
+  digest for this reason.
+
+### Search fallback
+- When an edit lands on a file no decision is bound to, the pre-edit hook now
+  searches the store on the path's own words and hands the agent the nearest
+  decisions, labelled plainly as a guess ("may be unrelated"), never as a
+  match. A brand-new file gets the same guess appended to its existing
+  reminder. Nothing is bound by it; the agent still decides whether it
+  applies.
+- The search is read-only: it opens the index strictly read-only, never
+  migrates a schema to answer a guess, and a schema gap refuses by name.
+  `memidx.py search` gains `--read-only`, `--hydrate` (include each hit's
+  rendered chain), `--hydrate-max-bytes`, and `--decisions-only`.
+- Caps keep it small: at most two hits, and each hit's chain is limited to
+  `MEMCONTINUUM_FALLBACK_MAX_BYTES` (default 2000 bytes), with older links
+  replaced by an explicit "omitted" marker. The path query is at most 12
+  words. A path under the store itself is skipped.
+- Results are decision records only (topics, their links, incidents,
+  investigations): the store README, source records, inbox drops, and
+  concepts are never offered as a guess.
+- The new-file hook now queries the same remapped path the edit hook does,
+  so a file written inside a worktree is searched on its real project path,
+  not on the worktree's directory name. A strip-prefix containing `*`, `?` or
+  `[` is matched literally.
+- The second hit now has to earn its place. A hit after the first is shown
+  only if its fused (RRF) score is at least `MEMCONTINUUM_FALLBACK_SECOND_FLOOR`
+  (default 0.0314, a provisional value due a re-check on fresh data); `0`
+  disables the floor, and an unparseable or negative value falls back to the
+  default. The floor applies only when the search proves RRF scores: it stays
+  off when the vector channel was missing or partial, and a run where one
+  channel returned nothing always hides the second hit. A dropped hit is
+  logged as `floor_dropped=<id>` (`fb_floor_dropped=<id>` on the new-file
+  hook's line) and is not remembered as shown.
+- `MEMCONTINUUM_FALLBACK_MODE` (`hybrid`, `vector`, `fts`) overrides the
+  search mode; the default stays `hybrid`.
+- New `hook.log` outcomes: `search-fallback` (hits, ids, mode, query,
+  timing) and `search-fallback-empty` (with a `reason=`). A search killed by
+  the watchdog is recorded with `fb_started=1`. `memidx.py stats` reports all
+  of it in a new `fallback` block, including timing percentiles.
+
+### Prompt-derived queries
+- An opt-in channel on the prompt hook can search the store on the words of
+  your own prompt and hand over at most one nearest decision per prompt,
+  labelled as a guess. It is off by default and is switched on one project at
+  a time: a line with the project's name in `prompt-query.projects` under
+  `MEMCONTINUUM_HOME`, or `MEMCONTINUUM_PROMPT_QUERY=1`. `MEMCONTINUUM_PROMPT_QUERY=0`
+  forces it off and wins over everything else.
+- The prompt text is never stored. It is tokenized in the one process that
+  reads the payload and only the derived terms leave it; the raw text is
+  never written to a file, session state, or `hook.log`. The log carries the
+  terms (`q=`) only. A secret pasted into an opted-in project's prompt can
+  therefore leave a fragment in `q=`.
+- A prompt with fewer than four content words does not search at all, and
+  conversational filler ("please", "explain", "need" and the like) does not
+  count towards that. The search is full-text only, and a topic already shown
+  this session is never repeated. A prompt that is redelivered after an
+  interrupted run never yields a second topic.
+- Messages that are not typed by you are never searched: subagent reports,
+  background-task notifications, cross-session messages, and harness framing
+  are recognised by their opening marker and skipped (`reason=non-user`).
+- With the channel off, the prompt hook still never reads the prompt text.
+  `memidx.py stats` gains a `prompt_query` block.
+
+### Search ranking
+- Hybrid search now steps aside to vector-only ranking when the full-text
+  channel's top hit shares almost no vocabulary with the query (content-term
+  coverage below 0.25). Previously noise from the full-text side could be
+  fused into an otherwise accurate vector ranking. `--mode fts` and
+  `--mode vector` are unchanged.
+- `memidx.py search --json` now says what happened on every hybrid search:
+  `"fusion": "rrf"` or `"vector-only"`, and a step-aside prints a one-line
+  note on stderr naming the measured coverage.
+
+### Store integrity
+- The append-only check now freezes a recorded link's exact bytes, not only
+  its parsed fields. A link rewritten through a YAML dumper, which can keep
+  every field while changing quoting, key order, or wrapping, is refused
+  as `link reformatted, not appended`. A link's valid lifecycle move is still
+  judged by the field rules alone.
+- Newest-first order is enforced: a new link inserted below one that was
+  already recorded is refused as `link inserted out of order`.
+- A file under `topics/`, `incidents/`, or `investigations/` whose first line
+  is not `---`, or whose frontmatter has no closing `---`, is now a lint
+  error. It used to parse silently as an empty note, with no schema check and
+  no append-only protection.
+- The store's `pre-commit` hook now also runs the plain schema check and
+  blocks the commit on any error (warnings pass). Previously it ran only the
+  append-only comparison, which cannot see a brand-new malformed file.
+- Cited commits and `file:line` citations are verified when `memlint.py` is
+  given `--code-root`. A citation that resolves to something wrong (the
+  commit exists but its quoted subject differs, or the file has fewer lines
+  than cited) is an error; one that resolves to nothing is a warning,
+  because it may cite another repository; an absolute-path citation is an
+  error. `--strict-citations` promotes the unresolved warnings to errors, for
+  a store that cites only the wired repository.
+- Two checks are now enforced for new links only, so records written before
+  them do not block commits: the allowed `kind` vocabulary, and the rule
+  that an `owner-verbatim` ruling is not a question. Under `--against-ref` a
+  violating new link is an error; in a plain run, and for links recorded
+  earlier, it is a warning until a later ruling supersedes the link.
+
+### Hooks
+- `hook.log` is now rotated with bounded retention. Once a session starts
+  with the file over `MEMCONTINUUM_LOG_MAX_BYTES` (default 5242880 bytes), it
+  becomes `hook.log.1`, older files shift up, and nothing beyond
+  `hook.log.$MEMCONTINUUM_LOG_KEEP` (default 12) is kept. Before this, only
+  one rotated file was kept, so a second rotation destroyed the first. Lowering `MEMCONTINUUM_LOG_KEEP` takes effect on the next
+  rotation. A rotation interrupted by the session-start watchdog is
+  recovered on the next one. `memidx.py stats` reads every retained file, so
+  a `--days` window that spans rotations still sees all of it.
+
+### Benchmark
+- The retrieval benchmark gains 12 long exact-term queries (a literal anchor
+  term inside a 12-20 word agent-shaped question) and reports how often
+  hybrid's step-aside fired on them and whether it helped or hurt
+  (`hybrid_stepaside` in `--json` output). It measures the risk and gates
+  nothing.
+
+### Documentation
+- The README describes the search fallback and the session-start standing
+  digest, and lists `memidx.py standing` in the command reference.
+  `docs/SCHEMA.md` documents `standing:`, the citation checks, and the
+  byte-level append-only rules; `docs/INTERNALS.md` documents every channel,
+  log key, and default above.
+
 ## [0.2.0] — 2026-09-15
 
 ### Tests
