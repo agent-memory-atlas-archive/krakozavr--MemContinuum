@@ -873,6 +873,26 @@ class TestQueryLib(unittest.TestCase):
             self._tokens("src/core/scan/unbound.py"),
         )
 
+    def test_source_path_strip_prefix_glob_characters_are_literal(self):
+        """A strip-prefix containing `*` must be compared literally: it must
+        not pathname-expand against sibling directories on disk and strip
+        a path that merely matches the expanded name."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "foo").mkdir()
+            (Path(tmp) / "foXo").mkdir()
+            path = f"{tmp}/foo/src/widgetthing.py"
+            # The literal prefix "<tmp>/fo*o" does not begin this path.
+            self.assertEqual(
+                self._source_path(path, "", f"{tmp}/fo*o"), path,
+            )
+            # And a literal `*` directory is still stripped literally.
+            (Path(tmp) / "fo*o").mkdir()
+            lit = f"{tmp}/fo*o/src/widgetthing.py"
+            self.assertEqual(
+                self._source_path(lit, "", f"{tmp}/fo*o"), "src/widgetthing.py",
+            )
+
     def test_source_path_prefers_cwd_relative(self):
         self.assertEqual(
             self._source_path("/repo/src/core/scan/unbound.py", "/repo", ""),

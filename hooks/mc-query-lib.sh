@@ -98,9 +98,12 @@ mc_query_source_path() {
         fi
     fi
     if [ -n "$prefixes" ]; then
-        local _mc_qsp_prefix
-        local IFS=':'
-        for _mc_qsp_prefix in $prefixes; do
+        # Split with `read -a`, the same way mc-path-lib.sh and
+        # pre-edit-chain.sh do: an unquoted `for ... in $prefixes` would
+        # pathname-expand a prefix containing `*`, `?` or `[`.
+        local _mc_qsp_prefix _mc_qsp_parts
+        IFS=: read -r -a _mc_qsp_parts <<< "$prefixes"
+        for _mc_qsp_prefix in "${_mc_qsp_parts[@]}"; do
             [ -z "$_mc_qsp_prefix" ] && continue
             stripped="${path#"$_mc_qsp_prefix"}"
             if [ "$stripped" != "$path" ]; then
