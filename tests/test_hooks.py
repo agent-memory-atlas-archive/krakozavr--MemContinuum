@@ -3527,7 +3527,7 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
         sub = self.backup / self.PROJECT
         bundles = sorted(sub.glob(f"{self.PROJECT}-[0-9]*-[0-9]*.bundle"))
         self.assertEqual(len(bundles), 1, list(sub.iterdir()))
-        self.assertEqual(list(sub.glob("*.part")), [])
+        self.assertEqual(list(sub.glob("*.part*")), [])
         _git(["bundle", "verify", str(bundles[0])], cwd=self.store)
         head = _git(["rev-parse", "HEAD"], cwd=self.store).stdout.strip()
         heads = _git(["bundle", "list-heads", str(bundles[0])], cwd=self.store).stdout
@@ -3593,7 +3593,7 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
         proc = self._good_commit(self._env(MEMCONTINUUM_BACKUP_DIR=str(self.backup)))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("backup=ok-manifest-refused", self._last_postcommit_line())
-        self.assertEqual(list(sub.glob("*.part")), [])
+        self.assertEqual(list(sub.glob("*.part*")), [])
         self.assertEqual(len(list(sub.glob("*.bundle"))), 1)
 
     def _minute_names(self):
@@ -3644,12 +3644,17 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
         sentinel = self.tmp / "outside-sentinel"
         sentinel.write_text("untouched")
         for n in self._minute_names():
-            (sub / (n + ".part")).symlink_to(sentinel)
-        proc = self._good_commit(self._env(MEMCONTINUUM_BACKUP_DIR=str(self.backup)))
+            (sub / (n + ".part.777")).symlink_to(sentinel)
+        proc = self._good_commit(self._env(MEMCONTINUUM_BACKUP_DIR=str(self.backup),
+                                           MEMCONTINUUM_BACKUP_PART_SUFFIX="777"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(sentinel.read_text(), "untouched")
+        # The hook `rm -f`s the part first (unlinks the symlink, never follows
+        # it); noclobber then guards only the rm-to-open race window.
         self.assertIn("backup=ok", self._last_postcommit_line())
         self.assertEqual(len(list(sub.glob("*.bundle"))), 1)
+        # only the next-minute plant (never opened by this run) may remain
+        self.assertTrue(all(p.is_symlink() for p in sub.glob("*.part*")))
 
     def _age(self, path, seconds):
         t = time.time() - seconds
@@ -3680,13 +3685,36 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
         self.assertFalse(old.exists())
         self.assertIn("part-swept=1", self._last_postcommit_line())
 
-    def test_part_name_is_unique_per_invocation(self):
+    def _sweep_with_budget(self, raw, maxage):
         sub = self.backup / self.PROJECT
         sub.mkdir()
+        fresh = sub / f"{self.PROJECT}-20200101-0900.bundle.part.4242"
+        fresh.write_text("live")
+        old = sub / f"{self.PROJECT}-20200101-0901.bundle.part.4243"
+        old.write_text("dead")
+        self._age(fresh, maxage - 8)
+        self._age(old, maxage + 15)
+        proc = self._good_commit(self._env(MEMCONTINUUM_BACKUP_DIR=str(self.backup),
+                                           MEMCONTINUUM_POST_COMMIT_BUDGET=raw))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(fresh.exists())
+        self.assertFalse(old.exists())
+        self.assertIn("backup=ok", self._last_postcommit_line())
+        self.assertEqual(len(list(sub.glob(f"{self.PROJECT}-2*-*.bundle"))), 1)
 
-        text = Path(__file__).resolve().parent.parent.joinpath("hooks", "post-commit-reindex.sh").read_text()
-        self.assertIn('part="$final.part.$$"', text)
-        self.assertIn("( set -C; git -C", text)
+    # budget 08 -> 16 s and 010 -> 20 s (decimal, never octal); 120.5 and
+    # empty fall back to 30 -> 60 s.
+    def test_sweep_budget_08(self):
+        self._sweep_with_budget("08", 16)
+
+    def test_sweep_budget_010(self):
+        self._sweep_with_budget("010", 20)
+
+    def test_sweep_budget_fraction(self):
+        self._sweep_with_budget("120.5", 60)
+
+    def test_sweep_budget_empty(self):
+        self._sweep_with_budget("", 60)
 
     def test_directory_at_final_bundle_name_is_refused(self):
         sub = self.backup / self.PROJECT

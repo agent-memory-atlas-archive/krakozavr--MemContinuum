@@ -12,7 +12,8 @@
   folder pointing elsewhere is refused), the bundle just written is never
   pruned, a `--backup-keep` such as `00` or `08` is rejected or normalised
   instead of being read as octal, and a half-written file left by a killed
-  hook is swept at the next run.
+  hook (`<name>.part.<pid>`) is swept by a later run once it is older than twice
+  the hook budget (60 s by default), so a live overlapping hook's file is left alone.
 - The post-commit hook now runs the commit checks again, so a store commit
   made with `git commit --no-verify` that would have been refused prints a
   warning, is logged, and is named at the next session start until a clean

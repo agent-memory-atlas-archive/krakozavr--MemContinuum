@@ -442,9 +442,14 @@ store). The pre-commit hook's working-tree-versus-index gap is inherited.
 directory is configured (environment, then `config.sh`, resolved by the
 config.sh sourcing `mc-watchdog.sh` already does; the installed wrapper is
 deliberately not extended, because `mc_installer_wrapper_shape` requires
-exactly five lines). The directory must pre-exist; `<name>.part` is created
-exclusively (`rm -f`, then noclobber; stdout form `git bundle create -`, so no
-`.lock`; stale `.part.lock` from the older form are swept), verified, and
+exactly five lines). The directory must pre-exist; the bundle is written to
+`<name>.part.<pid>` (unique per run) and the exclusive open IS the write
+(`rm -f`, then `set -C` on the very redirection git's stdout uses: a planted
+symlink is refused, not followed; stdout form `git bundle create -`, so no
+`.lock`). Grammar-checked leftovers (`.part.<digits>`, old `.part`, old
+`.part.lock`) older than twice the budget (default 30 s, so 60 s; the budget is
+normalised by `mc_backup_keep_normalize`, bad value -> 30) are swept, never by
+name order. The part is verified, and
 renamed through `mc_safe_replace` (refuses a symlink or directory destination:
 `failed:dest`; the re-lint marker uses a unique `.new.$$` temp and the same
 rename; `marker=write-failed`); the manifest line and the newest-N prune (by name sort, manual

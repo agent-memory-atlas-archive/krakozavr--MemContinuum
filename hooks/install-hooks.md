@@ -253,7 +253,7 @@ bundle with that name pattern counts, and a future-dated name cannot displace
 the new bundle) and deletes the rest; a failed delete logs
 `backup=ok-prune-failed`. A leftover `<name>.part.<digits>` (or an old `.part`, or a `.part.lock` from installs that ran the earlier named
 `git bundle create` form) from a killed hook is removed at the start of a later run only when its
-modification time is older than twice `MEMCONTINUUM_POST_COMMIT_BUDGET` (default 30, so 120 s); younger
+modification time is older than twice `MEMCONTINUUM_POST_COMMIT_BUDGET` (default 30, so 60 s); younger
 ones may belong to a live overlapping hook (`part-swept=N` is logged only when N>0). For `git commit --amend`, post-commit compares against the amended
 commit's parent, so a link introduced by the amended commit and rewritten in
 the amend reads as an add (pre-commit would have compared against the

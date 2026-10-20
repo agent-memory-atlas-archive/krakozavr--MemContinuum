@@ -64,8 +64,11 @@
 #                     writes it). Never created by this hook: an unmounted
 #                     drive must not silently receive bundles on the root fs.
 #   MEMCONTINUUM_BACKUP_KEEP  how many bundles to keep per store (default 10).
+#   MEMCONTINUUM_BACKUP_PART_SUFFIX  TEST-ONLY: digits used instead of the pid
+#                     in the `<name>.part.<suffix>` temp name (default $$).
 #   MEMCONTINUUM_POST_COMMIT_BUDGET  wall-clock budget in seconds for the
-#                     content pass (default 30). Passed to the shared
+#                     content pass (default 30); the backup sweep reads it
+#                     through mc_backup_keep_normalize. Passed to the shared
 #                     watchdog launcher as MC_WATCHDOG_BUDGET.
 #   MEMCONTINUUM_EMBED_WORKER  set to "0" to disable spawning the
 #                     background embed-worker entirely (tests/CI use this
@@ -435,14 +438,25 @@ mc_post_commit_backup() {
     sub="$real_sub"
     name="$PROJECT-$(date +%Y%m%d-%H%M 2>/dev/null).bundle"
     final="$sub/$name"
-    part="$final.part.$$"
+    # MEMCONTINUUM_BACKUP_PART_SUFFIX is TEST-ONLY (digits; default the pid):
+    # lets a test plant a path this run will open.
+    case "${MEMCONTINUUM_BACKUP_PART_SUFFIX:-}" in
+        ''|*[!0-9]*) psuf="$$" ;;
+        *) psuf="$MEMCONTINUUM_BACKUP_PART_SUFFIX" ;;
+    esac
+    part="$final.part.$psuf"
     # A watchdog SIGKILL skips every trap, so a killed run leaves its temp
     # behind. Sweep only grammar-checked leftovers (<name>.part.<digits>, the
     # old <name>.part, <name>.part.lock) whose mtime is older than twice the
     # watchdog budget: a younger one may belong to a live, overlapping hook.
     # Never by name order.
-    budget="${MEMCONTINUUM_POST_COMMIT_BUDGET:-30}"
-    case "$budget" in ''|*[!0-9]*) budget=30 ;; esac
+    # The budget is normalised exactly like BACKUP_KEEP (leading zeros stripped
+    # textually: 08/010 are octal inside $(( ))); anything else is 30.
+    if mc_backup_keep_normalize "${MEMCONTINUUM_POST_COMMIT_BUDGET:-30}"; then
+        budget="$MC_BACKUP_KEEP_NORM"
+    else
+        budget=30
+    fi
     maxage=$((budget * 2))
     for f in "$sub/$PROJECT"-[0-9]*-[0-9]*.bundle.part "$sub/$PROJECT"-[0-9]*-[0-9]*.bundle.part.*; do
         [ -e "$f" ] || [ -L "$f" ] || continue
