@@ -239,8 +239,11 @@ Layout: `<dir>/<project>/<project>-YYYYMMDD-HHMM.bundle` plus one
 `MANIFEST.txt` line per bundle (`<project> | source=… | HEAD=… | commits=… |
 bundle=… | size=… | sha256=…`). The folder name is the project name verbatim;
 on a case-insensitive drive (drvfs) `IceKEY-OpenRouter` lands in an existing
-`icekey-openrouter` folder. Each bundle is written as `<name>.part`, verified
-with `git bundle verify`, then renamed. A bundle is a snapshot of the refs at
+`icekey-openrouter` folder. Each bundle is written as `<name>.part` (created
+exclusively; a planted symlink there is unlinked, never followed; the bundle
+goes through stdout so git makes no `.lock`), verified with `git bundle
+verify`, then renamed with a refusal (`backup=failed:dest`) when the final name
+is a symlink or a directory. A bundle is a snapshot of the refs at
 commit time (not the reflog, so an `--amend` or reset drops the old commit
 from later bundles); two commits in the same minute share a name and the
 later snapshot replaces the earlier. After a verified rename the hook keeps
@@ -248,9 +251,14 @@ the bundle it just wrote plus at most N-1 others matching
 `<project>-<digits>-<digits>.bundle` (oldest names removed first; a manual
 bundle with that name pattern counts, and a future-dated name cannot displace
 the new bundle) and deletes the rest; a failed delete logs
-`backup=ok-prune-failed`. A `.part` left by a killed hook is removed at the
+`backup=ok-prune-failed`. A `.part` (or a `.part.lock` left by installs that ran the earlier named
+`git bundle create` form) left by a killed hook is removed at the
 start of the next run only if its name sorts before the new run's own
-`.part` (`part-swept=N` is logged only when N>0). Manifest lines are never
+`.part` (`part-swept=N` is logged only when N>0). For `git commit --amend`, post-commit compares against the amended
+commit's parent, so a link introduced by the amended commit and rewritten in
+the amend reads as an add (pre-commit would have compared against the
+replaced commit); links that existed in the parent are still caught. Amending a
+store's root commit is not supported (schema-checked only). Manifest lines are never
 pruned. Any failure logs `backup=failed:<reason>`, removes the `.part`, and
 leaves the exit code and the commit alone.
 

@@ -442,8 +442,12 @@ store). The pre-commit hook's working-tree-versus-index gap is inherited.
 directory is configured (environment, then `config.sh`, resolved by the
 config.sh sourcing `mc-watchdog.sh` already does; the installed wrapper is
 deliberately not extended, because `mc_installer_wrapper_shape` requires
-exactly five lines). The directory must pre-exist; `<name>.part` is verified
-and renamed; the manifest line and the newest-N prune (by name sort, manual
+exactly five lines). The directory must pre-exist; `<name>.part` is created
+exclusively (`rm -f`, then noclobber; stdout form `git bundle create -`, so no
+`.lock`; stale `.part.lock` from the older form are swept), verified, and
+renamed through `mc_safe_replace` (refuses a symlink or directory destination:
+`failed:dest`; the re-lint marker uses a unique `.new.$$` temp and the same
+rename; `marker=write-failed`); the manifest line and the newest-N prune (by name sort, manual
 bundles with the same pattern included) follow a successful rename only.
 Failures are `backup=failed:<reason>` and never touch the exit code. Cost is
 about 0.5s for the bundle on a real store, inside the existing 30s budget,
@@ -459,7 +463,11 @@ project name and backup dir are validated once, before any path is built
 (`relint=skipped:bad-project backup=skipped:bad-project` / `skipped:bad-dir`);
 a symlinked project folder is `backup=failed:bad-project`. A post-commit
 re-lint of an amended ROOT commit is schema-checked only (no `HEAD~1`);
-amending a store's root commit is not a supported case; `repo-init.sh`
+amending a store's root commit is not a supported case; for `--amend`
+post-commit compares against the amended commit's parent, so a link added by
+the amended commit and rewritten in the amend reads as an add (pre-commit
+compared against the replaced commit), while links present in the parent are
+still caught; `repo-init.sh`
 refuses `.` and `..` as `--project`. `--apply` never creates a bundle.
 
 **Logging, per hook.** The seven project-level hooks each write exactly one

@@ -261,6 +261,13 @@ fi
 # committed paths. A root commit (no HEAD~1) gets the schema pass only.
 RELINT="skipped"
 RELINT_MARKER="$MEMCONTINUUM_HOME/$PROJECT.relint-failed"
+# mc_safe_replace SRC DST -- atomic rename that refuses a destination which is
+# a symlink or a directory (mv would move SRC *into* either), and raises on a
+# directory destination (os.replace). Returns non-zero on any refusal.
+mc_safe_replace() {
+    if [ -L "$2" ] || [ -d "$2" ]; then return 1; fi
+    "$PY" -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' "$1" "$2" 2>/dev/null
+}
 mc_post_commit_relint() {
     local memlint="$SCRIPT_DIR/../memlint.py" kind="" summary="" sha short root_phys mroot
     if [ "$MC_NO_WATCHDOG" -eq 1 ]; then
@@ -355,17 +362,24 @@ mc_post_commit_relint() {
         return 0
     fi
     # Write-then-rename: a full disk leaves the old marker, never an empty one.
-    if {
-        printf 'root=%s\n' "$root_phys"
-        printf 'sha=%s\n' "$sha"
-        printf 'date=%s\n' "$(date -Iseconds 2>/dev/null || date)"
-        printf 'failed=%s\n' "$kind"
-        printf 'summary=%s\n' "${summary%;}"
-    } >"$RELINT_MARKER.new" 2>/dev/null \
-            && mv -f "$RELINT_MARKER.new" "$RELINT_MARKER" 2>/dev/null; then
+    # The temp name is unique per process and created exclusively (noclobber),
+    # so a planted symlink is never followed; the rename refuses a symlink or
+    # directory marker path.
+    local mtmp="$RELINT_MARKER.new.$$"
+    rm -f "$mtmp" 2>/dev/null
+    if (
+        set -C
+        {
+            printf 'root=%s\n' "$root_phys"
+            printf 'sha=%s\n' "$sha"
+            printf 'date=%s\n' "$(date -Iseconds 2>/dev/null || date)"
+            printf 'failed=%s\n' "$kind"
+            printf 'summary=%s\n' "${summary%;}"
+        } >"$mtmp"
+    ) 2>/dev/null && mc_safe_replace "$mtmp" "$RELINT_MARKER"; then
         :
     else
-        rm -f "$RELINT_MARKER.new" 2>/dev/null
+        rm -f "$mtmp" 2>/dev/null
         RELINT="failed:$kind marker=write-failed"
     fi
     return 0
@@ -424,9 +438,14 @@ mc_post_commit_backup() {
     # A watchdog SIGKILL skips every trap, so a killed run leaves its .part
     # behind: sweep the ones that sort before this run's own at the start of
     # the next run (and a TERM/exit trap removes this run's own).
-    for f in "$sub/$PROJECT"-[0-9]*-[0-9]*.bundle.part; do
-        [ -e "$f" ] || continue
-        mc_backup_name_ok "$PROJECT" "${f##*/}" .bundle.part || continue
+    # (Also the *.bundle.part.lock files the old named `git bundle create`
+    # form left behind when it was killed.)
+    for f in "$sub/$PROJECT"-[0-9]*-[0-9]*.bundle.part "$sub/$PROJECT"-[0-9]*-[0-9]*.bundle.part.lock; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        case "$f" in
+            *.part.lock) mc_backup_name_ok "$PROJECT" "${f##*/}" .bundle.part.lock || continue ;;
+            *) mc_backup_name_ok "$PROJECT" "${f##*/}" .bundle.part || continue ;;
+        esac
         if [[ "$f" < "$part" ]]; then
             rm -f "$f" 2>/dev/null && swept=$((swept + 1))
         fi
@@ -434,7 +453,15 @@ mc_post_commit_backup() {
     [ "$swept" -gt 0 ] && suffix=" part-swept=$swept"
     MC_PART_NOW="$part"
     trap mc_backup_cleanup_part EXIT
-    if ! git -C "$MEMCONTINUUM_ROOT" bundle create "$part" --all >/dev/null 2>&1; then
+    # Created exclusively: unlink any planted symlink (never its target), then
+    # noclobber-create; the bundle goes to stdout so git makes no .lock file.
+    rm -f "$part" 2>/dev/null
+    if [ -e "$part" ] || [ -L "$part" ]; then BACKUP="failed:part$suffix"; return 0; fi
+    if ! ( set -C; : >"$part" ) 2>/dev/null; then
+        BACKUP="failed:part$suffix"; return 0
+    fi
+    if ! git -C "$MEMCONTINUUM_ROOT" bundle create - --all >"$part" 2>/dev/null \
+            || [ -L "$part" ]; then
         rm -f "$part" 2>/dev/null; BACKUP="failed:bundle-create$suffix"; return 0
     fi
     if ! git -C "$MEMCONTINUUM_ROOT" bundle verify "$part" >/dev/null 2>&1; then
@@ -447,7 +474,10 @@ print(os.path.getsize(p), hashlib.sha256(open(p, "rb").read()).hexdigest())' "$p
         *" "*) ;;
         *) rm -f "$part" 2>/dev/null; BACKUP="failed:hash$suffix"; return 0 ;;
     esac
-    if ! mv -f "$part" "$final" 2>/dev/null; then
+    if [ -L "$final" ] || [ -d "$final" ]; then
+        rm -f "$part" 2>/dev/null; BACKUP="failed:dest$suffix"; return 0
+    fi
+    if ! mc_safe_replace "$part" "$final"; then
         rm -f "$part" 2>/dev/null; BACKUP="failed:rename$suffix"; return 0
     fi
     MC_PART_NOW=""

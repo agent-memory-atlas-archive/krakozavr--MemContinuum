@@ -20,9 +20,13 @@
   that warning; a warning left by another store with the same project name is
   neither cleared nor overwritten (the second store's own finding is then only
   printed and logged, `marker=foreign`); and without the watchdog python
-  neither the re-lint nor the backup runs. A project name or backup directory
-  that could leave its folder (`..`, a slash, a newline) makes the hook skip
-  the re-lint marker and the backup without touching anything.
+  neither the re-lint nor the backup runs. A project name that could leave
+  its folder (`..`, a slash, a newline) makes the hook skip both the re-lint
+  marker and the backup; a bad backup directory skips only the backup, the
+  re-lint still runs. Every file the hook creates (bundle part, marker temp)
+  is created exclusively and never through a planted symlink, and a bundle or
+  marker path that is a symlink or a directory is refused instead of being
+  moved into.
 
 ## [0.3.0] — 2026-10-15
 
