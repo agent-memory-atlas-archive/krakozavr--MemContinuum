@@ -1689,14 +1689,16 @@ post-commit re-lint and backup paragraphs there, and
    Never create then write, and never share a temp name between overlapping
    invocations. `MANIFEST.txt` is the other pattern, for an append-only log:
    `>>` only after checking it is not a symlink or a non-regular file.
-4. **Rename is the only publish step, and it refuses symlink or directory
-   targets.** `mc_safe_replace` in `hooks/post-commit-reindex.sh` refuses a
+4. **A replaced artifact is published by rename, and the rename refuses
+   symlink or directory targets.** `mc_safe_replace` in
+   `hooks/post-commit-reindex.sh` refuses a
    symlink or directory destination, then calls `os.replace`. It does not
    check filesystems: the caller must create the temp file beside its
    destination so the rename stays atomic. No `mv` over a path a user controls.
 5. **Sweep leftovers by age and exact grammar, never by loose glob.** A temp
    file is removed only when it is older than twice the hook's watchdog budget
-   and its name passes `mc_backup_part_ok`; a fresh file from an overlapping
+   (an invalid budget counts as 30 s) and its name passes `mc_backup_part_ok`;
+   a fresh file from an overlapping
    run is never a candidate. Published bundles are different: the prune lists
    them with `mc_backup_bundle_list` (exact `mc_backup_name_ok` grammar, name
    order) and keeps the newest N by that order, with the bundle just written
@@ -1711,10 +1713,11 @@ post-commit re-lint and backup paragraphs there, and
    the append-only pass (`hooks/mc-store-lint.sh`). A crash or a missing
    python is `skipped`, never `ok` and never a finding, but a crash in one
    check does not hide a genuine finding from the other. A sticky marker is
-   cleared only by a genuinely clean run whose recorded root matches.
+   cleared only by a genuinely clean run whose recorded root matches (a marker
+   with no recorded root is cleared too).
 8. **Nothing after the main job may change the exit code**, and each extra
    section logs its own `key=value` on the one `hook.log` line (the post-commit
-   line format is documented in the re-lint and backup paragraphs above).
+   line format is under the per-hook logging list above).
 
 ## bash 3.2 discipline
 
