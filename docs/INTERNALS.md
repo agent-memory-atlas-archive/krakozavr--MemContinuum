@@ -1652,6 +1652,56 @@ a window) raises its own FLAG there.
 Ordinary coreutils (`cat`, `dirname`, `date`, `mkdir`, …) are used freely — what
 is avoided is specifically the two GNU-only binaries macOS lacks.
 
+## Write-safety checklist for hooks and scripts
+
+Every new hook or script that writes outside the store cites this list in its
+brief. Each rule names the code that already implements it; reuse that code
+rather than writing a second copy. Background lives in
+[hooks and the fail-open contract](#hooks-and-the-fail-open-contract), the
+post-commit re-lint and backup paragraphs there, and
+[the watchdog](#the-watchdog); shell portability is in
+[bash 3.2 discipline](#bash-32-discipline).
+
+1. **Validate names before building any path.** A project name or configured
+   directory is checked once, up front (non-empty, no `/`, not `.` or `..`, no
+   newline), before it is joined into any path. A failure logs
+   `skipped:bad-project` or `skipped:bad-dir` and creates nothing. See the
+   validation block at the top of the re-lint/backup section of
+   `hooks/post-commit-reindex.sh`; `scripts/repo-init.sh` refuses `.` and `..`
+   as `--project`; compare paths through `mc_physical` in
+   `scripts/mc-registry-lib.sh` so a symlink cannot alias a protected path.
+2. **A configured root must pre-exist; the hook creates only its own
+   subfolder.** Never `mkdir -p` a user-configured destination: on WSL an
+   unmounted `/mnt/d` would receive the files on the Linux root and the hook
+   would report success.
+3. **Every file is created exclusively, under a per-invocation name, and the
+   exclusive create is the write.** The pattern is
+   `( set -C; cmd > "$final.part.$$" )`. Never create then write, and never
+   share a temp name between overlapping invocations. See the bundle write in
+   `post-commit-reindex.sh` and the re-lint marker's `.new.$$` temp.
+4. **Rename is the only publish step, and it refuses symlink or directory
+   targets.** `mc_safe_replace` in `hooks/post-commit-reindex.sh` does an
+   `os.replace` (same filesystem) after refusing a symlink or directory at the
+   destination. No `mv` over a path a user controls.
+5. **Sweep leftovers by age and exact grammar, never by name order or loose
+   glob.** A temp file is removed only when it is older than twice the hook's
+   watchdog budget and its name passes `mc_backup_part_ok`; a fresh file from
+   an overlapping run is never a candidate. Bundles are pruned through
+   `mc_backup_name_ok` and `mc_backup_bundle_list`, with the file just written
+   excluded explicitly.
+6. **Never `$(( ))` on a value you did not normalise.** A leading zero is octal
+   in bash (`08` crashes, `010` is misread). Keep one normaliser per setting,
+   shared by every reader; `mc_backup_keep_normalize` (hook, setup and updater)
+   is the model.
+7. **A verdict needs a positive signal, not a zero exit.** A lint or engine
+   call is trusted only when its own summary line is present
+   (`MC_LINT_SCHEMA_SUMMARY` in `hooks/mc-store-lint.sh`). A crash or a missing
+   python is `skipped`, never `ok` and never a finding. A sticky marker is
+   cleared only by a genuinely clean run whose recorded root matches.
+8. **Nothing after the main job may change the exit code**, and each extra
+   section logs its own `key=value` on the one `hook.log` line (the post-commit
+   line format is documented in the re-lint and backup paragraphs above).
+
 ## bash 3.2 discipline
 
 Stock macOS ships bash 3.2.57, so every shell script here — hooks, installer,
