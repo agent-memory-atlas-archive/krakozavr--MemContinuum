@@ -1662,41 +1662,55 @@ post-commit re-lint and backup paragraphs there, and
 [the watchdog](#the-watchdog); shell portability is in
 [bash 3.2 discipline](#bash-32-discipline).
 
-1. **Validate names before building any path.** A project name or configured
-   directory is checked once, up front (non-empty, no `/`, not `.` or `..`, no
-   newline), before it is joined into any path. A failure logs
-   `skipped:bad-project` or `skipped:bad-dir` and creates nothing. See the
-   validation block at the top of the re-lint/backup section of
-   `hooks/post-commit-reindex.sh`; `scripts/repo-init.sh` refuses `.` and `..`
-   as `--project`; compare paths through `mc_physical` in
-   `scripts/mc-registry-lib.sh` so a symlink cannot alias a protected path.
+1. **Validate names before building any path.** The two values that become
+   path segments are checked once, in the validation block of
+   `hooks/post-commit-reindex.sh` (before the reindex, ahead of any
+   project-derived path), not inside each section.
+   - Project name: empty, `.`, `..`, a `/` or a control character is
+     `PATH_UNSAFE`; the hook logs `skipped:bad-project` and exits having built
+     no project-derived path. A name outside `[A-Za-z0-9._-]` is `BAD_PROJECT`
+     only: the reindex still runs, the re-lint marker and backup are skipped.
+     `scripts/repo-init.sh` refuses `.` and `..` as `--project`.
+   - Backup directory: empty means off; it must be absolute, and a control
+     character is `BAD_DIR`. Only the backup section is skipped
+     (`skipped:bad-dir`).
+
+   Compare paths through `mc_physical` (`scripts/mc-registry-lib.sh`) so a
+   symlink cannot alias a protected path; the backup uses it to contain
+   `<dir>/<project>` inside the real backup directory.
 2. **A configured root must pre-exist; the hook creates only its own
    subfolder.** Never `mkdir -p` a user-configured destination: on WSL an
    unmounted `/mnt/d` would receive the files on the Linux root and the hook
-   would report success.
-3. **Every file is created exclusively, under a per-invocation name, and the
-   exclusive create is the write.** The pattern is
-   `( set -C; cmd > "$final.part.$$" )`. Never create then write, and never
-   share a temp name between overlapping invocations. See the bundle write in
-   `post-commit-reindex.sh` and the re-lint marker's `.new.$$` temp.
+   would report success. A missing directory logs `skipped:dir-missing`.
+3. **Published files are created exclusively, under a per-invocation name, and
+   the exclusive create is the write.** This covers the bundle
+   (`<name>.part.<pid>`) and the re-lint marker (`.new.$$`): any stale file of
+   that name is `rm -f`'d, then `( set -C; cmd > "$part" )` creates it.
+   Never create then write, and never share a temp name between overlapping
+   invocations. `MANIFEST.txt` is the other pattern, for an append-only log:
+   `>>` only after checking it is not a symlink or a non-regular file.
 4. **Rename is the only publish step, and it refuses symlink or directory
-   targets.** `mc_safe_replace` in `hooks/post-commit-reindex.sh` does an
-   `os.replace` (same filesystem) after refusing a symlink or directory at the
-   destination. No `mv` over a path a user controls.
-5. **Sweep leftovers by age and exact grammar, never by name order or loose
-   glob.** A temp file is removed only when it is older than twice the hook's
-   watchdog budget and its name passes `mc_backup_part_ok`; a fresh file from
-   an overlapping run is never a candidate. Bundles are pruned through
-   `mc_backup_name_ok` and `mc_backup_bundle_list`, with the file just written
+   targets.** `mc_safe_replace` in `hooks/post-commit-reindex.sh` refuses a
+   symlink or directory destination, then calls `os.replace`. It does not
+   check filesystems: the caller must create the temp file beside its
+   destination so the rename stays atomic. No `mv` over a path a user controls.
+5. **Sweep leftovers by age and exact grammar, never by loose glob.** A temp
+   file is removed only when it is older than twice the hook's watchdog budget
+   and its name passes `mc_backup_part_ok`; a fresh file from an overlapping
+   run is never a candidate. Published bundles are different: the prune lists
+   them with `mc_backup_bundle_list` (exact `mc_backup_name_ok` grammar, name
+   order) and keeps the newest N by that order, with the bundle just written
    excluded explicitly.
 6. **Never `$(( ))` on a value you did not normalise.** A leading zero is octal
    in bash (`08` crashes, `010` is misread). Keep one normaliser per setting,
    shared by every reader; `mc_backup_keep_normalize` (hook, setup and updater)
    is the model.
-7. **A verdict needs a positive signal, not a zero exit.** A lint or engine
-   call is trusted only when its own summary line is present
-   (`MC_LINT_SCHEMA_SUMMARY` in `hooks/mc-store-lint.sh`). A crash or a missing
-   python is `skipped`, never `ok` and never a finding. A sticky marker is
+7. **A verdict needs a positive signal, not a zero exit.** Each lint check is
+   trusted only when its own marker is present: `MC_LINT_SCHEMA_SUMMARY` for
+   the schema pass, the append-only `changed=` count (`MC_LINT_CHANGED`) for
+   the append-only pass (`hooks/mc-store-lint.sh`). A crash or a missing
+   python is `skipped`, never `ok` and never a finding, but a crash in one
+   check does not hide a genuine finding from the other. A sticky marker is
    cleared only by a genuinely clean run whose recorded root matches.
 8. **Nothing after the main job may change the exit code**, and each extra
    section logs its own `key=value` on the one `hook.log` line (the post-commit
