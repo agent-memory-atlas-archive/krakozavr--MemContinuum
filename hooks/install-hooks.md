@@ -181,6 +181,52 @@ the marker, and the worker loops again rather than declaring victory early).
 See docs/INTERNALS.md's watchdog and embedding-lifecycle sections for the
 full contract, including the crash/retry behavior.
 
+#### Post-commit re-lint
+
+`git commit --no-verify` skips `pre-commit` but never `post-commit`, so after
+the reindex this hook runs the same two checks `pre-commit` runs (the schema
+pass, and the append-only comparison of `HEAD~1` against the index; a root
+commit gets the schema pass only). The checks live in one sourced file,
+`hooks/mc-store-lint.sh`, shared by both hooks. A finding never blocks — the
+commit already exists. Instead the hook prints `MemContinuum: commit <sha> in
+store <project> skipped the commit checks and would have been refused:` and
+memlint's output on stderr, logs `relint=failed:schema|append-only|both`, and
+writes `$MEMCONTINUUM_HOME/<project>.relint-failed` (sha, date, summary). The
+next session start names the marker in one line; the next clean commit
+removes it. An engine crash is `relint=skipped:engine-failure`, never a
+finding. The `pre-commit` hook's documented gaps (the schema pass reads the
+working tree, not the index) are inherited unchanged.
+
+#### Store backup bundle
+
+Off unless a backup directory is configured. Settings, environment first, then
+`$MEMCONTINUUM_HOME/config.sh` (which `memcontinuum-setup.sh --backup-dir DIR
+--backup-keep N` writes, and keeps on later runs without the flags). They are
+deliberately not exported by the installed wrapper:
+
+- `MEMCONTINUUM_BACKUP_DIR` — an absolute directory that **already exists**.
+  The hook never creates it (on WSL an unmounted `/mnt/d` would otherwise
+  silently receive bundles on the Linux root); a missing directory logs
+  `backup=skipped:dir-missing`.
+- `MEMCONTINUUM_BACKUP_KEEP` — bundles to keep per store (default 10).
+
+Layout: `<dir>/<project>/<project>-YYYYMMDD-HHMM.bundle` plus one
+`MANIFEST.txt` line per bundle (`<project> | source=… | HEAD=… | commits=… |
+bundle=… | size=… | sha256=…`). The folder name is the project name verbatim;
+on a case-insensitive drive (drvfs) `IceKEY-OpenRouter` lands in an existing
+`icekey-openrouter` folder. Each bundle is written as `<name>.part`, verified
+with `git bundle verify`, then renamed; two commits in the same minute
+overwrite, and the later bundle is a superset because it is made with
+`--all`. After a verified rename the hook keeps the newest N files matching
+`<project>-<digits>-<digits>.bundle` (by name; a manual bundle with that name
+pattern counts toward N) and deletes the rest. Manifest lines are never
+pruned. Any failure logs `backup=failed:<reason>`, removes the `.part`, and
+leaves the exit code and the commit alone.
+
+Restore: `git clone <dir>/<project>/<file>.bundle <new-store-path>`.
+
+The hook's single log line gains `relint=… backup=…` after `embed=…`.
+
 ### 3b. `pre-commit-append-only.sh` — the store's `pre-commit`
 
 Enforces the append-only invariant docs/SCHEMA.md section 7 describes —

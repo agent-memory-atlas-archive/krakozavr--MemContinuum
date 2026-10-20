@@ -81,6 +81,10 @@ MEMLINT="$SCRIPT_DIR/../memlint.py"
 
 # shellcheck source=mc-watchdog.sh
 source "${MC_WATCHDOG_LIB_PATH:-$SCRIPT_DIR/mc-watchdog.sh}" 2>/dev/null
+# The two memlint checks and their verdict parsing, shared with the
+# post-commit re-lint (hooks/post-commit-reindex.sh).
+# shellcheck source=mc-store-lint.sh
+source "$SCRIPT_DIR/mc-store-lint.sh"
 # Deliberately never invoking the re-exec/guard block mc-watchdog.sh also
 # defines (see header above) -- sourcing it only for the
 # MEMCONTINUUM_HOME/config.sh resolution and MC_GUARD_PY it computes as a
@@ -158,21 +162,16 @@ fi
 # SCHEMA_RC=1 blocks the commit only when that marker is actually present;
 # a 1 with no marker (a crash) is logged and falls through fail-open, the
 # same as any other infrastructure problem this hook already tolerates.
-SCHEMA_OUT="$(PYTHONPATH= "$PY" "$MEMLINT" "$MEMCONTINUUM_ROOT" 2>&1)"
-SCHEMA_RC=$?
+mc_store_lint_schema "$PY" "$MEMLINT" "$MEMCONTINUUM_ROOT"
 SCHEMA_NOTE="schema=ok"
-if [ "$SCHEMA_RC" -eq 1 ]; then
-    case "$SCHEMA_OUT" in
-        *"memlint: "*" error(s)"*)
-            echo "$SCHEMA_OUT" >&2
-            log_line "schema-rc=1 project=$PROJECT"
-            exit 1
-            ;;
-    esac
-    SCHEMA_NOTE="schema=skipped-engine-failure"
-elif [ "$SCHEMA_RC" -ne 0 ]; then
-    SCHEMA_NOTE="schema=skipped-engine-failure"
-fi
+case "$MC_LINT_SCHEMA" in
+    fail)
+        echo "$MC_LINT_SCHEMA_OUT" >&2
+        log_line "schema-rc=1 project=$PROJECT"
+        exit 1
+        ;;
+    engine-failure) SCHEMA_NOTE="schema=skipped-engine-failure" ;;
+esac
 # NIT (re-gate): the schema outcome above, when it does NOT block, folds
 # into the ONE log line this invocation ends with below (the append-only
 # verdict, or the engine-failure fallback) rather than writing its own
@@ -180,58 +179,22 @@ fi
 # while the hook keeps working, followed by a second line, previously
 # disagreed with what actually happened.
 
-OUT="$(PYTHONPATH= "$PY" "$MEMLINT" --against-ref HEAD --staged "$MEMCONTINUUM_ROOT" 2>&1)"
-RC=$?
-
-# memlint's own append-only summary line (its last line, on both a clean
-# run and a refusal) carries "changed=N" -- only trust RC as a real
-# append-only verdict when that line is actually present. Anything else
-# (an unexpected engine crash, RC=2 from memlint's own git/ref resolution
-# failure -- which the unborn-HEAD check above means should never reach
-# here for THIS hook's own invocation, but memlint is still exercised
-# directly by other callers -- or any other shape with no summary line at
-# all) fails OPEN: an infrastructure problem must never read as "your
-# commit rewrites history".
-CHANGED=""
-case "$OUT" in
-    *"changed="*)
-        TAIL="${OUT##*changed=}"
-        CHANGED="${TAIL%% *}"
+# The verdict parsing (marker trust: `changed=` must be present, else an
+# engine failure that fails OPEN) lives in hooks/mc-store-lint.sh.
+mc_store_lint_append_only "$PY" "$MEMLINT" "$MEMCONTINUUM_ROOT" HEAD
+case "$MC_LINT_APPEND" in
+    ok)
+        log_line "rc=0 changed=$MC_LINT_CHANGED notes=$MC_LINT_NOTES $SCHEMA_NOTE project=$PROJECT"
+        exit 0
+        ;;
+    fail)
+        echo "$MC_LINT_APPEND_OUT" >&2
+        log_line "rc=1 changed=$MC_LINT_CHANGED notes=$MC_LINT_NOTES $SCHEMA_NOTE project=$PROJECT"
+        exit 1
         ;;
 esac
-case "$CHANGED" in
-    ''|*[!0-9]*) CHANGED="" ;;
-esac
-
-# Grok/Opus gate finding (MAJOR): `notes=N` is memlint's own count of
-# structural-extraction bail-outs (byte layer inconclusive for a link) --
-# parsed the same way as `changed=` above and always logged alongside it,
-# so a NOTE never again reaches nobody just because rc=0 never echoed
-# $OUT anywhere. Missing/unparseable is logged as "?" rather than dropped
-# silently, the same way a missing CHANGED falls through to the
-# engine-failure branch below instead of a bare "changed=" log line.
-NOTES=""
-case "$OUT" in
-    *"notes="*)
-        NOTES_TAIL="${OUT##*notes=}"
-        NOTES="${NOTES_TAIL%% *}"
-        ;;
-esac
-case "$NOTES" in
-    ''|*[!0-9]*) NOTES="?" ;;
-esac
-
-if [ "$RC" -eq 0 ] && [ -n "$CHANGED" ]; then
-    log_line "rc=0 changed=$CHANGED notes=$NOTES $SCHEMA_NOTE project=$PROJECT"
-    exit 0
-fi
-if [ "$RC" -eq 1 ] && [ -n "$CHANGED" ]; then
-    echo "$OUT" >&2
-    log_line "rc=1 changed=$CHANGED notes=$NOTES $SCHEMA_NOTE project=$PROJECT"
-    exit 1
-fi
 
 # Anything else (RC=2, a crash, no recognizable summary line at all) is an
 # ENGINE failure, not a history edit -- fail open.
-log_line "skipped=engine-failure rc=$RC $SCHEMA_NOTE project=$PROJECT"
+log_line "skipped=engine-failure rc=$MC_LINT_APPEND_RC $SCHEMA_NOTE project=$PROJECT"
 exit 0

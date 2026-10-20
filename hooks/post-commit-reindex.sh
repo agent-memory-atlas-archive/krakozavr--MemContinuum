@@ -26,6 +26,20 @@
 #      embed-worker --help` and docs/INTERNALS.md's watchdog/embedding-
 #      lifecycle sections for the full lock/marker/crash contract.
 #
+# After the reindex pass, the same guarded child does two more things, in
+# this order (each section is unable to change the exit code, and the hook
+# still writes ONE hook.log line, now carrying `relint=... backup=...`):
+#   3. RE-LINT. `git commit --no-verify` skips pre-commit but not
+#      post-commit, so the two checks pre-commit-append-only.sh runs (schema;
+#      append-only against the parent) run again here via the shared
+#      hooks/mc-store-lint.sh. A finding never blocks (the commit exists):
+#      it prints a banner on stderr, logs `relint=failed:<kind>` and leaves a
+#      sticky `$MEMCONTINUUM_HOME/<project>.relint-failed` marker that
+#      sessionstart-remind.sh surfaces; the next clean run removes it.
+#   4. BACKUP. When MEMCONTINUUM_BACKUP_DIR is set, `git bundle create --all`
+#      into `<dir>/<project>/`, verified, with a MANIFEST.txt line, pruned to
+#      the newest MEMCONTINUUM_BACKUP_KEEP. See hooks/install-hooks.md.
+#
 # Env (same names/defaults as pre-edit-chain.sh):
 #   MEMCONTINUUM_ROOT     the store's markdown root to reindex. Required --
 #                     unlike the pre-edit hook, this one DOES pass it to
@@ -43,6 +57,13 @@
 #                     $MEMCONTINUUM_HOME/config.sh (if it sets MEMCONTINUUM_PYTHON),
 #                     then <engine>/.venv/bin/python (scripts/repo-init.sh
 #                     --bootstrap-venv) when unset.
+#   MEMCONTINUUM_BACKUP_DIR   absolute, ALREADY EXISTING directory for store
+#                     backup bundles; unset/empty = backups off. Environment
+#                     first, then $MEMCONTINUUM_HOME/config.sh (sourced by
+#                     mc-watchdog.sh above; memcontinuum-setup.sh --backup-dir
+#                     writes it). Never created by this hook: an unmounted
+#                     drive must not silently receive bundles on the root fs.
+#   MEMCONTINUUM_BACKUP_KEEP  how many bundles to keep per store (default 10).
 #   MEMCONTINUUM_POST_COMMIT_BUDGET  wall-clock budget in seconds for the
 #                     content pass (default 30). Passed to the shared
 #                     watchdog launcher as MC_WATCHDOG_BUDGET.
@@ -82,6 +103,9 @@ if [ -z "${MC_UNDER_TIMEOUT:-}" ]; then
         exit 0
     fi
 fi
+
+# shellcheck source=mc-store-lint.sh
+source "$SCRIPT_DIR/mc-store-lint.sh" 2>/dev/null
 
 # From here on: the guarded child. MEMCONTINUUM_HOME is already resolved
 # and exported by mc-watchdog.sh above.
@@ -187,8 +211,132 @@ subprocess.Popen(
     fi
 fi
 
-printf '%s post-commit-reindex: rc=%s elapsed=%ss project=%s root=%s embed=%s :: %s\n' \
-    "$(date -Iseconds 2>/dev/null || date)" "$RC" "$ELAPSED" "$PROJECT" "$MEMCONTINUUM_ROOT" "$EMBED_STATE" "$OUT" >>"$LOG" 2>/dev/null || true
+# --- 3. post-commit re-lint (INC-0128) --------------------------------------
+# Same two checks as pre-commit-append-only.sh, through the same shared
+# functions (hooks/mc-store-lint.sh), so a `--no-verify` commit of a bad
+# record is still named. Never blocks and never changes the exit code. The
+# pre-commit hook's documented gaps are inherited unchanged: the schema pass
+# reads the working tree, not the index. HEAD~1 vs the index is HEAD vs
+# HEAD~1 here, because after a commit the index equals HEAD for the
+# committed paths. A root commit (no HEAD~1) gets the schema pass only.
+RELINT="skipped"
+RELINT_MARKER="$MEMCONTINUUM_HOME/$PROJECT.relint-failed"
+mc_post_commit_relint() {
+    local memlint="$SCRIPT_DIR/../memlint.py" kind="" summary="" sha short
+    if [ ! -x "$PY" ] || ! type mc_store_lint_schema >/dev/null 2>&1; then
+        RELINT="skipped:no-python"
+        return 0
+    fi
+    mc_store_lint_schema "$PY" "$memlint" "$MEMCONTINUUM_ROOT"
+    local append="ok" append_out=""
+    if git -C "$MEMCONTINUUM_ROOT" rev-parse --verify -q HEAD~1 >/dev/null 2>&1; then
+        mc_store_lint_append_only "$PY" "$memlint" "$MEMCONTINUUM_ROOT" HEAD~1
+        append="$MC_LINT_APPEND"
+        append_out="$MC_LINT_APPEND_OUT"
+    fi
+    if [ "$MC_LINT_SCHEMA" = "engine-failure" ] || [ "$append" = "engine-failure" ]; then
+        # An engine crash is never a finding -- unless the other check
+        # already produced a real one, which is still worth saying.
+        if [ "$MC_LINT_SCHEMA" != "fail" ] && [ "$append" != "fail" ]; then
+            RELINT="skipped:engine-failure"
+            rm -f "$RELINT_MARKER" 2>/dev/null
+            return 0
+        fi
+    fi
+    if [ "$MC_LINT_SCHEMA" = "fail" ] && [ "$append" = "fail" ]; then
+        kind="both"
+    elif [ "$MC_LINT_SCHEMA" = "fail" ]; then
+        kind="schema"
+    elif [ "$append" = "fail" ]; then
+        kind="append-only"
+    fi
+    if [ -z "$kind" ]; then
+        RELINT="ok"
+        rm -f "$RELINT_MARKER" 2>/dev/null
+        return 0
+    fi
+    RELINT="failed:$kind"
+    sha="$(git -C "$MEMCONTINUUM_ROOT" rev-parse HEAD 2>/dev/null)"
+    short="$(git -C "$MEMCONTINUUM_ROOT" rev-parse --short HEAD 2>/dev/null)"
+    {
+        printf 'MemContinuum: commit %s in store %s skipped the commit checks and would have been refused:\n' "$short" "$PROJECT"
+        [ "$MC_LINT_SCHEMA" = "fail" ] && printf '%s\n' "$MC_LINT_SCHEMA_OUT"
+        [ "$append" = "fail" ] && printf '%s\n' "$append_out"
+    } >&2
+    summary="$( { [ "$MC_LINT_SCHEMA" = "fail" ] && printf '%s\n' "$MC_LINT_SCHEMA_OUT"
+                  [ "$append" = "fail" ] && printf '%s\n' "$append_out"; } | grep '^memlint: ' | tr '\n' ';' )"
+    {
+        printf 'sha=%s\n' "$sha"
+        printf 'date=%s\n' "$(date -Iseconds 2>/dev/null || date)"
+        printf 'failed=%s\n' "$kind"
+        printf 'summary=%s\n' "${summary%;}"
+    } >"$RELINT_MARKER" 2>/dev/null
+    return 0
+}
+mc_post_commit_relint || RELINT="skipped:error"
+
+# --- 4. store backup bundle ---------------------------------------------------
+# Off unless MEMCONTINUUM_BACKUP_DIR is set (env, else config.sh). The dir
+# must already exist; only the per-store subfolder is created. Written as
+# <name>.part, verified, then renamed over the final name (two commits in
+# one minute overwrite; the later bundle is a superset because of --all).
+# Any failure -> backup=failed:<reason>, the .part removed, exit code untouched.
+BACKUP="off"
+mc_post_commit_backup() {
+    local dir="${MEMCONTINUUM_BACKUP_DIR:-}" keep="${MEMCONTINUUM_BACKUP_KEEP:-10}"
+    local sub name part final head commits stat count excess i f
+    [ -n "$dir" ] || { BACKUP="off"; return 0; }
+    case "$keep" in ''|*[!0-9]*|0) keep=10 ;; esac
+    if [ ! -d "$dir" ]; then BACKUP="skipped:dir-missing"; return 0; fi
+    sub="$dir/$PROJECT"
+    mkdir -p "$sub" 2>/dev/null || { BACKUP="failed:mkdir"; return 0; }
+    name="$PROJECT-$(date +%Y%m%d-%H%M 2>/dev/null).bundle"
+    part="$sub/$name.part"
+    final="$sub/$name"
+    if ! git -C "$MEMCONTINUUM_ROOT" bundle create "$part" --all >/dev/null 2>&1; then
+        rm -f "$part" 2>/dev/null; BACKUP="failed:bundle-create"; return 0
+    fi
+    if ! git -C "$MEMCONTINUUM_ROOT" bundle verify "$part" >/dev/null 2>&1; then
+        rm -f "$part" 2>/dev/null; BACKUP="failed:verify"; return 0
+    fi
+    stat="$("$PY" -c 'import hashlib, os, sys
+p = sys.argv[1]
+print(os.path.getsize(p), hashlib.sha256(open(p, "rb").read()).hexdigest())' "$part" 2>/dev/null)"
+    case "$stat" in
+        *" "*) ;;
+        *) rm -f "$part" 2>/dev/null; BACKUP="failed:hash"; return 0 ;;
+    esac
+    if ! mv -f "$part" "$final" 2>/dev/null; then
+        rm -f "$part" 2>/dev/null; BACKUP="failed:rename"; return 0
+    fi
+    head="$(git -C "$MEMCONTINUUM_ROOT" rev-parse HEAD 2>/dev/null)"
+    commits="$(git -C "$MEMCONTINUUM_ROOT" rev-list --count HEAD 2>/dev/null)"
+    printf '%s | source=%s | HEAD=%s | commits=%s | bundle=%s | size=%s | sha256=%s\n' \
+        "$PROJECT" "$MEMCONTINUUM_ROOT" "$head" "$commits" "$name" "${stat%% *}" "${stat#* }" \
+        >>"$sub/MANIFEST.txt" 2>/dev/null || { BACKUP="failed:manifest"; return 0; }
+    # Prune after a verified rename only: keep the newest $keep files named
+    # <project>-<digits>-<digits>.bundle (name sort; manual bundles with the
+    # same pattern count). MANIFEST lines are never pruned.
+    count=0
+    for f in "$sub/$PROJECT"-[0-9]*-[0-9]*.bundle; do
+        [ -e "$f" ] && count=$((count + 1))
+    done
+    excess=$((count - keep))
+    i=0
+    if [ "$excess" -gt 0 ]; then
+        for f in "$sub/$PROJECT"-[0-9]*-[0-9]*.bundle; do
+            [ -e "$f" ] || continue
+            i=$((i + 1))
+            [ "$i" -le "$excess" ] && rm -f "$f" 2>/dev/null
+        done
+    fi
+    BACKUP="ok"
+    return 0
+}
+mc_post_commit_backup || BACKUP="failed:error"
+
+printf '%s post-commit-reindex: rc=%s elapsed=%ss project=%s root=%s embed=%s relint=%s backup=%s :: %s\n' \
+    "$(date -Iseconds 2>/dev/null || date)" "$RC" "$ELAPSED" "$PROJECT" "$MEMCONTINUUM_ROOT" "$EMBED_STATE" "$RELINT" "$BACKUP" "$OUT" >>"$LOG" 2>/dev/null || true
 
 # A commit should never be blocked by a reindex failure.
 exit 0

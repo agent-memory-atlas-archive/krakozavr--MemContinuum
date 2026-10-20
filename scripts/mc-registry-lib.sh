@@ -1283,6 +1283,77 @@ mc_resolve_home() {
     return 0
 }
 
+# mc_config_read_var CONFIG_FILE NAME
+#
+# Prints the value NAME has in a config.sh AS IT STANDS ON DISK (empty when
+# the file or the name is absent), ignoring the calling environment: NAME is
+# unset inside the subshell first, for the same reason as
+# mc_config_managed_python (config.sh writes its lines conditionally so an
+# env override wins at hook time; a disk read must not see that override).
+# Used for the store-backup settings by memcontinuum-setup.sh (preserve the
+# recorded values on a re-run without the flags) and memcontinuum-update.sh.
+mc_config_read_var() {
+    local config="${1:-}" name="${2:-}"
+    [ -n "$config" ] && [ -n "$name" ] && [ -f "$config" ] || return 0
+    (
+        unset "$name"
+        # shellcheck source=/dev/null
+        . "$config" >/dev/null 2>&1
+        eval "printf '%s' \"\${$name:-}\""
+    )
+}
+
+# mc_backup_settings [CONFIG_FILE]
+#
+# Sets MC_BACKUP_DIR and MC_BACKUP_KEEP the way hooks/post-commit-reindex.sh
+# resolves them: the environment first, then CONFIG_FILE (default
+# $MEMCONTINUUM_HOME/config.sh). MC_BACKUP_DIR is empty when backups are off;
+# MC_BACKUP_KEEP falls back to 10 on a missing or non-numeric value.
+mc_backup_settings() {
+    local config="${1:-${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}/config.sh}"
+    MC_BACKUP_DIR="${MEMCONTINUUM_BACKUP_DIR:-}"
+    MC_BACKUP_KEEP="${MEMCONTINUUM_BACKUP_KEEP:-}"
+    [ -n "$MC_BACKUP_DIR" ] || MC_BACKUP_DIR="$(mc_config_read_var "$config" MEMCONTINUUM_BACKUP_DIR)"
+    [ -n "$MC_BACKUP_KEEP" ] || MC_BACKUP_KEEP="$(mc_config_read_var "$config" MEMCONTINUUM_BACKUP_KEEP)"
+    case "$MC_BACKUP_KEEP" in ''|*[!0-9]*|0) MC_BACKUP_KEEP=10 ;; esac
+    return 0
+}
+
+# mc_backup_state STORE PROJECT
+#
+# Sets MC_BACKUP_STATE for the updater's `backup` column (needs
+# mc_backup_settings first):
+#   off         no backup directory configured
+#   unreadable  directory configured but missing or unreadable
+#   none        directory present, no bundle for this store in it
+#   current     the newest bundle's HEAD equals the store's HEAD
+#   behind      otherwise (or the newest bundle cannot be read)
+# "Newest" is by name sort over <PROJECT>-<digits>-<digits>.bundle, the same
+# pattern the hook prunes by.
+mc_backup_state() {
+    local store="$1" project="$2" sub newest="" f heads bundle_head store_head
+    MC_BACKUP_STATE="off"
+    [ -n "${MC_BACKUP_DIR:-}" ] || return 0
+    if [ ! -d "$MC_BACKUP_DIR" ] || [ ! -r "$MC_BACKUP_DIR" ]; then
+        MC_BACKUP_STATE="unreadable"
+        return 0
+    fi
+    sub="$MC_BACKUP_DIR/$project"
+    for f in "$sub/$project"-[0-9]*-[0-9]*.bundle; do
+        [ -e "$f" ] && newest="$f"
+    done
+    if [ -z "$newest" ]; then
+        MC_BACKUP_STATE="none"
+        return 0
+    fi
+    MC_BACKUP_STATE="behind"
+    heads="$(git bundle list-heads "$newest" HEAD 2>/dev/null)" || return 0
+    bundle_head="${heads%% *}"
+    store_head="$(git -C "$store" rev-parse HEAD 2>/dev/null)" || return 0
+    [ -n "$bundle_head" ] && [ "$bundle_head" = "$store_head" ] && MC_BACKUP_STATE="current"
+    return 0
+}
+
 # mc_config_managed_python CONFIG_FILE
 #
 # Read MEMCONTINUUM_PYTHON and MEMCONTINUUM_VENV_MANAGED off a config.sh AS

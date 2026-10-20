@@ -20,7 +20,8 @@
 #
 # Usage:
 #   memcontinuum-setup.sh [--venv DIR] [--python PATH] [--claude-dir DIR]
-#                [--no-model-warm] [--dry-run] [--uninstall]
+#                [--no-model-warm] [--backup-dir DIR] [--backup-keep N]
+#                [--dry-run] [--uninstall]
 #
 #   --venv DIR        where to create the venv. Default <checkout>/.venv, which
 #                     is also the path every hook falls back to on its own.
@@ -28,6 +29,12 @@
 #                     must already have requirements.txt installed.
 #   --claude-dir DIR  user-level Claude Code directory. Default ~/.claude.
 #   --no-model-warm   skip the one-time embedding-model download.
+#   --backup-dir DIR  turn on store backup bundles: after every store commit
+#                     the post-commit hook writes a verified git bundle to
+#                     DIR/<project>/ (DIR must already exist). An empty value
+#                     turns it off. Recorded in config.sh; a later run without
+#                     the flag keeps the recorded value.
+#   --backup-keep N   how many bundles to keep per store (default 10).
 #   --dry-run         print the plan, write nothing.
 #   --uninstall       remove the user-level hook, the skill, and this
 #                     machine's config. Never touches a venv, a store, any
@@ -86,6 +93,12 @@ UNINSTALL=0
 # interactive setup menu, which is skipped whenever either was given.
 PYTHON_EXPLICIT=0
 VENV_EXPLICIT=0
+# Store-backup settings. *_GIVEN distinguishes "flag passed (possibly empty =
+# turn off)" from "flag absent" -- absent keeps whatever config.sh records.
+BACKUP_DIR=""
+BACKUP_KEEP=""
+BACKUP_DIR_GIVEN=0
+BACKUP_KEEP_GIVEN=0
 
 # scan to the explicit end marker above rather than a hardcoded line count --
 # a hardcoded `sed -n '2,Np'` silently truncates or overruns usage() every
@@ -105,6 +118,8 @@ while [ $# -gt 0 ]; do
         --python) need_value "$@"; PYTHON_BIN="$2"; PYTHON_EXPLICIT=1; shift 2 ;;
         --claude-dir) need_value "$@"; CLAUDE_DIR="$2"; shift 2 ;;
         --no-model-warm) MODEL_WARM=0; shift ;;
+        --backup-dir) need_value "$@"; BACKUP_DIR="$2"; BACKUP_DIR_GIVEN=1; shift 2 ;;
+        --backup-keep) need_value "$@"; BACKUP_KEEP="$2"; BACKUP_KEEP_GIVEN=1; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
         -h|--help) usage 0 ;;
@@ -429,6 +444,43 @@ if [ "$DRY_RUN" -eq 0 ]; then
     Q_HOME="$(sh_quote "$MEMCONTINUUM_HOME")"
     Q_CLAUDE_DIR="$(sh_quote "$CLAUDE_DIR")"
     Q_VENV_MANAGED="$(sh_quote "$NEW_VENV_MANAGED")"
+    # Store backup settings: the heredoc below regenerates the whole file, so
+    # without the flags the values already recorded must be carried over
+    # (read off the disk copy, not the environment). Unset = no lines.
+    # mc_config_read_var is in scripts/mc-registry-lib.sh, which this script
+    # already requires above (mc_config_managed_python).
+    if [ "$BACKUP_DIR_GIVEN" -eq 0 ]; then
+        BACKUP_DIR="$(mc_config_read_var "$CONFIG" MEMCONTINUUM_BACKUP_DIR)"
+    fi
+    if [ "$BACKUP_KEEP_GIVEN" -eq 0 ]; then
+        BACKUP_KEEP="$(mc_config_read_var "$CONFIG" MEMCONTINUUM_BACKUP_KEEP)"
+    fi
+    case "$BACKUP_DIR" in
+        ''|/*) ;;
+        *) die "--backup-dir must be an absolute path (got: $BACKUP_DIR)" ;;
+    esac
+    case "$BACKUP_DIR" in
+        *"$MC_NL"*) die "backup dir path contains a newline -- unsupported" ;;
+    esac
+    case "$BACKUP_KEEP" in
+        ''|*[!0-9]*) [ -z "$BACKUP_KEEP" ] || die "--backup-keep must be a positive integer (got: $BACKUP_KEEP)" ;;
+        0) die "--backup-keep must be a positive integer (got: 0)" ;;
+    esac
+    BACKUP_CONF="# Store backup bundles: not configured (memcontinuum-setup.sh --backup-dir DIR turns them on)."
+    if [ -n "$BACKUP_DIR" ] || [ -n "$BACKUP_KEEP" ]; then
+        BACKUP_CONF="# Store backup bundles, written by hooks/post-commit-reindex.sh after each store
+# commit into \$MEMCONTINUUM_BACKUP_DIR/<project>/ (the dir must already exist;
+# the hook never creates it). Environment wins over these lines."
+        if [ -n "$BACKUP_DIR" ]; then
+            BACKUP_CONF="$BACKUP_CONF
+if [ -z \"\${MEMCONTINUUM_BACKUP_DIR:-}\" ]; then MEMCONTINUUM_BACKUP_DIR=$(sh_quote "$BACKUP_DIR"); fi"
+            [ -d "$BACKUP_DIR" ] || printf 'WARNING: backup dir %s does not exist yet -- the hook skips backups until it does\n' "$BACKUP_DIR" >&2
+        fi
+        if [ -n "$BACKUP_KEEP" ]; then
+            BACKUP_CONF="$BACKUP_CONF
+if [ -z \"\${MEMCONTINUUM_BACKUP_KEEP:-}\" ]; then MEMCONTINUUM_BACKUP_KEEP=$(sh_quote "$BACKUP_KEEP"); fi"
+        fi
+    fi
     # Machine backup rule: never overwrite a config a previous setup wrote
     # without keeping a copy.
     [ -f "$CONFIG" ] && cp "$CONFIG" "$CONFIG.bak-memcontinuum"
@@ -452,6 +504,7 @@ MEMCONTINUUM_MACHINE_CLAUDE_DIR=$Q_CLAUDE_DIR
 # python this setup was told to use as-is and must never pip-install into
 # (0). See this file's own determination above.
 MEMCONTINUUM_VENV_MANAGED=$Q_VENV_MANAGED
+$BACKUP_CONF
 CONF
     if [ "$IS_CUSTOM_HOME" -eq 1 ]; then
         mkdir -p "$DEFAULT_MEMCONTINUUM_HOME" || die "cannot create $DEFAULT_MEMCONTINUUM_HOME"

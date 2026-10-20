@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+- Every store commit can now write a verified `git bundle` backup of the
+  store: set `memcontinuum-setup.sh --backup-dir DIR [--backup-keep N]` and
+  the post-commit hook keeps the newest N bundles per store in `DIR/<project>/`
+  with a manifest line each. `memcontinuum-update.sh` shows the setting on the
+  machine line and each store's state (off, none, current, behind) in a new
+  `backup` column.
+- The post-commit hook now runs the commit checks again, so a store commit
+  made with `git commit --no-verify` that would have been refused prints a
+  warning, is logged, and is named at the next session start until a clean
+  commit follows.
+
 ## [0.3.0] — 2026-10-15
 
 Upgrading: the decision index schema generation moves from 5 to 6 (it now

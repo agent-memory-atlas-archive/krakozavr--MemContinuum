@@ -15,7 +15,7 @@
 # compares what was rendered there against the engine checkout right now.
 #
 # No flags (or --dry-run, the default): prints a table and writes nothing.
-#   repo | claude-dir | stamped | engine | store-match | rules | skill | store-hooks | action
+#   repo | claude-dir | stamped | engine | store-match | rules | skill | store-hooks | backup | action
 #     repo         the registry row's key (an origin remote URL, or a path)
 #     claude-dir   one claude-dir this row lists (or recovers -- see below)
 #     stamped      the MEMCONTINUUM_RENDERED value on this claude-dir's
@@ -50,6 +50,15 @@
 #                  says: these are not looked at, not that they cannot go
 #                  stale (a README's baked python/engine/code-root recipe
 #                  can, and a user pasting a stale one would care).
+#     backup       off/none/current/behind/unreadable -- the store's backup
+#                  bundles (hooks/post-commit-reindex.sh, memcontinuum-setup.sh
+#                  --backup-dir): off = no backup directory configured (env,
+#                  else config.sh); unreadable = configured but missing;
+#                  none = no bundle for this store in it; current = the
+#                  newest bundle's HEAD equals the store's HEAD; behind =
+#                  otherwise. Informational only; --apply never creates a
+#                  bundle (the commit hook does). The machine line below the
+#                  table repeats the configured directory and keep count.
 #     action       ok | stale | store-mismatch | store-form-stale |
 #                  store-form-updated | rules-stale | rules-missing |
 #                  rules-foreign | skill-foreign | migrate |
@@ -1165,7 +1174,7 @@ mc_note_replace_field() {
 
 TABLE_HEADER_PRINTED=0
 print_row() {
-    # print_row REPO CLAUDE_DIR STAMPED STORE_MATCH RULES SKILL STORE_HOOKS ACTION
+    # print_row REPO CLAUDE_DIR STAMPED STORE_MATCH RULES SKILL STORE_HOOKS BACKUP ACTION
     #
     # store-hooks (I2, updater-coverage workstream): ok/stale/missing/
     # foreign/not-checked for STORE's git post-commit and pre-commit
@@ -1174,10 +1183,10 @@ print_row() {
     # human scans, and rules/skill already establish the one-column-per-
     # artifact-class precedent this follows rather than doubling.
     if [ "$TABLE_HEADER_PRINTED" -eq 0 ]; then
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "repo" "claude-dir" "stamped" "engine" "store-match" "rules" "skill" "store-hooks" "action"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "repo" "claude-dir" "stamped" "engine" "store-match" "rules" "skill" "store-hooks" "backup" "action"
         TABLE_HEADER_PRINTED=1
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$ENGINE_SHA" "$4" "$5" "$6" "$7" "$8"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$ENGINE_SHA" "$4" "$5" "$6" "$7" "$8" "$9"
 }
 
 # --- process_claude_dir: the per-(row, claude-dir) walk + optional apply ---
@@ -1236,6 +1245,14 @@ process_claude_dir() {
     mc_update_rules_state "$claude_dir"
     mc_update_skill_state "$claude_dir"
     mc_update_store_hooks_state
+    # backup column: settings resolved once per run (mc_backup_settings in
+    # scripts/mc-registry-lib.sh, the same env-then-config.sh order the hook
+    # uses), state per store (mc_backup_state, same file).
+    if [ -z "${MC_BACKUP_SETTINGS_DONE:-}" ]; then
+        mc_backup_settings "$MEMCONTINUUM_HOME/config.sh"
+        MC_BACKUP_SETTINGS_DONE=1
+    fi
+    mc_backup_state "$STORE" "$PROJECT"
 
     # store-missing outranks everything, INCLUDING a clean stamp and a
     # store= that still matches what is rendered. A rendered
@@ -1304,7 +1321,7 @@ process_claude_dir() {
         action="ok"
     fi
 
-    print_row "$KEY" "$claude_dir" "$stamp" "$store_match" "$MC_RULES_STATE" "$MC_SKILL_STATE" "$MC_STORE_HOOKS_STATE" "$action"
+    print_row "$KEY" "$claude_dir" "$stamp" "$store_match" "$MC_RULES_STATE" "$MC_SKILL_STATE" "$MC_STORE_HOOKS_STATE" "$MC_BACKUP_STATE" "$action"
 
     # store-form-stale only ever fires with APPLY=0 (see above) -- the
     # hint's remedy is always "re-run with --apply", literally, never
@@ -1755,7 +1772,7 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     NEVER_COMMA="$(printf '%s' "$NEVER_SEMI" | tr ';' ',')"
 
     if [ -z "$PROJECT" ]; then
-        print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unknown" "unknown" "unrecoverable"
+        print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unknown" "unknown" "unknown" "unrecoverable"
         echo "  no project= recorded for $KEY -- re-run memcontinuum-decide.sh wired --repo ... --store ... --project ... to fix" >&2
         # Work left undone is work left undone: --apply promised to end with
         # every walked row correct, and this one was never even resolved to a
@@ -1800,7 +1817,7 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
             case "$KEY" in
                 /*) CLAUDE_DIRS_SEMI="$KEY/.claude" ;;
                 *)
-                    print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unknown" "unknown" "unrecoverable"
+                    print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unknown" "unknown" "unknown" "unrecoverable"
                     echo "  legacy row, no claude-dirs recorded, and the key is a remote URL (not a path) -- this row's claude-dir cannot be recovered automatically. Fix: memcontinuum-decide.sh wired --repo PATH --store $STORE --project $PROJECT --claude-dir DIR [--code-root DIR ...] [--langs LIST]" >&2
                     [ "$APPLY" -eq 1 ] && WALK_RC=1
                     continue
@@ -2164,7 +2181,13 @@ if [ "$MACHINE" -eq 1 ]; then
     [ -f "$MEMCONTINUUM_HOME/config.sh" ] && MACHINE_CONFIG_STATE="present"
 
     echo
-    echo "machine: $MACHINE_CLAUDE_DIR rendered by $MACHINE_STAMP, engine at $MACHINE_ENGINE, skill $MACHINE_SKILL_STATE, config $MACHINE_CONFIG_STATE -- $MACHINE_ACTION"
+    mc_backup_settings "$MEMCONTINUUM_HOME/config.sh"
+    if [ -n "$MC_BACKUP_DIR" ]; then
+        MACHINE_BACKUP="backup: $MC_BACKUP_DIR (keep $MC_BACKUP_KEEP)"
+    else
+        MACHINE_BACKUP="backup: off"
+    fi
+    echo "machine: $MACHINE_CLAUDE_DIR rendered by $MACHINE_STAMP, engine at $MACHINE_ENGINE, skill $MACHINE_SKILL_STATE, config $MACHINE_CONFIG_STATE, $MACHINE_BACKUP -- $MACHINE_ACTION"
 
     if [ "$APPLY" -eq 1 ]; then
         REFRESH_OK=0

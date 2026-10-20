@@ -415,6 +415,37 @@ Budget: this channel runs inside the SAME 2s watchdog every other
 fixture (ext4, fts mode, a real hit): ~0.29s end to end for the whole
 hook run, five-sample average — comfortably inside budget.
 
+**Post-commit re-lint.** `git commit --no-verify` skips `pre-commit`, not
+`post-commit`. After the reindex pass, `post-commit-reindex.sh`
+re-runs the two `pre-commit-append-only.sh` checks through the shared
+`hooks/mc-store-lint.sh` (`mc_store_lint_schema`, `mc_store_lint_append_only`;
+sourced, bash 3.2 safe, they set result variables and never exit), with the
+same marker-trust rule: a verdict counts only with memlint's own summary line
+(`memlint: N error(s)` / `changed=`); an engine crash is
+`relint=skipped:engine-failure`. The only difference is the ref: `HEAD` before
+the commit, `HEAD~1` after it (the index equals `HEAD` for the committed
+paths). A root commit gets the schema pass only. A finding prints a banner on
+stderr, logs `relint=failed:<schema|append-only|both>`, and writes the sticky
+`$MEMCONTINUUM_HOME/<project>.relint-failed` marker that `sessionstart-remind.sh`
+surfaces as one line at startup/resume/clear; a clean run removes it. It can
+not change the exit code, and its cost is the two lints (~0.8s on a 150-file
+store). The pre-commit hook's working-tree-versus-index gap is inherited.
+
+**Store backup bundle.** The same guarded child, after the re-lint, writes a
+`git bundle create --all` into `$MEMCONTINUUM_BACKUP_DIR/<project>/` when that
+directory is configured (environment, then `config.sh`, resolved by the
+config.sh sourcing `mc-watchdog.sh` already does; the installed wrapper is
+deliberately not extended, because `mc_installer_wrapper_shape` requires
+exactly five lines). The directory must pre-exist; `<name>.part` is verified
+and renamed; the manifest line and the newest-N prune (by name sort, manual
+bundles with the same pattern included) follow a successful rename only.
+Failures are `backup=failed:<reason>` and never touch the exit code. Cost is
+about 0.5s for the bundle on a real store, inside the existing 30s budget,
+which is unchanged. `memcontinuum-update.sh` reports it: the machine line
+(`backup: <dir> (keep N)` / `backup: off`) and a per-store `backup` column
+(`mc_backup_state` in `scripts/mc-registry-lib.sh`: off, none, current,
+behind, unreadable). `--apply` never creates a bundle.
+
 **Logging, per hook.** The seven project-level hooks each write exactly one
 `outcome=` line per run to `$MEMCONTINUUM_HOME/hook.log`.
 Diagnostic lines may precede it (`pre-edit-chain.sh` logs a missing-python note
@@ -423,7 +454,7 @@ guarded hook cannot write its own outcome line then — it may be mid-call, or m
 never have reached that code — so `mc-watchdog.sh` writes
 `outcome=watchdog-killed hook=<name>` itself before exiting. The three hooks
 outside that rule are deliberate: `post-commit-reindex.sh` writes its own
-`post-commit-reindex: rc=… elapsed=… project=… root=… embed=pending|clean|skipped`
+`post-commit-reindex: rc=… elapsed=… project=… root=… embed=pending|clean|skipped relint=… backup=…`
 line instead, `pre-commit-append-only.sh` writes its own line, one of
 `pre-commit-append-only: rc=1 changed=<n> project=…` (refused the commit),
 `rc=0 changed=<n> project=…` (clean), or `skipped=<reason> project=…` — an

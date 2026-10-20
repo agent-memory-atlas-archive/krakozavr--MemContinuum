@@ -3437,6 +3437,235 @@ class TestPreCommitAppendOnlyRealCommit(unittest.TestCase):
         self.assertNotEqual(head_before, self._head(store), "--no-verify must let the commit through")
 
 
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestPostCommitRelintAndBackup(unittest.TestCase):
+    """0.4.0: the post-commit hook's re-lint (a `--no-verify` commit of a bad
+    record is still named) and store backup bundle, through real `git commit`
+    runs against throwaway stores and a throwaway MEMCONTINUUM_HOME."""
+
+    PROJECT = "bk-proj"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="memcontinuum-postcommit-bk-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.store = _init_topic_store(self.tmp / "store")
+        self.backup = self.tmp / "backup"
+        self.backup.mkdir()
+        hooks_dir = Path(_git(["rev-parse", "--git-path", "hooks"], cwd=self.store).stdout.strip())
+        if not hooks_dir.is_absolute():
+            hooks_dir = self.store / hooks_dir
+        for name, script in (("post-commit", POST_COMMIT_HOOK), ("pre-commit", PRE_COMMIT_HOOK)):
+            wrapper = hooks_dir / name
+            wrapper.write_text(
+                "#!/usr/bin/env bash\n"
+                f"export MEMCONTINUUM_ROOT={shlex.quote(str(self.store))}\n"
+                f"export MEMCONTINUUM_PROJECT={self.PROJECT}\n"
+                f"export MEMCONTINUUM_PYTHON={shlex.quote(VENV_PYTHON)}\n"
+                f"export MEMCONTINUUM_HOME={shlex.quote(str(self.home))}\n"
+                "export MEMCONTINUUM_EMBED_WORKER=0\n"
+                f'exec "{MC_BASH}" {shlex.quote(str(script))}\n'
+            )
+            wrapper.chmod(0o755)
+
+    def _env(self, **extra):
+        env = clean_env(HOME=str(self.home))
+        for k in list(env):
+            if k.startswith("MEMCONTINUUM_"):
+                del env[k]
+        env.update(extra)
+        return env
+
+    def _commit(self, message, env=None, no_verify=False):
+        args = ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test",
+                "commit", "-q", "-m", message]
+        if no_verify:
+            args.append("--no-verify")
+        return subprocess.run(args, cwd=str(self.store), capture_output=True, text=True,
+                              env=env or self._env(), timeout=60)
+
+    def _good_commit(self, env=None):
+        topic = self.store / "topics" / "foo.md"
+        topic.write_text(_prepend_new_link(topic.read_text()))
+        _git(["add", "topics/foo.md"], cwd=self.store)
+        return self._commit("good edit", env)
+
+    def _log(self):
+        return (self.home / "hook.log").read_text()
+
+    def _last_postcommit_line(self):
+        return [l for l in self._log().splitlines() if "post-commit-reindex:" in l][-1]
+
+    def _marker(self):
+        return self.home / f"{self.PROJECT}.relint-failed"
+
+    # -- backup -------------------------------------------------------------
+
+    def test_backup_off_when_unset(self):
+        proc = self._good_commit()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = self._last_postcommit_line()
+        self.assertIn("backup=off", line)
+        self.assertIn("relint=ok", line)
+        self.assertEqual(list(self.backup.iterdir()), [])
+        self.assertFalse((self.backup / self.PROJECT).exists())
+
+    def test_backup_bundle_written_verified_and_manifested(self):
+        proc = self._good_commit(self._env(MEMCONTINUUM_BACKUP_DIR=str(self.backup)))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("backup=ok", self._last_postcommit_line())
+        sub = self.backup / self.PROJECT
+        bundles = sorted(sub.glob(f"{self.PROJECT}-[0-9]*-[0-9]*.bundle"))
+        self.assertEqual(len(bundles), 1, list(sub.iterdir()))
+        self.assertEqual(list(sub.glob("*.part")), [])
+        _git(["bundle", "verify", str(bundles[0])], cwd=self.store)
+        head = _git(["rev-parse", "HEAD"], cwd=self.store).stdout.strip()
+        heads = _git(["bundle", "list-heads", str(bundles[0])], cwd=self.store).stdout
+        self.assertIn(head, heads)
+        manifest = (sub / "MANIFEST.txt").read_text().splitlines()
+        self.assertEqual(len(manifest), 1)
+        fields = [f.strip() for f in manifest[0].split(" | ")]
+        self.assertEqual(fields[0], self.PROJECT)
+        self.assertEqual(fields[1], f"source={self.store}")
+        self.assertEqual(fields[2], f"HEAD={head}")
+        self.assertEqual(fields[3], "commits=2")
+        self.assertEqual(fields[4], f"bundle={bundles[0].name}")
+        self.assertEqual(fields[5], f"size={bundles[0].stat().st_size}")
+        import hashlib
+        self.assertEqual(fields[6], "sha256=" + hashlib.sha256(bundles[0].read_bytes()).hexdigest())
+
+    def test_backup_dir_from_config_sh_and_env_wins(self):
+        (self.home / "config.sh").write_text(
+            f"if [ -z \"${{MEMCONTINUUM_BACKUP_DIR:-}}\" ]; then MEMCONTINUUM_BACKUP_DIR={shlex.quote(str(self.backup))}; fi\n"
+        )
+        proc = self._good_commit()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("backup=ok", self._last_postcommit_line())
+        self.assertTrue((self.backup / self.PROJECT / "MANIFEST.txt").exists())
+        # env wins over config.sh
+        other = self.tmp / "other"
+        other.mkdir()
+        proc = subprocess.run(
+            ["git", "-c", "user.email=t@e.com", "-c", "user.name=T", "commit", "-q",
+             "--allow-empty", "-m", "second"],
+            cwd=str(self.store), capture_output=True, text=True, timeout=60,
+            env=self._env(MEMCONTINUUM_BACKUP_DIR=str(other)))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue((other / self.PROJECT / "MANIFEST.txt").exists())
+
+    def test_backup_prune_keeps_newest_n_and_manifest_grows(self):
+        sub = self.backup / self.PROJECT
+        sub.mkdir()
+        for i in range(1, 6):
+            (sub / f"{self.PROJECT}-2020010{i}-0900.bundle").write_text("old")
+        (sub / "unrelated.txt").write_text("keep me")
+        proc = self._good_commit(self._env(MEMCONTINUUM_BACKUP_DIR=str(self.backup),
+                                           MEMCONTINUUM_BACKUP_KEEP="3"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        names = sorted(p.name for p in sub.glob(f"{self.PROJECT}-[0-9]*-[0-9]*.bundle"))
+        self.assertEqual(len(names), 3, names)
+        self.assertEqual(names[0], f"{self.PROJECT}-20200104-0900.bundle")
+        self.assertEqual(names[1], f"{self.PROJECT}-20200105-0900.bundle")
+        self.assertTrue((sub / "unrelated.txt").exists())
+        self.assertEqual(len((sub / "MANIFEST.txt").read_text().splitlines()), 1)
+
+    def test_backup_dir_missing_is_skipped_and_never_created(self):
+        missing = self.tmp / "not-mounted"
+        proc = self._good_commit(self._env(MEMCONTINUUM_BACKUP_DIR=str(missing)))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("backup=skipped:dir-missing", self._last_postcommit_line())
+        self.assertFalse(missing.exists())
+
+    def test_backup_failure_never_changes_the_commit(self):
+        sub = self.backup / self.PROJECT
+        sub.mkdir()
+        (sub / "MANIFEST.txt").mkdir()  # an append to a directory fails; the commit must not
+        proc = self._good_commit(self._env(MEMCONTINUUM_BACKUP_DIR=str(self.backup)))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("backup=failed:manifest", self._last_postcommit_line())
+        self.assertEqual(list(sub.glob("*.part")), [])
+
+    # -- re-lint ------------------------------------------------------------
+
+    def _assert_flagged(self, proc, kinds):
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("skipped the commit checks and would have been refused", proc.stderr)
+        self.assertIn(f"in store {self.PROJECT}", proc.stderr)
+        line = self._last_postcommit_line()
+        self.assertTrue(any(f"relint=failed:{k}" in line for k in kinds), line)
+        self.assertEqual(len([l for l in self._log().splitlines() if "post-commit-reindex:" in l]), 1)
+        marker = self._marker().read_text()
+        sha = _git(["rev-parse", "HEAD"], cwd=self.store).stdout.strip()
+        self.assertIn(f"sha={sha}", marker)
+        self.assertIn("summary=memlint: ", marker)
+
+    def test_no_verify_edited_old_link_is_flagged(self):
+        topic = self.store / "topics" / "foo.md"
+        topic.write_text(topic.read_text().replace("first ruling", "EDITED first ruling"))
+        _git(["add", "topics/foo.md"], cwd=self.store)
+        proc = self._commit("bad edit", no_verify=True)
+        self._assert_flagged(proc, ["append-only", "both"])
+
+    def test_no_verify_record_without_frontmatter_fence_is_flagged(self):
+        (self.store / "topics" / "nofence.md").write_text("just prose, no frontmatter\n")
+        _git(["add", "topics/nofence.md"], cwd=self.store)
+        proc = self._commit("unfenced", no_verify=True)
+        self._assert_flagged(proc, ["schema", "both"])
+
+    def test_next_clean_commit_clears_the_marker(self):
+        (self.store / "topics" / "nofence.md").write_text("just prose, no frontmatter\n")
+        _git(["add", "topics/nofence.md"], cwd=self.store)
+        self._commit("unfenced", no_verify=True)
+        self.assertTrue(self._marker().exists())
+        _git(["rm", "-q", "-f", "topics/nofence.md"], cwd=self.store)
+        proc = self._commit("fix: remove the unfenced record")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("relint=ok", self._last_postcommit_line())
+        self.assertFalse(self._marker().exists())
+
+    def test_clean_commit_is_silent_and_relint_ok(self):
+        proc = self._good_commit()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("would have been refused", proc.stderr)
+        self.assertIn("relint=ok", self._last_postcommit_line())
+        self.assertFalse(self._marker().exists())
+
+    def test_engine_crash_is_skipped_not_a_finding(self):
+        env = self._env()
+        broken = self.tmp / "broken-python"
+        broken.write_text(
+            "#!/bin/sh\n"
+            'case "$1" in *memlint.py) echo "Traceback: boom" >&2; exit 1;; esac\n'
+            f'exec {shlex.quote(VENV_PYTHON)} "$@"\n')
+        broken.chmod(0o755)
+        wrapper = self.store / ".git" / "hooks" / "post-commit"
+        text = wrapper.read_text().replace(shlex.quote(VENV_PYTHON), shlex.quote(str(broken)))
+        wrapper.write_text(text)
+        proc = self._good_commit(env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("would have been refused", proc.stderr)
+        self.assertIn("relint=skipped:engine-failure", self._last_postcommit_line())
+        self.assertFalse(self._marker().exists())
+
+    def test_root_commit_gets_schema_pass_only(self):
+        solo = _git(["init", "-q", str(self.tmp / "solo")], cwd=self.tmp)
+        solo_root = self.tmp / "solo"
+        (solo_root / "topics").mkdir()
+        (solo_root / "topics" / "bad.md").write_text("no fence\n")
+        _git(["add", "topics/bad.md"], cwd=solo_root)
+        env = self._env(MEMCONTINUUM_ROOT=str(solo_root), MEMCONTINUUM_PROJECT=self.PROJECT,
+                        MEMCONTINUUM_PYTHON=VENV_PYTHON, MEMCONTINUUM_HOME=str(self.home),
+                        MEMCONTINUUM_EMBED_WORKER="0")
+        subprocess.run(["git", "-c", "user.email=t@e.com", "-c", "user.name=T", "commit", "-q",
+                        "-m", "root", "--no-verify"], cwd=str(solo_root), env=env,
+                       capture_output=True, text=True, timeout=60)
+        proc = subprocess.run([MC_BASH, str(POST_COMMIT_HOOK)], capture_output=True, text=True,
+                              env=env, timeout=60, cwd=str(solo_root))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("relint=failed:schema", self._last_postcommit_line())
+
+
 class TestMemorySearchSkill(unittest.TestCase):
     def test_e_skill_frontmatter_has_name_and_description(self):
         import yaml
