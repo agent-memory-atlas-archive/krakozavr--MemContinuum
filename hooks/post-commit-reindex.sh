@@ -138,6 +138,36 @@ if [ -z "${MEMCONTINUUM_ROOT:-}" ]; then
 fi
 
 PROJECT="${MEMCONTINUUM_PROJECT:-$(basename "$MEMCONTINUUM_ROOT")}"
+
+# ONE validation of the two values that become path segments, before ANY
+# project-derived path ($PROJECT.sqlite, .relint-failed, <dir>/$PROJECT) is
+# built. A hand-edited wrapper with MEMCONTINUUM_PROJECT=../victim must not
+# write or delete outside MEMCONTINUUM_HOME.
+#   PATH_UNSAFE   $PROJECT could leave its directory (empty, ., .., a slash,
+#                 or a control character): the hook logs and touches nothing.
+#   BAD_PROJECT   $PROJECT is outside [A-Za-z0-9._-]+ (e.g. a space): the
+#                 reindex still runs (it only names files inside HOME), but the
+#                 re-lint marker and the backup folder are skipped.
+#   BAD_DIR       MEMCONTINUUM_BACKUP_DIR is not absolute or holds a control
+#                 character (a newline would split a path): backup skipped.
+PATH_UNSAFE=0
+BAD_PROJECT=0
+BAD_DIR=0
+case "$PROJECT" in
+    ""|.|..|*/*|*[[:cntrl:]]*) PATH_UNSAFE=1; BAD_PROJECT=1 ;;
+    *[!A-Za-z0-9._-]*) BAD_PROJECT=1 ;;
+esac
+case "${MEMCONTINUUM_BACKUP_DIR:-}" in
+    "") ;;
+    *[[:cntrl:]]*) BAD_DIR=1 ;;
+    /*) ;;
+    *) BAD_DIR=1 ;;
+esac
+if [ "$PATH_UNSAFE" -eq 1 ]; then
+    printf '%s post-commit-reindex: bad project name, skipping project=%s root=%s relint=skipped:bad-project backup=skipped:bad-project\n' \
+        "$(date -Iseconds 2>/dev/null || date)" "$(printf '%s' "$PROJECT" | tr -d '[:cntrl:]')" "$MEMCONTINUUM_ROOT" >>"$LOG" 2>/dev/null || true
+    exit 0
+fi
 DB_PATH="$MEMCONTINUUM_HOME/$PROJECT.sqlite"
 
 # $EPOCHREALTIME is a bash 5-ism (unbound under `set -u` on macOS's stock
@@ -237,7 +267,12 @@ mc_post_commit_relint() {
         RELINT="skipped:no-watchdog"
         return 0
     fi
-    if [ "$MC_NO_LINT_LIB" -eq 1 ] || ! type mc_store_lint_schema >/dev/null 2>&1; then
+    if [ "$BAD_PROJECT" -eq 1 ]; then
+        RELINT="skipped:bad-project"
+        return 0
+    fi
+    if [ "$MC_NO_LINT_LIB" -eq 1 ] || ! type mc_store_lint_schema >/dev/null 2>&1 \
+            || ! type mc_physical >/dev/null 2>&1; then
         RELINT="skipped:no-lint-lib"
         return 0
     fi
@@ -245,13 +280,18 @@ mc_post_commit_relint() {
         RELINT="skipped:no-python"
         return 0
     fi
-    root_phys="$(cd "$MEMCONTINUUM_ROOT" 2>/dev/null && pwd -P)"
+    root_phys="$(mc_physical "$MEMCONTINUUM_ROOT")"
     mc_store_lint_schema "$PY" "$memlint" "$MEMCONTINUUM_ROOT"
     local append="ok" append_out=""
     if git -C "$MEMCONTINUUM_ROOT" rev-parse --verify -q HEAD~1 >/dev/null 2>&1; then
         mc_store_lint_append_only "$PY" "$memlint" "$MEMCONTINUUM_ROOT" HEAD~1
         append="$MC_LINT_APPEND"
         append_out="$MC_LINT_APPEND_OUT"
+    fi
+    # Exit 0 with no memlint summary line is no evidence of a clean store (a
+    # stub interpreter, e.g. /bin/true): treat it like a crash.
+    if [ "$MC_LINT_SCHEMA" = "ok" ] && [ "${MC_LINT_SCHEMA_SUMMARY:-0}" != "1" ]; then
+        MC_LINT_SCHEMA="engine-failure"
     fi
     if [ "$MC_LINT_SCHEMA" = "engine-failure" ] || [ "$append" = "engine-failure" ]; then
         # An engine crash is never a finding -- unless the other check
@@ -291,6 +331,16 @@ mc_post_commit_relint() {
         return 0
     fi
     RELINT="failed:$kind"
+    # A marker another store (same project name, different root) left behind
+    # is never overwritten: its finding stays visible. The banner still prints.
+    local foreign=0
+    if [ -f "$RELINT_MARKER" ]; then
+        mroot=""
+        IFS= read -r mroot <"$RELINT_MARKER" 2>/dev/null || true
+        case "$mroot" in
+            root=*) mroot="${mroot#root=}"; [ "$mroot" = "$root_phys" ] || foreign=1 ;;
+        esac
+    fi
     sha="$(git -C "$MEMCONTINUUM_ROOT" rev-parse HEAD 2>/dev/null)"
     short="$(git -C "$MEMCONTINUUM_ROOT" rev-parse --short HEAD 2>/dev/null)"
     {
@@ -300,13 +350,24 @@ mc_post_commit_relint() {
     } >&2
     summary="$( { [ "$MC_LINT_SCHEMA" = "fail" ] && printf '%s\n' "$MC_LINT_SCHEMA_OUT"
                   [ "$append" = "fail" ] && printf '%s\n' "$append_out"; } | grep '^memlint: ' | tr '\n' ';' )"
-    {
+    if [ "$foreign" -eq 1 ]; then
+        RELINT="failed:$kind marker=foreign"
+        return 0
+    fi
+    # Write-then-rename: a full disk leaves the old marker, never an empty one.
+    if {
         printf 'root=%s\n' "$root_phys"
         printf 'sha=%s\n' "$sha"
         printf 'date=%s\n' "$(date -Iseconds 2>/dev/null || date)"
         printf 'failed=%s\n' "$kind"
         printf 'summary=%s\n' "${summary%;}"
-    } >"$RELINT_MARKER" 2>/dev/null
+    } >"$RELINT_MARKER.new" 2>/dev/null \
+            && mv -f "$RELINT_MARKER.new" "$RELINT_MARKER" 2>/dev/null; then
+        :
+    else
+        rm -f "$RELINT_MARKER.new" 2>/dev/null
+        RELINT="failed:$kind marker=write-failed"
+    fi
     return 0
 }
 mc_post_commit_relint || RELINT="skipped:error"
@@ -327,19 +388,16 @@ mc_backup_cleanup_part() {
 mc_post_commit_backup() {
     local dir="${MEMCONTINUUM_BACKUP_DIR:-}" keep rawkeep="${MEMCONTINUUM_BACKUP_KEEP:-}" keep_bad=0
     local sub real_dir real_sub name part final head commits stat f
-    local list others_count excess i swept=0 prune_failed=0 suffix=""
+    local n others_count excess i swept=0 prune_failed=0 suffix=""
     [ -n "$dir" ] || { BACKUP="off"; return 0; }
     if [ "$MC_NO_WATCHDOG" -eq 1 ]; then BACKUP="skipped:no-watchdog"; return 0; fi
-    # PROJECT becomes a path segment: refuse anything that could leave DIR.
-    case "$PROJECT" in
-        ""|.|..|*[!A-Za-z0-9._-]*) BACKUP="failed:bad-project"; return 0 ;;
-    esac
-    case "$dir" in
-        /*) ;;
-        *) BACKUP="failed:bad-dir"; return 0 ;;
-    esac
+    # PROJECT and DIR were validated once, above, before any path was built.
+    if [ "$BAD_PROJECT" -eq 1 ]; then BACKUP="skipped:bad-project"; return 0; fi
+    if [ "$BAD_DIR" -eq 1 ]; then BACKUP="skipped:bad-dir"; return 0; fi
     if ! type mc_backup_keep_normalize >/dev/null 2>&1 \
-            || ! type mc_backup_bundle_list >/dev/null 2>&1; then
+            || ! type mc_backup_bundle_list >/dev/null 2>&1 \
+            || ! type mc_backup_name_ok >/dev/null 2>&1 \
+            || ! type mc_physical >/dev/null 2>&1; then
         BACKUP="skipped:no-lib"; return 0
     fi
     if [ -z "$rawkeep" ]; then
@@ -350,11 +408,11 @@ mc_post_commit_backup() {
         keep=10; keep_bad=1
     fi
     if [ ! -d "$dir" ]; then BACKUP="skipped:dir-missing"; return 0; fi
-    real_dir="$(cd "$dir" 2>/dev/null && pwd -P)" || { BACKUP="failed:bad-dir"; return 0; }
+    real_dir="$(mc_physical "$dir")"
     sub="$real_dir/$PROJECT"
     mkdir -p "$sub" 2>/dev/null || { BACKUP="failed:mkdir"; return 0; }
     # A symlinked <dir>/<project> pointing elsewhere is refused.
-    real_sub="$(cd "$sub" 2>/dev/null && pwd -P)" || { BACKUP="failed:mkdir"; return 0; }
+    real_sub="$(mc_physical "$sub")"
     case "$real_sub/" in
         "${real_dir%/}/"*) ;;
         *) BACKUP="failed:bad-project"; return 0 ;;
@@ -368,6 +426,7 @@ mc_post_commit_backup() {
     # the next run (and a TERM/exit trap removes this run's own).
     for f in "$sub/$PROJECT"-[0-9]*-[0-9]*.bundle.part; do
         [ -e "$f" ] || continue
+        mc_backup_name_ok "$PROJECT" "${f##*/}" .bundle.part || continue
         if [[ "$f" < "$part" ]]; then
             rm -f "$f" 2>/dev/null && swept=$((swept + 1))
         fi
@@ -394,6 +453,11 @@ print(os.path.getsize(p), hashlib.sha256(open(p, "rb").read()).hexdigest())' "$p
     MC_PART_NOW=""
     head="$(git -C "$MEMCONTINUUM_ROOT" rev-parse HEAD 2>/dev/null)"
     commits="$(git -C "$MEMCONTINUUM_ROOT" rev-list --count HEAD 2>/dev/null)"
+    # `>>` follows a symlink: never append through one (or into a directory).
+    if [ -L "$sub/MANIFEST.txt" ] || { [ -e "$sub/MANIFEST.txt" ] && [ ! -f "$sub/MANIFEST.txt" ]; }; then
+        BACKUP="ok-manifest-refused$suffix"
+        return 0
+    fi
     printf '%s | source=%s | HEAD=%s | commits=%s | bundle=%s | size=%s | sha256=%s\n' \
         "$PROJECT" "$MEMCONTINUUM_ROOT" "$head" "$commits" "$name" "${stat%% *}" "${stat#* }" \
         >>"$sub/MANIFEST.txt" 2>/dev/null || { BACKUP="failed:manifest$suffix"; return 0; }
@@ -406,22 +470,25 @@ print(os.path.getsize(p), hashlib.sha256(open(p, "rb").read()).hexdigest())' "$p
     # exact name is excluded, so a future-dated older name cannot displace
     # it); of the OTHERS keep at most keep-1, oldest names first removed.
     # MANIFEST lines are never pruned.
-    list="$(mc_backup_bundle_list "$sub" "$PROJECT")"
+    mc_backup_bundle_list "$sub" "$PROJECT"
+    n=${#MC_BACKUP_BUNDLES[@]}
     others_count=0
-    while IFS= read -r f; do
-        [ -n "$f" ] && [ "$f" != "$final" ] && others_count=$((others_count + 1))
-    done <<<"$list"
-    excess=$((others_count - (keep - 1)))
     i=0
+    while [ "$i" -lt "$n" ]; do
+        [ "${MC_BACKUP_BUNDLES[$i]}" != "$final" ] && others_count=$((others_count + 1))
+        i=$((i + 1))
+    done
+    excess=$((others_count - (keep - 1)))
     if [ "$excess" -gt 0 ]; then
-        while IFS= read -r f; do
-            [ -n "$f" ] && [ "$f" != "$final" ] || continue
+        i=0
+        while [ "$i" -lt "$n" ] && [ "$excess" -gt 0 ]; do
+            f="${MC_BACKUP_BUNDLES[$i]}"
             i=$((i + 1))
-            if [ "$i" -le "$excess" ]; then
-                rm -f "$f" 2>/dev/null || prune_failed=1
-                [ -e "$f" ] && prune_failed=1
-            fi
-        done <<<"$list"
+            [ "$f" != "$final" ] || continue
+            excess=$((excess - 1))
+            rm -f "$f" 2>/dev/null || prune_failed=1
+            [ -e "$f" ] && prune_failed=1
+        done
     fi
     if [ "$prune_failed" -eq 1 ]; then BACKUP="ok-prune-failed$suffix"; else BACKUP="ok$suffix"; fi
     return 0

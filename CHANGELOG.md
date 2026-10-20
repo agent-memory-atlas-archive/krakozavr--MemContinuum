@@ -16,9 +16,13 @@
 - The post-commit hook now runs the commit checks again, so a store commit
   made with `git commit --no-verify` that would have been refused prints a
   warning, is logged, and is named at the next session start until a clean
-  commit follows. An engine crash never clears that warning, a warning from
-  another store with the same project name is left alone, and without the
-  watchdog python neither the re-lint nor the backup runs.
+  commit follows. An engine crash (or a lint that prints nothing) never clears
+  that warning; a warning left by another store with the same project name is
+  neither cleared nor overwritten (the second store's own finding is then only
+  printed and logged, `marker=foreign`); and without the watchdog python
+  neither the re-lint nor the backup runs. A project name or backup directory
+  that could leave its folder (`..`, a slash, a newline) makes the hook skip
+  the re-lint marker and the backup without touching anything.
 
 ## [0.3.0] — 2026-10-15
 

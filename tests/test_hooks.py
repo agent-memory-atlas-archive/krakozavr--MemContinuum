@@ -3592,8 +3592,9 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
         (sub / "MANIFEST.txt").mkdir()  # an append to a directory fails; the commit must not
         proc = self._good_commit(self._env(MEMCONTINUUM_BACKUP_DIR=str(self.backup)))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("backup=failed:manifest", self._last_postcommit_line())
+        self.assertIn("backup=ok-manifest-refused", self._last_postcommit_line())
         self.assertEqual(list(sub.glob("*.part")), [])
+        self.assertEqual(len(list(sub.glob("*.bundle"))), 1)
 
     # -- re-lint ------------------------------------------------------------
 
@@ -3743,16 +3744,16 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
         inner = self.tmp / "inner"
         inner.mkdir()
         line = self._backup_line_after("..", MEMCONTINUUM_BACKUP_DIR=str(inner))
-        self.assertIn("backup=failed:bad-project", line)
+        self.assertIn("backup=skipped:bad-project", line)
         self.assertEqual([p.name for p in self.tmp.glob("*.bundle*")], [])
         self.assertEqual(list(inner.iterdir()), [])
 
     def test_project_dot_or_slash_is_refused(self):
         line = self._backup_line_after(".", MEMCONTINUUM_BACKUP_DIR=str(self.backup))
-        self.assertIn("backup=failed:bad-project", line)
+        self.assertIn("backup=skipped:bad-project", line)
         self.assertEqual(list(self.backup.iterdir()), [])
         line = self._backup_line_after("a/b", MEMCONTINUUM_BACKUP_DIR=str(self.backup))
-        self.assertIn("backup=failed:bad-project", line)
+        self.assertIn("backup=skipped:bad-project", line)
         self.assertEqual(list(self.backup.iterdir()), [])
 
     def test_symlinked_project_folder_pointing_outside_is_refused(self):
@@ -3765,7 +3766,7 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
 
     def test_relative_backup_dir_is_refused(self):
         line = self._backup_line_after(MEMCONTINUUM_BACKUP_DIR="relative/dir")
-        self.assertIn("backup=failed:bad-dir", line)
+        self.assertIn("backup=skipped:bad-dir", line)
 
     def test_backup_dir_with_a_space(self):
         spaced = self.tmp / "back up dir"
@@ -3828,6 +3829,134 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
         # ... and no note at all when nothing was swept.
         line = self._backup_line_after(MEMCONTINUUM_BACKUP_DIR=str(self.backup))
         self.assertNotIn("part-swept", line)
+
+    # -- fix round 2 --------------------------------------------------------
+
+    def _snapshot(self, root):
+        return sorted(str(p.relative_to(root)) for p in Path(root).rglob("*"))
+
+    def test_bad_project_with_a_finding_writes_no_marker_anywhere(self):
+        victim_parent = self.tmp / "victimparent"
+        victim_parent.mkdir()
+        # HOME is tmp/home, so ../victim lands in tmp: outside HOME.
+        before = self._snapshot(self.tmp)
+        (self.store / "topics" / "nofence.md").write_text("just prose, no frontmatter\n")
+        _git(["add", "topics/nofence.md"], cwd=self.store)
+        wrapper = self.store / ".git" / "hooks" / "post-commit"
+        wrapper.write_text(re.sub(r"(?m)^export MEMCONTINUUM_PROJECT=.*$",
+                                  "export MEMCONTINUUM_PROJECT=../victim", wrapper.read_text()))
+        proc = self._commit("unfenced", no_verify=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual([p for p in self.tmp.rglob("*victim*") if p != victim_parent], [])
+        self.assertEqual([p for p in self.tmp.rglob("*relint-failed*")], [])
+        self.assertEqual([p for p in self.tmp.rglob("*.sqlite")], [])
+        line = self._last_postcommit_line()
+        self.assertIn("relint=skipped:bad-project backup=skipped:bad-project", line)
+        del before
+
+    def test_project_with_a_space_still_reindexes_but_skips_relint_and_backup(self):
+        line = self._backup_line_after("my store", MEMCONTINUUM_BACKUP_DIR=str(self.backup))
+        self.assertIn("relint=skipped:bad-project", line)
+        self.assertIn("backup=skipped:bad-project", line)
+        self.assertEqual(list(self.backup.iterdir()), [])
+        self.assertTrue((self.home / "my store.sqlite").exists())
+
+    def test_backup_dir_with_a_newline_is_refused_and_nothing_is_deleted(self):
+        weird = self.tmp / "evil\nname"
+        weird.mkdir()
+        sentinel = self.tmp / "sentinel.bundle"
+        sentinel.write_text("keep")
+        sub = weird / self.PROJECT
+        sub.mkdir()
+        old = sub / f"{self.PROJECT}-20200101-0900.bundle"
+        old.write_text("old")
+        line = self._backup_line_after(MEMCONTINUUM_BACKUP_DIR=str(weird), MEMCONTINUUM_BACKUP_KEEP="1")
+        self.assertIn("backup=skipped:bad-dir", line)
+        self.assertEqual(old.read_text(), "old")
+        self.assertEqual(sentinel.read_text(), "keep")
+        self.assertFalse((sub / "MANIFEST.txt").exists())
+
+    def test_symlinked_manifest_is_not_appended_through(self):
+        sub = self.backup / self.PROJECT
+        sub.mkdir()
+        outside = self.tmp / "outside-sentinel.txt"
+        outside.write_text("untouched\n")
+        (sub / "MANIFEST.txt").symlink_to(outside)
+        line = self._backup_line_after(MEMCONTINUUM_BACKUP_DIR=str(self.backup))
+        self.assertIn("backup=ok-manifest-refused", line)
+        self.assertEqual(outside.read_text(), "untouched\n")
+        self.assertEqual(len(list(sub.glob("*.bundle"))), 1)
+
+    def test_foreign_marker_survives_a_second_stores_finding_and_clean_run(self):
+        self._plant_marker()
+        lines = self._marker().read_text().splitlines()
+        foreign = "root=/some/other/store\n" + "".join(l + "\n" for l in lines[1:])
+        self._marker().write_text(foreign)
+        (self.store / "topics" / "nofence2.md").write_text("still no frontmatter\n")
+        _git(["add", "topics/nofence2.md"], cwd=self.store)
+        proc = self._commit("another bad one", no_verify=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("would have been refused", proc.stderr)
+        self.assertRegex(self._last_postcommit_line(), r"relint=failed:\w[\w-]* marker=foreign")
+        self.assertEqual(self._marker().read_text(), foreign)
+        _git(["rm", "-q", "-f", "topics/nofence.md", "topics/nofence2.md"], cwd=self.store)
+        self._commit("fix")
+        self.assertEqual(self._marker().read_text(), foreign)
+
+    def test_stub_interpreter_with_empty_output_never_clears_a_marker(self):
+        self._plant_marker()
+        before = self._marker().read_text()
+        stub = self.tmp / "true-python"
+        # memlint "succeeds" silently (what /bin/true would do); everything else
+        # (the watchdog guard, reindex) stays real.
+        stub.write_text("#!/bin/sh\n"
+                        'case "$1" in *memlint.py) exit 0;; esac\n'
+                        f'exec {shlex.quote(VENV_PYTHON)} "$@"\n')
+        stub.chmod(0o755)
+        self._edit_wrapper("post-commit", shlex.quote(VENV_PYTHON), shlex.quote(str(stub)))
+        proc = subprocess.run(["git", "-c", "user.email=t@e.com", "-c", "user.name=T", "commit", "-q",
+                               "--allow-empty", "--no-verify", "-m", "empty"], cwd=str(self.store),
+                              capture_output=True, text=True, env=self._env(), timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("relint=skipped:engine-failure", self._last_postcommit_line())
+        self.assertEqual(self._marker().read_text(), before)
+
+    def test_bundle_name_grammar_ignores_decoys(self):
+        sub = self.backup / self.PROJECT
+        sub.mkdir()
+        decoys = [f"{self.PROJECT}-1notes-2manual.bundle", f"{self.PROJECT}-202001-0900.bundle",
+                  f"{self.PROJECT}-20200101-09000.bundle", f"{self.PROJECT}-1notes-2manual.bundle.part"]
+        for d in decoys:
+            (sub / d).write_text("decoy")
+        real = sub / f"{self.PROJECT}-20200101-0900.bundle"
+        real.write_text("old")
+        line = self._backup_line_after(MEMCONTINUUM_BACKUP_DIR=str(self.backup),
+                                       MEMCONTINUUM_BACKUP_KEEP="1")
+        self.assertIn("backup=ok", line)
+        self.assertNotIn("part-swept", line)
+        for d in decoys:
+            self.assertEqual((sub / d).read_text(), "decoy", d)
+        self.assertFalse(real.exists())
+
+    def test_marker_write_failure_leaves_the_old_marker(self):
+        self._plant_marker()
+        before = self._marker().read_text()
+        (self.home / f"{self.PROJECT}.relint-failed.new").mkdir()
+        (self.store / "topics" / "nofence2.md").write_text("still no frontmatter\n")
+        _git(["add", "topics/nofence2.md"], cwd=self.store)
+        proc = self._commit("another bad one", no_verify=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("marker=write-failed", self._last_postcommit_line())
+        self.assertEqual(self._marker().read_text(), before)
+
+    def test_empty_env_backup_dir_overrides_config_sh(self):
+        (self.home / "config.sh").write_text(
+            f"if [ -z \"${{MEMCONTINUUM_BACKUP_DIR+x}}\" ]; then MEMCONTINUUM_BACKUP_DIR={shlex.quote(str(self.backup))}; fi\n"
+        )
+        proc = self._good_commit(self._env(MEMCONTINUUM_BACKUP_DIR=""))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("backup=off", self._last_postcommit_line())
+        self.assertEqual(list(self.backup.iterdir()), [])
 
 
 class TestMemorySearchSkill(unittest.TestCase):

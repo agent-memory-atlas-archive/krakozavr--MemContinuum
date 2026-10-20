@@ -195,7 +195,10 @@ writes `$MEMCONTINUUM_HOME/<project>.relint-failed` (sha, date, summary). The
 next session start names the marker in one line (with the store root it came
 from, the marker's first line `root=<physical path>`); the next clean commit
 of that same store removes it (another store sharing the project name leaves
-it alone and logs `relint=ok marker=foreign`). An engine crash is
+it alone and logs `relint=ok marker=foreign`; a finding in such a second store
+leaves the first store's marker in place and logs `relint=failed:<kind>
+marker=foreign`, the banner still printing). An engine crash, or a memlint run
+that exits 0 without printing its summary line, is
 `relint=skipped:engine-failure`, never a finding, and never clears the marker.
 A renamed project leaves its marker under the old name. With no watchdog
 python (`MC_GUARD_PY` unresolved) the re-lint and backup log
@@ -220,10 +223,17 @@ deliberately not exported by the installed wrapper:
   unusable value (`0`, `00`, `abc`) logs `backup=failed:bad-keep` and prunes
   nothing; the bundle is still written. `memcontinuum-setup.sh` rejects it at
   the flag.
-- A relative directory logs `backup=failed:bad-dir`; a project name that is
-  `.`, `..` or has anything outside `[A-Za-z0-9._-]` logs
-  `backup=failed:bad-project`, as does a `<dir>/<project>` symlink that
-  resolves outside `<dir>`.
+- A relative directory, or one containing a newline or other control character,
+  logs `backup=skipped:bad-dir`; a project name that is `.`, `..` or has
+  anything outside `[A-Za-z0-9._-]` logs `relint=skipped:bad-project
+  backup=skipped:bad-project` and writes no marker (a name with a slash or
+  control character skips the whole hook, reindex included). A
+  `<dir>/<project>` symlink that resolves outside `<dir>` logs
+  `backup=failed:bad-project`. Only files named exactly
+  `<project>-YYYYMMDD-HHMM.bundle` count as bundles. An empty
+  `MEMCONTINUUM_BACKUP_DIR` in the environment switches backups off even when
+  `config.sh` records a directory. A `MANIFEST.txt` that is a symlink or not a
+  regular file is not appended to (`backup=ok-manifest-refused`, bundle kept).
 
 Layout: `<dir>/<project>/<project>-YYYYMMDD-HHMM.bundle` plus one
 `MANIFEST.txt` line per bundle (`<project> | source=… | HEAD=… | commits=… |
@@ -239,7 +249,8 @@ the bundle it just wrote plus at most N-1 others matching
 bundle with that name pattern counts, and a future-dated name cannot displace
 the new bundle) and deletes the rest; a failed delete logs
 `backup=ok-prune-failed`. A `.part` left by a killed hook is removed at the
-start of the next run (`part-swept=N` is logged only when N>0). Manifest lines are never
+start of the next run only if its name sorts before the new run's own
+`.part` (`part-swept=N` is logged only when N>0). Manifest lines are never
 pruned. Any failure logs `backup=failed:<reason>`, removes the `.part`, and
 leaves the exit code and the commit alone.
 

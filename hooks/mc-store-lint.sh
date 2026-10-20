@@ -15,6 +15,11 @@
 #   INC-0127). Sets:
 #     MC_LINT_SCHEMA      ok | fail | engine-failure
 #     MC_LINT_SCHEMA_OUT  memlint's combined output
+#     MC_LINT_SCHEMA_SUMMARY  1 when memlint printed its own summary line
+#                         (`memlint: clean` / `memlint: N error(s)`), else 0.
+#                         Pre-commit ignores it (it fails open); post-commit
+#                         treats an `ok` WITHOUT a summary as engine-failure,
+#                         so a stub interpreter can never clear a sticky marker.
 #   Python exits 1 on ANY uncaught exception, so RC=1 counts as a finding
 #   only together with memlint's own `memlint: N error(s)` summary marker; a
 #   1 without it (a venv that cannot import memlint's dependencies) or any
@@ -38,6 +43,10 @@ mc_store_lint_schema() {
     MC_LINT_SCHEMA_OUT="$(PYTHONPATH= "$py" "$memlint" "$root" 2>&1)"
     rc=$?
     MC_LINT_SCHEMA="ok"
+    MC_LINT_SCHEMA_SUMMARY=0
+    case "$MC_LINT_SCHEMA_OUT" in
+        *"memlint: clean"*|*"memlint: "*" error(s)"*) MC_LINT_SCHEMA_SUMMARY=1 ;;
+    esac
     if [ "$rc" -eq 1 ]; then
         case "$MC_LINT_SCHEMA_OUT" in
             *"memlint: "*" error(s)"*) MC_LINT_SCHEMA="fail" ;;

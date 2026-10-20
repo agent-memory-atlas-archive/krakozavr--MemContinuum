@@ -1323,16 +1323,36 @@ mc_backup_keep_normalize() {
     return 0
 }
 
+# mc_backup_name_ok PROJECT BASENAME [SUFFIX]
+#
+# True when BASENAME is exactly <PROJECT>-YYYYMMDD-HHMM<SUFFIX> (8 digits, dash,
+# 4 digits; SUFFIX defaults to ".bundle", the .part sweep passes
+# ".bundle.part"). The ONE definition of a bundle name: the glob
+# `<project>-[0-9]*-[0-9]*` alone also matches `proj-1notes-2manual.bundle`.
+# PROJECT is quoted, so it is literal in the pattern.
+mc_backup_name_ok() {
+    case "$2" in
+        "$1"-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]"${3:-.bundle}") return 0 ;;
+    esac
+    return 1
+}
+
 # mc_backup_bundle_list SUBDIR PROJECT
 #
-# Prints, one per line in name order, the files in SUBDIR named
-# <PROJECT>-<digits>-<digits>.bundle -- the ONE definition of "a bundle of
-# this store" (the hook prunes by it, mc_backup_state reads the newest by it;
-# manual bundles with the same name pattern count).
+# Fills the array MC_BACKUP_BUNDLES with the files in SUBDIR that satisfy
+# mc_backup_name_ok, in name order -- the ONE definition of "a bundle of this
+# store" (the hook prunes by it, mc_backup_state reads the newest by it; manual
+# bundles with the same name count). An array, never a newline-joined string:
+# a path is never split, so no serialisation step can turn one path into two
+# deletion candidates. Callers iterate by index (an empty array under `set -u`
+# is unsafe on bash 3.2).
 mc_backup_bundle_list() {
     local f
+    MC_BACKUP_BUNDLES=()
     for f in "$1/$2"-[0-9]*-[0-9]*.bundle; do
-        [ -e "$f" ] && printf '%s\n' "$f"
+        [ -e "$f" ] || continue
+        mc_backup_name_ok "$2" "${f##*/}" || continue
+        MC_BACKUP_BUNDLES[${#MC_BACKUP_BUNDLES[@]}]="$f"
     done
     return 0
 }
@@ -1348,7 +1368,9 @@ mc_backup_settings() {
     local config="${1:-${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}/config.sh}"
     MC_BACKUP_DIR="${MEMCONTINUUM_BACKUP_DIR:-}"
     MC_BACKUP_KEEP="${MEMCONTINUUM_BACKUP_KEEP:-}"
-    [ -n "$MC_BACKUP_DIR" ] || MC_BACKUP_DIR="$(mc_config_read_var "$config" MEMCONTINUUM_BACKUP_DIR)"
+    # Presence, not non-emptiness: MEMCONTINUUM_BACKUP_DIR='' in the
+    # environment is an explicit "off" that config.sh must not override.
+    [ -n "${MEMCONTINUUM_BACKUP_DIR+x}" ] || MC_BACKUP_DIR="$(mc_config_read_var "$config" MEMCONTINUUM_BACKUP_DIR)"
     [ -n "$MC_BACKUP_KEEP" ] || MC_BACKUP_KEEP="$(mc_config_read_var "$config" MEMCONTINUUM_BACKUP_KEEP)"
     if [ -z "$MC_BACKUP_KEEP" ]; then
         MC_BACKUP_KEEP=10
@@ -1373,10 +1395,10 @@ mc_backup_settings() {
 #   behind      otherwise
 # "Newest" is by name sort over mc_backup_bundle_list.
 mc_backup_state() {
-    local store="$1" project="$2" sub newest="" f heads bundle_head store_head list
+    local store="$1" project="$2" sub newest="" heads bundle_head store_head n
     MC_BACKUP_STATE="off"
     [ -n "${MC_BACKUP_DIR:-}" ] || return 0
-    if [ ! -d "$MC_BACKUP_DIR" ] || [ ! -r "$MC_BACKUP_DIR" ]; then
+    if [ ! -d "$MC_BACKUP_DIR" ] || [ ! -r "$MC_BACKUP_DIR" ] || [ ! -x "$MC_BACKUP_DIR" ]; then
         MC_BACKUP_STATE="unreadable"
         return 0
     fi
@@ -1385,10 +1407,9 @@ mc_backup_state() {
         MC_BACKUP_STATE="unreadable"
         return 0
     fi
-    list="$(mc_backup_bundle_list "$sub" "$project")"
-    while IFS= read -r f; do
-        [ -n "$f" ] && newest="$f"
-    done <<<"$list"
+    mc_backup_bundle_list "$sub" "$project"
+    n=${#MC_BACKUP_BUNDLES[@]}
+    [ "$n" -gt 0 ] && newest="${MC_BACKUP_BUNDLES[$((n - 1))]}"
     if [ -z "$newest" ]; then
         MC_BACKUP_STATE="none"
         return 0

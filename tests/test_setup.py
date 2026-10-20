@@ -284,6 +284,18 @@ class TestBootstrapInstall(BootstrapCase):
         self.assertEqual(self.bootstrap("--backup-dir", "").returncode, 0)
         self.assertEqual(self._config_var("MEMCONTINUUM_BACKUP_DIR"), "")
 
+    def test_empty_env_backup_dir_beats_the_recorded_config_line(self):
+        backup = Path(self.tmp) / "bk"
+        backup.mkdir()
+        self.assertEqual(self.bootstrap("--backup-dir", str(backup)).returncode, 0)
+        cfg = str(Path(self.mc_home, "config.sh"))
+        lib = str(Path(__file__).resolve().parent.parent / "scripts" / "mc-registry-lib.sh")
+        out = subprocess.run(
+            ["bash", "-c", 'MEMCONTINUUM_BACKUP_DIR=""; . "$1"; printf "[%s]" "${MEMCONTINUUM_BACKUP_DIR-unset}"; '
+             '. "$2"; mc_backup_settings "$1"; printf "[%s]" "$MC_BACKUP_DIR"', "x", cfg, lib],
+            capture_output=True, text=True)
+        self.assertEqual(out.stdout, "[][]", out.stderr)
+
     def test_no_backup_flags_means_no_backup_lines(self):
         self.assertEqual(self.bootstrap().returncode, 0)
         config = Path(self.mc_home, "config.sh").read_text(encoding="utf-8")

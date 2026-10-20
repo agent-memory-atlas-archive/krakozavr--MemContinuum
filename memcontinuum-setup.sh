@@ -478,10 +478,11 @@ if [ "$DRY_RUN" -eq 0 ]; then
     if [ -n "$BACKUP_DIR" ] || [ -n "$BACKUP_KEEP" ]; then
         BACKUP_CONF="# Store backup bundles, written by hooks/post-commit-reindex.sh after each store
 # commit into \$MEMCONTINUUM_BACKUP_DIR/<project>/ (the dir must already exist;
-# the hook never creates it). Environment wins over these lines."
+# the hook never creates it). Environment wins over these lines, an empty
+# MEMCONTINUUM_BACKUP_DIR in the environment included (explicit off)."
         if [ -n "$BACKUP_DIR" ]; then
             BACKUP_CONF="$BACKUP_CONF
-if [ -z \"\${MEMCONTINUUM_BACKUP_DIR:-}\" ]; then MEMCONTINUUM_BACKUP_DIR=$(sh_quote "$BACKUP_DIR"); fi"
+if [ -z \"\${MEMCONTINUUM_BACKUP_DIR+x}\" ]; then MEMCONTINUUM_BACKUP_DIR=$(sh_quote "$BACKUP_DIR"); fi"
             [ -d "$BACKUP_DIR" ] || printf 'WARNING: backup dir %s does not exist yet -- the hook skips backups until it does\n' "$BACKUP_DIR" >&2
         fi
         if [ -n "$BACKUP_KEEP" ]; then

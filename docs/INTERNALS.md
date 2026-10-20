@@ -452,9 +452,14 @@ which is unchanged. `memcontinuum-update.sh` reports it: the machine line
 (`mc_backup_state` in `scripts/mc-registry-lib.sh`: off, none, current,
 behind, unreadable, and `unknown` on a row that records no project). The
 KEEP rule is one function, `mc_backup_keep_normalize`, shared by the hook,
-setup and the updater; the bundle name glob is `mc_backup_bundle_list`. The
-project name is a path segment, so the hook refuses `.`/`..`/odd names and a
-symlinked project folder (`backup=failed:bad-project`); `repo-init.sh`
+setup and the updater; the bundle name is defined once by `mc_backup_name_ok`
+(exact `<project>-YYYYMMDD-HHMM.bundle`) and `mc_backup_bundle_list` fills an
+array from it (never a newline-joined string, so a path is never split). The
+project name and backup dir are validated once, before any path is built
+(`relint=skipped:bad-project backup=skipped:bad-project` / `skipped:bad-dir`);
+a symlinked project folder is `backup=failed:bad-project`. A post-commit
+re-lint of an amended ROOT commit is schema-checked only (no `HEAD~1`);
+amending a store's root commit is not a supported case; `repo-init.sh`
 refuses `.` and `..` as `--project`. `--apply` never creates a bundle.
 
 **Logging, per hook.** The seven project-level hooks each write exactly one
