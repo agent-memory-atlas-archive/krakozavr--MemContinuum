@@ -3453,14 +3453,17 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
         self.store = _init_topic_store(self.tmp / "store")
         self.backup = self.tmp / "backup"
         self.backup.mkdir()
-        hooks_dir = Path(_git(["rev-parse", "--git-path", "hooks"], cwd=self.store).stdout.strip())
+        self._install_wrappers(self.store)
+
+    def _install_wrappers(self, store):
+        hooks_dir = Path(_git(["rev-parse", "--git-path", "hooks"], cwd=store).stdout.strip())
         if not hooks_dir.is_absolute():
-            hooks_dir = self.store / hooks_dir
+            hooks_dir = store / hooks_dir
         for name, script in (("post-commit", POST_COMMIT_HOOK), ("pre-commit", PRE_COMMIT_HOOK)):
             wrapper = hooks_dir / name
             wrapper.write_text(
                 "#!/usr/bin/env bash\n"
-                f"export MEMCONTINUUM_ROOT={shlex.quote(str(self.store))}\n"
+                f"export MEMCONTINUUM_ROOT={shlex.quote(str(store))}\n"
                 f"export MEMCONTINUUM_PROJECT={self.PROJECT}\n"
                 f"export MEMCONTINUUM_PYTHON={shlex.quote(VENV_PYTHON)}\n"
                 f"export MEMCONTINUUM_HOME={shlex.quote(str(self.home))}\n"
@@ -3468,6 +3471,12 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
                 f'exec "{MC_BASH}" {shlex.quote(str(script))}\n'
             )
             wrapper.chmod(0o755)
+
+    def _edit_wrapper(self, name, old, new):
+        wrapper = self.store / ".git" / "hooks" / name
+        text = wrapper.read_text()
+        self.assertIn(old, text)
+        wrapper.write_text(text.replace(old, new))
 
     def _env(self, **extra):
         env = clean_env(HOME=str(self.home))
@@ -3648,22 +3657,177 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
         self.assertIn("relint=skipped:engine-failure", self._last_postcommit_line())
         self.assertFalse(self._marker().exists())
 
+    def _plant_marker(self):
+        (self.store / "topics" / "nofence.md").write_text("just prose, no frontmatter\n")
+        _git(["add", "topics/nofence.md"], cwd=self.store)
+        self._commit("unfenced", no_verify=True)
+        self.assertTrue(self._marker().exists())
+
+    def _broken_python(self):
+        broken = self.tmp / "broken-python"
+        broken.write_text(
+            "#!/bin/sh\n"
+            'case "$1" in *memlint.py) echo "Traceback: boom" >&2; exit 1;; esac\n'
+            f'exec {shlex.quote(VENV_PYTHON)} "$@"\n')
+        broken.chmod(0o755)
+        return broken
+
+    def test_engine_crash_never_clears_a_sticky_marker(self):
+        self._plant_marker()
+        before = self._marker().read_text()
+        self._edit_wrapper("post-commit", shlex.quote(VENV_PYTHON), shlex.quote(str(self._broken_python())))
+        proc = subprocess.run(["git", "-c", "user.email=t@e.com", "-c", "user.name=T", "commit", "-q",
+                               "--allow-empty", "--no-verify", "-m", "empty"], cwd=str(self.store),
+                              capture_output=True, text=True, env=self._env(), timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("relint=skipped:engine-failure", self._last_postcommit_line())
+        self.assertEqual(self._marker().read_text(), before)
+
+    def test_marker_records_root_and_a_foreign_marker_is_not_cleared(self):
+        self._plant_marker()
+        lines = self._marker().read_text().splitlines()
+        self.assertEqual(lines[0], f"root={self.store.resolve()}")
+        foreign = "root=/some/other/store\n" + "".join(l + "\n" for l in lines[1:])
+        self._marker().write_text(foreign)
+        _git(["rm", "-q", "-f", "topics/nofence.md"], cwd=self.store)
+        proc = self._commit("fix")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("relint=ok marker=foreign", self._last_postcommit_line())
+        self.assertEqual(self._marker().read_text(), foreign)
+
     def test_root_commit_gets_schema_pass_only(self):
-        solo = _git(["init", "-q", str(self.tmp / "solo")], cwd=self.tmp)
         solo_root = self.tmp / "solo"
+        _git(["init", "-q", str(solo_root)], cwd=self.tmp)
+        self._install_wrappers(solo_root)
         (solo_root / "topics").mkdir()
         (solo_root / "topics" / "bad.md").write_text("no fence\n")
         _git(["add", "topics/bad.md"], cwd=solo_root)
-        env = self._env(MEMCONTINUUM_ROOT=str(solo_root), MEMCONTINUUM_PROJECT=self.PROJECT,
-                        MEMCONTINUUM_PYTHON=VENV_PYTHON, MEMCONTINUUM_HOME=str(self.home),
-                        MEMCONTINUUM_EMBED_WORKER="0")
-        subprocess.run(["git", "-c", "user.email=t@e.com", "-c", "user.name=T", "commit", "-q",
-                        "-m", "root", "--no-verify"], cwd=str(solo_root), env=env,
-                       capture_output=True, text=True, timeout=60)
-        proc = subprocess.run([MC_BASH, str(POST_COMMIT_HOOK)], capture_output=True, text=True,
-                              env=env, timeout=60, cwd=str(solo_root))
+        proc = subprocess.run(["git", "-c", "user.email=t@e.com", "-c", "user.name=T", "commit", "-q",
+                               "-m", "root", "--no-verify"], cwd=str(solo_root), env=self._env(),
+                              capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("relint=failed:schema", self._last_postcommit_line())
+
+    def test_missing_lint_lib_fails_open_in_both_hooks(self):
+        env = self._env(MC_STORE_LINT_LIB_PATH=str(self.tmp / "no-such-lint.sh"))
+        proc = self._good_commit(env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        log = self._log()
+        self.assertIn("pre-commit-append-only: skipped=no-lint-lib project=" + self.PROJECT, log)
+        self.assertIn("relint=skipped:no-lint-lib", self._last_postcommit_line())
+
+    # -- hardening ----------------------------------------------------------
+
+    def test_no_watchdog_skips_relint_and_backup(self):
+        self._edit_wrapper("post-commit", shlex.quote(VENV_PYTHON), shlex.quote(str(self.tmp / "no-python")))
+        proc = self._good_commit(self._env(MEMCONTINUUM_BACKUP_DIR=str(self.backup)))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = self._last_postcommit_line()
+        self.assertIn("relint=skipped:no-watchdog", line)
+        self.assertIn("backup=skipped:no-watchdog", line)
+        self.assertEqual(list(self.backup.iterdir()), [])
+
+    def _backup_line_after(self, project=None, **env):
+        if project is not None:
+            wrapper = self.store / ".git" / "hooks" / "post-commit"
+            wrapper.write_text(re.sub(r"(?m)^export MEMCONTINUUM_PROJECT=.*$",
+                                      lambda m: f"export MEMCONTINUUM_PROJECT={shlex.quote(project)}",
+                                      wrapper.read_text()))
+        proc = subprocess.run(["git", "-c", "user.email=t@e.com", "-c", "user.name=T", "commit", "-q",
+                               "--allow-empty", "-m", "empty"], cwd=str(self.store),
+                              capture_output=True, text=True, env=self._env(**env), timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return self._last_postcommit_line()
+
+    def test_project_dotdot_cannot_escape_the_backup_dir(self):
+        inner = self.tmp / "inner"
+        inner.mkdir()
+        line = self._backup_line_after("..", MEMCONTINUUM_BACKUP_DIR=str(inner))
+        self.assertIn("backup=failed:bad-project", line)
+        self.assertEqual([p.name for p in self.tmp.glob("*.bundle*")], [])
+        self.assertEqual(list(inner.iterdir()), [])
+
+    def test_project_dot_or_slash_is_refused(self):
+        line = self._backup_line_after(".", MEMCONTINUUM_BACKUP_DIR=str(self.backup))
+        self.assertIn("backup=failed:bad-project", line)
+        self.assertEqual(list(self.backup.iterdir()), [])
+        line = self._backup_line_after("a/b", MEMCONTINUUM_BACKUP_DIR=str(self.backup))
+        self.assertIn("backup=failed:bad-project", line)
+        self.assertEqual(list(self.backup.iterdir()), [])
+
+    def test_symlinked_project_folder_pointing_outside_is_refused(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (self.backup / self.PROJECT).symlink_to(outside)
+        line = self._backup_line_after(MEMCONTINUUM_BACKUP_DIR=str(self.backup))
+        self.assertIn("backup=failed:bad-project", line)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_relative_backup_dir_is_refused(self):
+        line = self._backup_line_after(MEMCONTINUUM_BACKUP_DIR="relative/dir")
+        self.assertIn("backup=failed:bad-dir", line)
+
+    def test_backup_dir_with_a_space(self):
+        spaced = self.tmp / "back up dir"
+        spaced.mkdir()
+        line = self._backup_line_after(MEMCONTINUUM_BACKUP_DIR=str(spaced))
+        self.assertIn("backup=ok", line)
+        self.assertEqual(len(list((spaced / self.PROJECT).glob("*.bundle"))), 1)
+
+    def test_backup_keep_zero_padded_and_octal_looking_values(self):
+        sub = self.backup / self.PROJECT
+        for keep, expect_ok in (("00", False), ("0", False), ("abc", False), ("08", True), ("010", True)):
+            with self.subTest(keep=keep):
+                shutil.rmtree(sub, ignore_errors=True)
+                sub.mkdir()
+                for i in range(1, 13):
+                    (sub / f"{self.PROJECT}-2020{i:02d}01-0900.bundle").write_text("old")
+                line = self._backup_line_after(MEMCONTINUUM_BACKUP_DIR=str(self.backup),
+                                               MEMCONTINUUM_BACKUP_KEEP=keep)
+                bundles = sorted(sub.glob("*.bundle"))
+                self.assertNotIn("syntax error", line)
+                self.assertTrue(any(b.read_bytes()[:1] != b"o" for b in bundles), "new bundle survives")
+                if expect_ok:
+                    self.assertIn("backup=ok", line)
+                    self.assertEqual(len(bundles), int(keep.lstrip("0")))
+                else:
+                    self.assertIn("backup=failed:bad-keep", line)
+                    self.assertEqual(len(bundles), 13)  # no prune at all
+
+    def test_prune_never_deletes_the_bundle_just_written(self):
+        sub = self.backup / self.PROJECT
+        sub.mkdir()
+        future = sub / f"{self.PROJECT}-29991231-2359.bundle"
+        future.write_text("future")
+        line = self._backup_line_after(MEMCONTINUUM_BACKUP_DIR=str(self.backup),
+                                       MEMCONTINUUM_BACKUP_KEEP="1")
+        self.assertIn("backup=ok", line)
+        names = [p.name for p in sub.glob("*.bundle")]
+        self.assertEqual(len(names), 1, names)
+        self.assertNotEqual(names[0], future.name)
+        self.assertFalse(future.exists())
+
+    def test_failed_prune_is_reported(self):
+        sub = self.backup / self.PROJECT
+        sub.mkdir()
+        old = sub / f"{self.PROJECT}-20200101-0900.bundle"
+        old.mkdir()  # rm -f on a directory fails
+        (old / "x").write_text("x")
+        line = self._backup_line_after(MEMCONTINUUM_BACKUP_DIR=str(self.backup),
+                                       MEMCONTINUUM_BACKUP_KEEP="1")
+        self.assertIn("backup=ok-prune-failed", line)
+
+    def test_stale_part_is_swept_and_reported(self):
+        sub = self.backup / self.PROJECT
+        sub.mkdir()
+        stale = sub / f"{self.PROJECT}-20200101-0900.bundle.part"
+        stale.write_text("half a bundle")
+        line = self._backup_line_after(MEMCONTINUUM_BACKUP_DIR=str(self.backup))
+        self.assertIn("backup=ok part-swept=1", line)
+        self.assertFalse(stale.exists())
+        # ... and no note at all when nothing was swept.
+        line = self._backup_line_after(MEMCONTINUUM_BACKUP_DIR=str(self.backup))
+        self.assertNotIn("part-swept", line)
 
 
 class TestMemorySearchSkill(unittest.TestCase):

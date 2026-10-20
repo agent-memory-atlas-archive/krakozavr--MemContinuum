@@ -2173,6 +2173,7 @@ class TestSessionStartRemind(HookTestBase):
         project = env["MEMCONTINUUM_PROJECT"]
         marker = self.home / f"{project}.relint-failed"
         marker.write_text(
+            "root=/stores/the-store\n"
             "sha=0123456789abcdef0123456789abcdef01234567\n"
             "date=2026-10-19T10:00:00\n"
             "failed=schema\n"
@@ -2182,7 +2183,7 @@ class TestSessionStartRemind(HookTestBase):
         proc, _ = run_script(SESSIONSTART_HOOK, payload, env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn(f"MemContinuum: store {project} commit 01234567 skipped the commit checks "
+        self.assertIn(f"MemContinuum: store {project} (/stores/the-store) commit 01234567 skipped the commit checks "
                       "and would have been refused (memlint: 1 error(s), 0 warning(s)) "
                       "-- fix with a new commit; see ", ctx)
         self.assertIn(f"{project}.relint-failed", ctx)

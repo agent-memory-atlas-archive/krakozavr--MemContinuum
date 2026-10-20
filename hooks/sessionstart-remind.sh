@@ -377,17 +377,18 @@ print((str(g) if g is not None else "?") + " " + str(c))
 # hooks/post-commit-reindex.sh writes it, the next clean store commit removes
 # it). A fact, never an imperative. Nothing printed when there is no marker.
 mc_relint_note() {
-    local f="$MEMCONTINUUM_HOME/$MC_PROJECT.relint-failed" sha="" summary="" line
+    local f="$MEMCONTINUUM_HOME/$MC_PROJECT.relint-failed" sha="" summary="" line root=""
     [ -f "$f" ] || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
+            root=*) root="${line#root=}" ;;
             sha=*) sha="${line#sha=}" ;;
             summary=*) summary="${line#summary=}" ;;
         esac
     done <"$f"
     [ -n "$sha" ] || return 0
-    printf 'MemContinuum: store %s commit %s skipped the commit checks and would have been refused (%s) -- fix with a new commit; see %s' \
-        "$MC_PROJECT" "${sha:0:8}" "$summary" "$f"
+    printf 'MemContinuum: store %s%s commit %s skipped the commit checks and would have been refused (%s) -- fix with a new commit; see %s' \
+        "$MC_PROJECT" "${root:+ ($root)}" "${sha:0:8}" "$summary" "$f"
 }
 
 mc_maybe_upgrade_hint() {

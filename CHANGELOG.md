@@ -6,12 +6,19 @@
   store: set `memcontinuum-setup.sh --backup-dir DIR [--backup-keep N]` and
   the post-commit hook keeps the newest N bundles per store in `DIR/<project>/`
   with a manifest line each. `memcontinuum-update.sh` shows the setting on the
-  machine line and each store's state (off, none, current, behind) in a new
-  `backup` column.
+  machine line and each store's state (off, none, current, behind,
+  unreadable, unknown) in a new `backup` column. The bundle is never written
+  outside `DIR` (project names `.` and `..` are refused, a symlinked project
+  folder pointing elsewhere is refused), the bundle just written is never
+  pruned, a `--backup-keep` such as `00` or `08` is rejected or normalised
+  instead of being read as octal, and a half-written file left by a killed
+  hook is swept at the next run.
 - The post-commit hook now runs the commit checks again, so a store commit
   made with `git commit --no-verify` that would have been refused prints a
   warning, is logged, and is named at the next session start until a clean
-  commit follows.
+  commit follows. An engine crash never clears that warning, a warning from
+  another store with the same project name is left alone, and without the
+  watchdog python neither the re-lint nor the backup runs.
 
 ## [0.3.0] — 2026-10-15
 

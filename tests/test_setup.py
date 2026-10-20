@@ -294,6 +294,12 @@ class TestBootstrapInstall(BootstrapCase):
         self.assertNotEqual(self.bootstrap("--backup-dir", "relative/dir").returncode, 0)
         self.assertNotEqual(self.bootstrap("--backup-keep", "0").returncode, 0)
         self.assertNotEqual(self.bootstrap("--backup-keep", "many").returncode, 0)
+        self.assertNotEqual(self.bootstrap("--backup-keep", "00").returncode, 0)
+
+    def test_backup_keep_is_normalised_to_plain_decimal(self):
+        for given, want in (("08", "8"), ("010", "10"), ("007", "7")):
+            self.assertEqual(self.bootstrap("--backup-keep", given).returncode, 0, given)
+            self.assertEqual(self._config_var("MEMCONTINUUM_BACKUP_KEEP"), want)
 
     def test_rerunning_never_duplicates_the_hook(self):
         for _ in range(3):

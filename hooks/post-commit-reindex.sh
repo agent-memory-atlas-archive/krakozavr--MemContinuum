@@ -95,6 +95,7 @@ MEMIDX="$SCRIPT_DIR/../memidx.py"
 # launcher (which reads MC_WATCHDOG_BUDGET from the environment) sees it.
 # shellcheck source=mc-watchdog.sh
 source "${MC_WATCHDOG_LIB_PATH:-$SCRIPT_DIR/mc-watchdog.sh}" 2>/dev/null
+MC_NO_WATCHDOG=0
 if [ -z "${MC_UNDER_TIMEOUT:-}" ]; then
     export MC_UNDER_TIMEOUT=1
     export MC_WATCHDOG_BUDGET="${MEMCONTINUUM_POST_COMMIT_BUDGET:-30}"
@@ -102,10 +103,19 @@ if [ -z "${MC_UNDER_TIMEOUT:-}" ]; then
         "$MC_GUARD_PY" -c "$MC_WATCHDOG_LAUNCHER_PY" "${BASH:-bash}" "${BASH_SOURCE[0]}" "$@"
         exit 0
     fi
+    # No guard python resolved: this run is NOT under a watchdog. The
+    # re-lint and backup sections below do git/filesystem work that must
+    # never run unwatched, so they log skipped:no-watchdog and do nothing.
+    MC_NO_WATCHDOG=1
 fi
 
+# The lint functions and the backup helpers live in sibling files; a failed
+# load is infrastructure, so the sections below skip (fail open), never abort.
+MC_NO_LINT_LIB=0
 # shellcheck source=mc-store-lint.sh
-source "$SCRIPT_DIR/mc-store-lint.sh" 2>/dev/null
+source "${MC_STORE_LINT_LIB_PATH:-$SCRIPT_DIR/mc-store-lint.sh}" 2>/dev/null || MC_NO_LINT_LIB=1
+# shellcheck source=../scripts/mc-registry-lib.sh
+source "$SCRIPT_DIR/../scripts/mc-registry-lib.sh" 2>/dev/null || true
 
 # From here on: the guarded child. MEMCONTINUUM_HOME is already resolved
 # and exported by mc-watchdog.sh above.
@@ -222,11 +232,20 @@ fi
 RELINT="skipped"
 RELINT_MARKER="$MEMCONTINUUM_HOME/$PROJECT.relint-failed"
 mc_post_commit_relint() {
-    local memlint="$SCRIPT_DIR/../memlint.py" kind="" summary="" sha short
-    if [ ! -x "$PY" ] || ! type mc_store_lint_schema >/dev/null 2>&1; then
+    local memlint="$SCRIPT_DIR/../memlint.py" kind="" summary="" sha short root_phys mroot
+    if [ "$MC_NO_WATCHDOG" -eq 1 ]; then
+        RELINT="skipped:no-watchdog"
+        return 0
+    fi
+    if [ "$MC_NO_LINT_LIB" -eq 1 ] || ! type mc_store_lint_schema >/dev/null 2>&1; then
+        RELINT="skipped:no-lint-lib"
+        return 0
+    fi
+    if [ ! -x "$PY" ]; then
         RELINT="skipped:no-python"
         return 0
     fi
+    root_phys="$(cd "$MEMCONTINUUM_ROOT" 2>/dev/null && pwd -P)"
     mc_store_lint_schema "$PY" "$memlint" "$MEMCONTINUUM_ROOT"
     local append="ok" append_out=""
     if git -C "$MEMCONTINUUM_ROOT" rev-parse --verify -q HEAD~1 >/dev/null 2>&1; then
@@ -238,8 +257,8 @@ mc_post_commit_relint() {
         # An engine crash is never a finding -- unless the other check
         # already produced a real one, which is still worth saying.
         if [ "$MC_LINT_SCHEMA" != "fail" ] && [ "$append" != "fail" ]; then
+            # A crash never clears a sticky finding: only a clean run does.
             RELINT="skipped:engine-failure"
-            rm -f "$RELINT_MARKER" 2>/dev/null
             return 0
         fi
     fi
@@ -252,7 +271,23 @@ mc_post_commit_relint() {
     fi
     if [ -z "$kind" ]; then
         RELINT="ok"
-        rm -f "$RELINT_MARKER" 2>/dev/null
+        if [ -f "$RELINT_MARKER" ]; then
+            # The marker is keyed by project name only, so it records the
+            # store root it came from; another store that shares the name
+            # must neither clear nor be cleared by it. A marker without a
+            # root line predates the field and is treated as this store's.
+            mroot=""
+            IFS= read -r mroot <"$RELINT_MARKER" 2>/dev/null || true
+            case "$mroot" in
+                root=*) mroot="${mroot#root=}" ;;
+                *) mroot="$root_phys" ;;
+            esac
+            if [ "$mroot" = "$root_phys" ]; then
+                rm -f "$RELINT_MARKER" 2>/dev/null
+            else
+                RELINT="ok marker=foreign"
+            fi
+        fi
         return 0
     fi
     RELINT="failed:$kind"
@@ -266,6 +301,7 @@ mc_post_commit_relint() {
     summary="$( { [ "$MC_LINT_SCHEMA" = "fail" ] && printf '%s\n' "$MC_LINT_SCHEMA_OUT"
                   [ "$append" = "fail" ] && printf '%s\n' "$append_out"; } | grep '^memlint: ' | tr '\n' ';' )"
     {
+        printf 'root=%s\n' "$root_phys"
         printf 'sha=%s\n' "$sha"
         printf 'date=%s\n' "$(date -Iseconds 2>/dev/null || date)"
         printf 'failed=%s\n' "$kind"
@@ -277,60 +313,117 @@ mc_post_commit_relint || RELINT="skipped:error"
 
 # --- 4. store backup bundle ---------------------------------------------------
 # Off unless MEMCONTINUUM_BACKUP_DIR is set (env, else config.sh). The dir
-# must already exist; only the per-store subfolder is created. Written as
-# <name>.part, verified, then renamed over the final name (two commits in
-# one minute overwrite; the later bundle is a superset because of --all).
+# must be absolute and already exist; only the per-store subfolder is
+# created. Written as <name>.part, verified, then renamed over the final name
+# (a bundle is a snapshot of the refs at commit time; two commits in one
+# minute share a name and the later snapshot replaces the earlier).
 # Any failure -> backup=failed:<reason>, the .part removed, exit code untouched.
 BACKUP="off"
+MC_PART_NOW=""
+mc_backup_cleanup_part() {
+    [ -n "$MC_PART_NOW" ] && rm -f "$MC_PART_NOW" 2>/dev/null
+    return 0
+}
 mc_post_commit_backup() {
-    local dir="${MEMCONTINUUM_BACKUP_DIR:-}" keep="${MEMCONTINUUM_BACKUP_KEEP:-10}"
-    local sub name part final head commits stat count excess i f
+    local dir="${MEMCONTINUUM_BACKUP_DIR:-}" keep rawkeep="${MEMCONTINUUM_BACKUP_KEEP:-}" keep_bad=0
+    local sub real_dir real_sub name part final head commits stat f
+    local list others_count excess i swept=0 prune_failed=0 suffix=""
     [ -n "$dir" ] || { BACKUP="off"; return 0; }
-    case "$keep" in ''|*[!0-9]*|0) keep=10 ;; esac
+    if [ "$MC_NO_WATCHDOG" -eq 1 ]; then BACKUP="skipped:no-watchdog"; return 0; fi
+    # PROJECT becomes a path segment: refuse anything that could leave DIR.
+    case "$PROJECT" in
+        ""|.|..|*[!A-Za-z0-9._-]*) BACKUP="failed:bad-project"; return 0 ;;
+    esac
+    case "$dir" in
+        /*) ;;
+        *) BACKUP="failed:bad-dir"; return 0 ;;
+    esac
+    if ! type mc_backup_keep_normalize >/dev/null 2>&1 \
+            || ! type mc_backup_bundle_list >/dev/null 2>&1; then
+        BACKUP="skipped:no-lib"; return 0
+    fi
+    if [ -z "$rawkeep" ]; then
+        keep=10
+    elif mc_backup_keep_normalize "$rawkeep"; then
+        keep="$MC_BACKUP_KEEP_NORM"
+    else
+        keep=10; keep_bad=1
+    fi
     if [ ! -d "$dir" ]; then BACKUP="skipped:dir-missing"; return 0; fi
-    sub="$dir/$PROJECT"
+    real_dir="$(cd "$dir" 2>/dev/null && pwd -P)" || { BACKUP="failed:bad-dir"; return 0; }
+    sub="$real_dir/$PROJECT"
     mkdir -p "$sub" 2>/dev/null || { BACKUP="failed:mkdir"; return 0; }
+    # A symlinked <dir>/<project> pointing elsewhere is refused.
+    real_sub="$(cd "$sub" 2>/dev/null && pwd -P)" || { BACKUP="failed:mkdir"; return 0; }
+    case "$real_sub/" in
+        "${real_dir%/}/"*) ;;
+        *) BACKUP="failed:bad-project"; return 0 ;;
+    esac
+    sub="$real_sub"
     name="$PROJECT-$(date +%Y%m%d-%H%M 2>/dev/null).bundle"
     part="$sub/$name.part"
     final="$sub/$name"
+    # A watchdog SIGKILL skips every trap, so a killed run leaves its .part
+    # behind: sweep the ones that sort before this run's own at the start of
+    # the next run (and a TERM/exit trap removes this run's own).
+    for f in "$sub/$PROJECT"-[0-9]*-[0-9]*.bundle.part; do
+        [ -e "$f" ] || continue
+        if [[ "$f" < "$part" ]]; then
+            rm -f "$f" 2>/dev/null && swept=$((swept + 1))
+        fi
+    done
+    [ "$swept" -gt 0 ] && suffix=" part-swept=$swept"
+    MC_PART_NOW="$part"
+    trap mc_backup_cleanup_part EXIT
     if ! git -C "$MEMCONTINUUM_ROOT" bundle create "$part" --all >/dev/null 2>&1; then
-        rm -f "$part" 2>/dev/null; BACKUP="failed:bundle-create"; return 0
+        rm -f "$part" 2>/dev/null; BACKUP="failed:bundle-create$suffix"; return 0
     fi
     if ! git -C "$MEMCONTINUUM_ROOT" bundle verify "$part" >/dev/null 2>&1; then
-        rm -f "$part" 2>/dev/null; BACKUP="failed:verify"; return 0
+        rm -f "$part" 2>/dev/null; BACKUP="failed:verify$suffix"; return 0
     fi
     stat="$("$PY" -c 'import hashlib, os, sys
 p = sys.argv[1]
 print(os.path.getsize(p), hashlib.sha256(open(p, "rb").read()).hexdigest())' "$part" 2>/dev/null)"
     case "$stat" in
         *" "*) ;;
-        *) rm -f "$part" 2>/dev/null; BACKUP="failed:hash"; return 0 ;;
+        *) rm -f "$part" 2>/dev/null; BACKUP="failed:hash$suffix"; return 0 ;;
     esac
     if ! mv -f "$part" "$final" 2>/dev/null; then
-        rm -f "$part" 2>/dev/null; BACKUP="failed:rename"; return 0
+        rm -f "$part" 2>/dev/null; BACKUP="failed:rename$suffix"; return 0
     fi
+    MC_PART_NOW=""
     head="$(git -C "$MEMCONTINUUM_ROOT" rev-parse HEAD 2>/dev/null)"
     commits="$(git -C "$MEMCONTINUUM_ROOT" rev-list --count HEAD 2>/dev/null)"
     printf '%s | source=%s | HEAD=%s | commits=%s | bundle=%s | size=%s | sha256=%s\n' \
         "$PROJECT" "$MEMCONTINUUM_ROOT" "$head" "$commits" "$name" "${stat%% *}" "${stat#* }" \
-        >>"$sub/MANIFEST.txt" 2>/dev/null || { BACKUP="failed:manifest"; return 0; }
-    # Prune after a verified rename only: keep the newest $keep files named
-    # <project>-<digits>-<digits>.bundle (name sort; manual bundles with the
-    # same pattern count). MANIFEST lines are never pruned.
-    count=0
-    for f in "$sub/$PROJECT"-[0-9]*-[0-9]*.bundle; do
-        [ -e "$f" ] && count=$((count + 1))
-    done
-    excess=$((count - keep))
+        >>"$sub/MANIFEST.txt" 2>/dev/null || { BACKUP="failed:manifest$suffix"; return 0; }
+    if [ "$keep_bad" -eq 1 ]; then
+        # An unusable KEEP never prunes: the bundle just written stays.
+        BACKUP="failed:bad-keep$suffix"
+        return 0
+    fi
+    # Prune after a verified rename only: never the bundle just written (its
+    # exact name is excluded, so a future-dated older name cannot displace
+    # it); of the OTHERS keep at most keep-1, oldest names first removed.
+    # MANIFEST lines are never pruned.
+    list="$(mc_backup_bundle_list "$sub" "$PROJECT")"
+    others_count=0
+    while IFS= read -r f; do
+        [ -n "$f" ] && [ "$f" != "$final" ] && others_count=$((others_count + 1))
+    done <<<"$list"
+    excess=$((others_count - (keep - 1)))
     i=0
     if [ "$excess" -gt 0 ]; then
-        for f in "$sub/$PROJECT"-[0-9]*-[0-9]*.bundle; do
-            [ -e "$f" ] || continue
+        while IFS= read -r f; do
+            [ -n "$f" ] && [ "$f" != "$final" ] || continue
             i=$((i + 1))
-            [ "$i" -le "$excess" ] && rm -f "$f" 2>/dev/null
-        done
+            if [ "$i" -le "$excess" ]; then
+                rm -f "$f" 2>/dev/null || prune_failed=1
+                [ -e "$f" ] && prune_failed=1
+            fi
+        done <<<"$list"
     fi
-    BACKUP="ok"
+    if [ "$prune_failed" -eq 1 ]; then BACKUP="ok-prune-failed$suffix"; else BACKUP="ok$suffix"; fi
     return 0
 }
 mc_post_commit_backup || BACKUP="failed:error"

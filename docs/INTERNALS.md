@@ -427,7 +427,13 @@ the commit, `HEAD~1` after it (the index equals `HEAD` for the committed
 paths). A root commit gets the schema pass only. A finding prints a banner on
 stderr, logs `relint=failed:<schema|append-only|both>`, and writes the sticky
 `$MEMCONTINUUM_HOME/<project>.relint-failed` marker that `sessionstart-remind.sh`
-surfaces as one line at startup/resume/clear; a clean run removes it. It can
+surfaces as one line at startup/resume/clear. The marker's first line is
+`root=<physical store root>`: only a clean run of the same root removes it
+(otherwise `relint=ok marker=foreign`), and an engine crash never does. The
+marker is keyed by project name only, so a renamed project leaves its marker
+under the old name (no migration; the nag stops when the file is deleted).
+Without a resolved watchdog python (the script fell through unguarded) the
+re-lint and backup log `skipped:no-watchdog` and do nothing. It can
 not change the exit code, and its cost is the two lints (~0.8s on a 150-file
 store). The pre-commit hook's working-tree-versus-index gap is inherited.
 
@@ -444,7 +450,12 @@ about 0.5s for the bundle on a real store, inside the existing 30s budget,
 which is unchanged. `memcontinuum-update.sh` reports it: the machine line
 (`backup: <dir> (keep N)` / `backup: off`) and a per-store `backup` column
 (`mc_backup_state` in `scripts/mc-registry-lib.sh`: off, none, current,
-behind, unreadable). `--apply` never creates a bundle.
+behind, unreadable, and `unknown` on a row that records no project). The
+KEEP rule is one function, `mc_backup_keep_normalize`, shared by the hook,
+setup and the updater; the bundle name glob is `mc_backup_bundle_list`. The
+project name is a path segment, so the hook refuses `.`/`..`/odd names and a
+symlinked project folder (`backup=failed:bad-project`); `repo-init.sh`
+refuses `.` and `..` as `--project`. `--apply` never creates a bundle.
 
 **Logging, per hook.** The seven project-level hooks each write exactly one
 `outcome=` line per run to `$MEMCONTINUUM_HOME/hook.log`.

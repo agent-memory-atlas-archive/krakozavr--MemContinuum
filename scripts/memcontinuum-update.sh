@@ -50,13 +50,15 @@
 #                  says: these are not looked at, not that they cannot go
 #                  stale (a README's baked python/engine/code-root recipe
 #                  can, and a user pasting a stale one would care).
-#     backup       off/none/current/behind/unreadable -- the store's backup
+#     backup       off/none/current/behind/unreadable/unknown -- the store's backup
 #                  bundles (hooks/post-commit-reindex.sh, memcontinuum-setup.sh
 #                  --backup-dir): off = no backup directory configured (env,
-#                  else config.sh); unreadable = configured but missing;
-#                  none = no bundle for this store in it; current = the
-#                  newest bundle's HEAD equals the store's HEAD; behind =
-#                  otherwise. Informational only; --apply never creates a
+#                  else config.sh); unreadable = configured but missing or
+#                  unreadable, the store's subfolder cannot be read, or the
+#                  newest bundle cannot be read; none = no bundle for this
+#                  store in it; current = the newest bundle's HEAD equals
+#                  the store's HEAD; behind = otherwise; unknown = the row
+#                  records no project=, so there is no store to look up. Informational only; --apply never creates a
 #                  bundle (the commit hook does). The machine line below the
 #                  table repeats the configured directory and keep count.
 #     action       ok | stale | store-mismatch | store-form-stale |
@@ -1245,14 +1247,8 @@ process_claude_dir() {
     mc_update_rules_state "$claude_dir"
     mc_update_skill_state "$claude_dir"
     mc_update_store_hooks_state
-    # backup column: settings resolved once per run (mc_backup_settings in
-    # scripts/mc-registry-lib.sh, the same env-then-config.sh order the hook
-    # uses), state per store (mc_backup_state, same file).
-    if [ -z "${MC_BACKUP_SETTINGS_DONE:-}" ]; then
-        mc_backup_settings "$MEMCONTINUUM_HOME/config.sh"
-        MC_BACKUP_SETTINGS_DONE=1
-    fi
-    mc_backup_state "$STORE" "$PROJECT"
+    # backup column: see backup_state_for.
+    backup_state_for "$STORE" "$PROJECT"
 
     # store-missing outranks everything, INCLUDING a clean stamp and a
     # store= that still matches what is rendered. A rendered
@@ -1752,6 +1748,18 @@ if [ -n "$TARGET_REPO" ]; then
     ONLY_KEY="$MC_REPO_KEY"
 fi
 
+# backup_state_for STORE PROJECT -- sets MC_BACKUP_STATE for the `backup`
+# column. Settings are resolved once per run (mc_backup_settings in
+# scripts/mc-registry-lib.sh, the same env-then-config.sh order the hook
+# uses), state per store (mc_backup_state, same file).
+backup_state_for() {
+    if [ -z "${MC_BACKUP_SETTINGS_DONE:-}" ]; then
+        mc_backup_settings "$MEMCONTINUUM_HOME/config.sh"
+        MC_BACKUP_SETTINGS_DONE=1
+    fi
+    mc_backup_state "$1" "$2"
+}
+
 while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
     case "$RAW_LINE" in \#*|"") continue ;; esac
     KEY="${RAW_LINE%%"$MC_TAB"*}"
@@ -1817,7 +1825,8 @@ while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
             case "$KEY" in
                 /*) CLAUDE_DIRS_SEMI="$KEY/.claude" ;;
                 *)
-                    print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unknown" "unknown" "unknown" "unrecoverable"
+                    backup_state_for "$STORE" "$PROJECT"
+                    print_row "$KEY" "(unknown)" "none" "unknown" "unknown" "unknown" "unknown" "$MC_BACKUP_STATE" "unrecoverable"
                     echo "  legacy row, no claude-dirs recorded, and the key is a remote URL (not a path) -- this row's claude-dir cannot be recovered automatically. Fix: memcontinuum-decide.sh wired --repo PATH --store $STORE --project $PROJECT --claude-dir DIR [--code-root DIR ...] [--langs LIST]" >&2
                     [ "$APPLY" -eq 1 ] && WALK_RC=1
                     continue

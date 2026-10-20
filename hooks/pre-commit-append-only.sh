@@ -84,7 +84,8 @@ source "${MC_WATCHDOG_LIB_PATH:-$SCRIPT_DIR/mc-watchdog.sh}" 2>/dev/null
 # The two memlint checks and their verdict parsing, shared with the
 # post-commit re-lint (hooks/post-commit-reindex.sh).
 # shellcheck source=mc-store-lint.sh
-source "$SCRIPT_DIR/mc-store-lint.sh"
+MC_NO_LINT_LIB=0
+source "${MC_STORE_LINT_LIB_PATH:-$SCRIPT_DIR/mc-store-lint.sh}" 2>/dev/null || MC_NO_LINT_LIB=1
 # Deliberately never invoking the re-exec/guard block mc-watchdog.sh also
 # defines (see header above) -- sourcing it only for the
 # MEMCONTINUUM_HOME/config.sh resolution and MC_GUARD_PY it computes as a
@@ -101,6 +102,13 @@ log_line() {
     printf '%s pre-commit-append-only: %s\n' \
         "$(date -Iseconds 2>/dev/null || date)" "$1" >>"$LOG" 2>/dev/null || true
 }
+
+if [ "$MC_NO_LINT_LIB" -eq 1 ]; then
+    # Infrastructure fails open: without the lint functions there is nothing
+    # to judge a commit by, and a broken checkout must not block commits.
+    log_line "skipped=no-lint-lib project=${MEMCONTINUUM_PROJECT:-$(basename "${MEMCONTINUUM_ROOT:-default}")}"
+    exit 0
+fi
 
 if [ -z "${MEMCONTINUUM_ROOT:-}" ]; then
     _SKIP_PROJECT="${MEMCONTINUUM_PROJECT:-default}"

@@ -192,9 +192,16 @@ commit already exists. Instead the hook prints `MemContinuum: commit <sha> in
 store <project> skipped the commit checks and would have been refused:` and
 memlint's output on stderr, logs `relint=failed:schema|append-only|both`, and
 writes `$MEMCONTINUUM_HOME/<project>.relint-failed` (sha, date, summary). The
-next session start names the marker in one line; the next clean commit
-removes it. An engine crash is `relint=skipped:engine-failure`, never a
-finding. The `pre-commit` hook's documented gaps (the schema pass reads the
+next session start names the marker in one line (with the store root it came
+from, the marker's first line `root=<physical path>`); the next clean commit
+of that same store removes it (another store sharing the project name leaves
+it alone and logs `relint=ok marker=foreign`). An engine crash is
+`relint=skipped:engine-failure`, never a finding, and never clears the marker.
+A renamed project leaves its marker under the old name. With no watchdog
+python (`MC_GUARD_PY` unresolved) the re-lint and backup log
+`relint=skipped:no-watchdog` / `backup=skipped:no-watchdog` and do nothing; a
+missing `mc-store-lint.sh` is `relint=skipped:no-lint-lib` (and the
+`pre-commit` hook fails open with `skipped=no-lint-lib`). The `pre-commit` hook's documented gaps (the schema pass reads the
 working tree, not the index) are inherited unchanged.
 
 #### Store backup bundle
@@ -208,18 +215,31 @@ deliberately not exported by the installed wrapper:
   The hook never creates it (on WSL an unmounted `/mnt/d` would otherwise
   silently receive bundles on the Linux root); a missing directory logs
   `backup=skipped:dir-missing`.
-- `MEMCONTINUUM_BACKUP_KEEP` — bundles to keep per store (default 10).
+- `MEMCONTINUUM_BACKUP_KEEP` — bundles to keep per store (default 10). A
+  positive decimal; leading zeros are stripped (`08` is 8, never octal). An
+  unusable value (`0`, `00`, `abc`) logs `backup=failed:bad-keep` and prunes
+  nothing; the bundle is still written. `memcontinuum-setup.sh` rejects it at
+  the flag.
+- A relative directory logs `backup=failed:bad-dir`; a project name that is
+  `.`, `..` or has anything outside `[A-Za-z0-9._-]` logs
+  `backup=failed:bad-project`, as does a `<dir>/<project>` symlink that
+  resolves outside `<dir>`.
 
 Layout: `<dir>/<project>/<project>-YYYYMMDD-HHMM.bundle` plus one
 `MANIFEST.txt` line per bundle (`<project> | source=… | HEAD=… | commits=… |
 bundle=… | size=… | sha256=…`). The folder name is the project name verbatim;
 on a case-insensitive drive (drvfs) `IceKEY-OpenRouter` lands in an existing
 `icekey-openrouter` folder. Each bundle is written as `<name>.part`, verified
-with `git bundle verify`, then renamed; two commits in the same minute
-overwrite, and the later bundle is a superset because it is made with
-`--all`. After a verified rename the hook keeps the newest N files matching
-`<project>-<digits>-<digits>.bundle` (by name; a manual bundle with that name
-pattern counts toward N) and deletes the rest. Manifest lines are never
+with `git bundle verify`, then renamed. A bundle is a snapshot of the refs at
+commit time (not the reflog, so an `--amend` or reset drops the old commit
+from later bundles); two commits in the same minute share a name and the
+later snapshot replaces the earlier. After a verified rename the hook keeps
+the bundle it just wrote plus at most N-1 others matching
+`<project>-<digits>-<digits>.bundle` (oldest names removed first; a manual
+bundle with that name pattern counts, and a future-dated name cannot displace
+the new bundle) and deletes the rest; a failed delete logs
+`backup=ok-prune-failed`. A `.part` left by a killed hook is removed at the
+start of the next run (`part-swept=N` is logged only when N>0). Manifest lines are never
 pruned. Any failure logs `backup=failed:<reason>`, removes the `.part`, and
 leaves the exit code and the commit alone.
 

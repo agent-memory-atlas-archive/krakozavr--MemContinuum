@@ -1219,6 +1219,39 @@ class TestBackupColumn(UpdateTestBase):
         shutil.rmtree(backup)
         self.assertEqual(self.table_rows(self._run())[0]["backup"], "unreadable")
 
+    def test_corrupt_newest_bundle_is_unreadable_not_behind(self):
+        backup = Path(self.tmp, "bk")
+        backup.mkdir()
+        self._write_config(backup)
+        sub = Path(backup, "proj")
+        sub.mkdir()
+        (sub / "proj-20261019-1000.bundle").write_text("not a bundle")
+        self.assertEqual(self.table_rows(self._run())[0]["backup"], "unreadable")
+
+    def test_invalid_keep_is_named_not_silently_defaulted(self):
+        backup = Path(self.tmp, "bk")
+        backup.mkdir()
+        self._write_config(backup, keep="08x")
+        self.assertIn(f"backup: {backup} (keep invalid)", self._run())
+
+    def test_unrecoverable_row_with_known_store_and_project_still_gets_backup_state(self):
+        backup = Path(self.tmp, "bk")
+        backup.mkdir()
+        self._write_config(backup)
+        self._bundle(backup)
+        write_row(self.home, "https://example.invalid/x.git", "wired",
+                  note=f"store={self.store} project=proj")
+        out = self._run()
+        row = [r for r in self.table_rows(out) if "example.invalid" in r["repo"]][0]
+        self.assertEqual(row["action"], "unrecoverable")
+        self.assertEqual(row["backup"], "current")
+
+    def test_unrecoverable_row_without_project_is_unknown(self):
+        write_row(self.home, "https://example.invalid/y.git", "wired", note="store=/somewhere")
+        out = self._run()
+        row = [r for r in self.table_rows(out) if "example.invalid" in r["repo"]][0]
+        self.assertEqual(row["backup"], "unknown")
+
     def test_apply_does_not_create_a_bundle(self):
         backup = Path(self.tmp, "bk")
         backup.mkdir()

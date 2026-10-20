@@ -462,10 +462,18 @@ if [ "$DRY_RUN" -eq 0 ]; then
     case "$BACKUP_DIR" in
         *"$MC_NL"*) die "backup dir path contains a newline -- unsupported" ;;
     esac
-    case "$BACKUP_KEEP" in
-        ''|*[!0-9]*) [ -z "$BACKUP_KEEP" ] || die "--backup-keep must be a positive integer (got: $BACKUP_KEEP)" ;;
-        0) die "--backup-keep must be a positive integer (got: 0)" ;;
-    esac
+    if [ -n "$BACKUP_KEEP" ]; then
+        # mc_backup_keep_normalize: the one validity rule (no octal reading
+        # of 08/010, 0 refused); the file gets the plain decimal.
+        if mc_backup_keep_normalize "$BACKUP_KEEP"; then
+            BACKUP_KEEP="$MC_BACKUP_KEEP_NORM"
+        elif [ "$BACKUP_KEEP_GIVEN" -eq 1 ]; then
+            die "--backup-keep must be a positive integer (got: $BACKUP_KEEP)"
+        else
+            printf 'WARNING: ignoring the invalid MEMCONTINUUM_BACKUP_KEEP=%s recorded in %s\n' "$BACKUP_KEEP" "$CONFIG" >&2
+            BACKUP_KEEP=""
+        fi
+    fi
     BACKUP_CONF="# Store backup bundles: not configured (memcontinuum-setup.sh --backup-dir DIR turns them on)."
     if [ -n "$BACKUP_DIR" ] || [ -n "$BACKUP_KEEP" ]; then
         BACKUP_CONF="# Store backup bundles, written by hooks/post-commit-reindex.sh after each store
