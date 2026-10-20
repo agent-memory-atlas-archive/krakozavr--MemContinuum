@@ -3401,6 +3401,22 @@ class TestProjectNameCanonicalization(unittest.TestCase):
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
+    def test_dot_and_dotdot_project_names_refused(self):
+        """"." and ".." fit [A-Za-z0-9._-]+ but are path traversals once the
+        name is a path segment (the store-backup folder)."""
+        for name in (".", ".."):
+            home = sandbox_home()
+            try:
+                store = str(Path(home) / "store")
+                proc = run_install(
+                    ["--project", name, "--store", store, "--claude-dir", str(Path(home) / ".claude")],
+                    home,
+                )
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertFalse(Path(store).exists())
+            finally:
+                shutil.rmtree(home, ignore_errors=True)
+
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestCodeCensusAndConsentDialogue(unittest.TestCase):

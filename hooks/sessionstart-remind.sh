@@ -371,6 +371,26 @@ print((str(g) if g is not None else "?") + " " + str(c))
     fi
 }
 
+# mc_relint_note -- prints ONE fact line when the store's post-commit hook
+# left a sticky `<project>.relint-failed` marker (a commit that skipped the
+# commit checks, e.g. `git commit --no-verify`, and would have been refused;
+# hooks/post-commit-reindex.sh writes it, the next clean store commit removes
+# it). A fact, never an imperative. Nothing printed when there is no marker.
+mc_relint_note() {
+    local f="$MEMCONTINUUM_HOME/$MC_PROJECT.relint-failed" sha="" summary="" line root=""
+    [ -f "$f" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            root=*) root="${line#root=}" ;;
+            sha=*) sha="${line#sha=}" ;;
+            summary=*) summary="${line#summary=}" ;;
+        esac
+    done <"$f"
+    [ -n "$sha" ] || return 0
+    printf 'MemContinuum: store %s%s commit %s skipped the commit checks and would have been refused (%s) -- fix with a new commit; see %s' \
+        "$MC_PROJECT" "${root:+ ($root)}" "${sha:0:8}" "$summary" "$f"
+}
+
 mc_maybe_upgrade_hint() {
     STANDING_HINT_CTX=""
     [ "$STANDING_STATUS" = "skipped-upgrade-required" ] || return
@@ -573,12 +593,23 @@ print(json.dumps(state))
             fi
         fi
 
+        RELINT_NOTE="$(mc_relint_note)"
+        RELINT_TOKEN=""
+        if [ -n "$RELINT_NOTE" ]; then
+            if [ -n "$STANDING_CTX" ]; then
+                STANDING_CTX="$STANDING_CTX"$'\n\n'"$RELINT_NOTE"
+            else
+                STANDING_CTX="$RELINT_NOTE"
+            fi
+            RELINT_TOKEN=" relint=shown"
+        fi
+
         if [ -n "$STANDING_CTX" ]; then
             PY_OUT="$(mc_wrap_context "$STANDING_CTX")"
             [ -n "$PY_OUT" ] && printf '%s\n' "$PY_OUT"
         fi
 
-        finish "init" "standing=$STANDING_LOG_TOKEN"
+        finish "init" "standing=$STANDING_LOG_TOKEN$RELINT_TOKEN"
         ;;
 
     compact)

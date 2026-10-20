@@ -181,6 +181,91 @@ the marker, and the worker loops again rather than declaring victory early).
 See docs/INTERNALS.md's watchdog and embedding-lifecycle sections for the
 full contract, including the crash/retry behavior.
 
+#### Post-commit re-lint
+
+`git commit --no-verify` skips `pre-commit` but never `post-commit`, so after
+the reindex this hook runs the same two checks `pre-commit` runs (the schema
+pass, and the append-only comparison of `HEAD~1` against the index; a root
+commit gets the schema pass only). The checks live in one sourced file,
+`hooks/mc-store-lint.sh`, shared by both hooks. A finding never blocks — the
+commit already exists. Instead the hook prints `MemContinuum: commit <sha> in
+store <project> skipped the commit checks and would have been refused:` and
+memlint's output on stderr, logs `relint=failed:schema|append-only|both`, and
+writes `$MEMCONTINUUM_HOME/<project>.relint-failed` (sha, date, summary). The
+next session start names the marker in one line (with the store root it came
+from, the marker's first line `root=<physical path>`); the next clean commit
+of that same store removes it (another store sharing the project name leaves
+it alone and logs `relint=ok marker=foreign`; a finding in such a second store
+leaves the first store's marker in place and logs `relint=failed:<kind>
+marker=foreign`, the banner still printing). An engine crash, or a memlint run
+that exits 0 without printing its summary line, is
+`relint=skipped:engine-failure`, never a finding, and never clears the marker.
+A renamed project leaves its marker under the old name. With no watchdog
+python (`MC_GUARD_PY` unresolved) the re-lint and backup log
+`relint=skipped:no-watchdog` / `backup=skipped:no-watchdog` and do nothing; a
+missing `mc-store-lint.sh` is `relint=skipped:no-lint-lib` (and the
+`pre-commit` hook fails open with `skipped=no-lint-lib`). The `pre-commit` hook's documented gaps (the schema pass reads the
+working tree, not the index) are inherited unchanged.
+
+#### Store backup bundle
+
+Off unless a backup directory is configured. Settings, environment first, then
+`$MEMCONTINUUM_HOME/config.sh` (which `memcontinuum-setup.sh --backup-dir DIR
+--backup-keep N` writes, and keeps on later runs without the flags). They are
+deliberately not exported by the installed wrapper:
+
+- `MEMCONTINUUM_BACKUP_DIR` — an absolute directory that **already exists**.
+  The hook never creates it (on WSL an unmounted `/mnt/d` would otherwise
+  silently receive bundles on the Linux root); a missing directory logs
+  `backup=skipped:dir-missing`.
+- `MEMCONTINUUM_BACKUP_KEEP` — bundles to keep per store (default 10). A
+  positive decimal; leading zeros are stripped (`08` is 8, never octal). An
+  unusable value (`0`, `00`, `abc`) logs `backup=failed:bad-keep` and prunes
+  nothing; the bundle is still written. `memcontinuum-setup.sh` rejects it at
+  the flag.
+- A relative directory, or one containing a newline or other control character,
+  logs `backup=skipped:bad-dir`; a project name that is `.`, `..` or has
+  anything outside `[A-Za-z0-9._-]` logs `relint=skipped:bad-project
+  backup=skipped:bad-project` and writes no marker (a name with a slash or
+  control character skips the whole hook, reindex included). A
+  `<dir>/<project>` symlink that resolves outside `<dir>` logs
+  `backup=failed:bad-project`. Only files named exactly
+  `<project>-YYYYMMDD-HHMM.bundle` count as bundles. An empty
+  `MEMCONTINUUM_BACKUP_DIR` in the environment switches backups off even when
+  `config.sh` records a directory. A `MANIFEST.txt` that is a symlink or not a
+  regular file is not appended to (`backup=ok-manifest-refused`, bundle kept).
+
+Layout: `<dir>/<project>/<project>-YYYYMMDD-HHMM.bundle` plus one
+`MANIFEST.txt` line per bundle (`<project> | source=… | HEAD=… | commits=… |
+bundle=… | size=… | sha256=…`). The folder name is the project name verbatim;
+on a case-insensitive drive (drvfs) `IceKEY-OpenRouter` lands in an existing
+`icekey-openrouter` folder. Each bundle is written as `<name>.part.<pid>` (unique per hook run; created
+exclusively, the write itself being the exclusive open, so a planted symlink is
+never followed; the bundle goes through stdout so git makes no `.lock`), verified with `git bundle
+verify`, then renamed with a refusal (`backup=failed:dest`) when the final name
+is a symlink or a directory. A bundle is a snapshot of the refs at
+commit time (not the reflog, so an `--amend` or reset drops the old commit
+from later bundles); two commits in the same minute share a name and the
+later one replaces the earlier (the second atomic rename wins). After a verified rename the hook keeps
+the bundle it just wrote plus at most N-1 others matching
+`<project>-YYYYMMDD-HHMM.bundle` (oldest names removed first; a manual
+bundle with that name pattern counts, and a future-dated name cannot displace
+the new bundle) and deletes the rest; a failed delete logs
+`backup=ok-prune-failed`. A leftover `<name>.part.<digits>` (or an old `.part`, or a `.part.lock` from installs that ran the earlier named
+`git bundle create` form) from a killed hook is removed at the start of a later run only when its
+modification time is older than twice `MEMCONTINUUM_POST_COMMIT_BUDGET` (default 30, so 60 s); younger
+ones may belong to a live overlapping hook (`part-swept=N` is logged only when N>0). For `git commit --amend`, post-commit compares against the amended
+commit's parent, so a link introduced by the amended commit and rewritten in
+the amend reads as an add (pre-commit would have compared against the
+replaced commit); links that existed in the parent are still caught. Amending a
+store's root commit is not supported (schema-checked only). Manifest lines are never
+pruned. Any failure logs `backup=failed:<reason>`, removes its `.part.<pid>`, and
+leaves the exit code and the commit alone.
+
+Restore: `git clone <dir>/<project>/<file>.bundle <new-store-path>`.
+
+The hook's single log line gains `relint=… backup=…` after `embed=…`.
+
 ### 3b. `pre-commit-append-only.sh` — the store's `pre-commit`
 
 Enforces the append-only invariant docs/SCHEMA.md section 7 describes —

@@ -2165,6 +2165,35 @@ class TestSessionStartRemind(HookTestBase):
         self.assertEqual(state.get("start_code_sha"), git_head(self.code_root))
         self.assertEqual(state.get("start_store_sha"), git_head(self.store_root))
 
+    def test_relint_marker_surfaces_one_line_at_session_start(self):
+        """0.4.0: a sticky <project>.relint-failed marker (written by the
+        store post-commit re-lint) becomes one fact line in the startup
+        context; without the marker the startup stays silent."""
+        env = self.base_env()
+        project = env["MEMCONTINUUM_PROJECT"]
+        marker = self.home / f"{project}.relint-failed"
+        marker.write_text(
+            "root=/stores/the-store\n"
+            "sha=0123456789abcdef0123456789abcdef01234567\n"
+            "date=2026-10-19T10:00:00\n"
+            "failed=schema\n"
+            "summary=memlint: 1 error(s), 0 warning(s)\n"
+        )
+        payload = self.session_start_payload("s-start-relint", source="startup")
+        proc, _ = run_script(SESSIONSTART_HOOK, payload, env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"MemContinuum: store {project} (/stores/the-store) commit 01234567 skipped the commit checks "
+                      "and would have been refused (memlint: 1 error(s), 0 warning(s)) "
+                      "-- fix with a new commit; see ", ctx)
+        self.assertIn(f"{project}.relint-failed", ctx)
+        self.assertIn("relint=shown", (self.home / "hook.log").read_text())
+
+        marker.unlink()
+        proc, _ = run_script(SESSIONSTART_HOOK, self.session_start_payload("s-start-relint2", source="startup"), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
     def test_clear_inits_state_with_start_shas_silently(self):
         """INC-0108: a session that begins with /clear (source=clear) must
         take the same init path as startup -- a cleared session is a fresh

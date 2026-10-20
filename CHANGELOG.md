@@ -1,5 +1,34 @@
 # Changelog
 
+## [Unreleased]
+
+- Every store commit can now write a verified `git bundle` backup of the
+  store: set `memcontinuum-setup.sh --backup-dir DIR [--backup-keep N]` and
+  the post-commit hook keeps the newest N bundles per store in `DIR/<project>/`
+  with a manifest line each. `memcontinuum-update.sh` shows the setting on the
+  machine line and each store's state (off, none, current, behind,
+  unreadable, unknown) in a new `backup` column. The bundle is never written
+  outside `DIR` (project names `.` and `..` are refused, a symlinked project
+  folder pointing elsewhere is refused), the bundle just written is never
+  pruned, a `--backup-keep` such as `00` or `08` is rejected or normalised
+  instead of being read as octal, and a half-written file left by a killed
+  hook (`<name>.part.<pid>`) is swept by a later run once it is older than twice
+  the hook budget (60 s by default), so a live overlapping hook's file is left alone.
+- The post-commit hook now runs the commit checks again, so a store commit
+  made with `git commit --no-verify` that would have been refused prints a
+  warning, is logged, and is named at the next session start until a clean
+  commit follows. An engine crash (or a lint that prints nothing) never clears
+  that warning; a warning left by another store with the same project name is
+  neither cleared nor overwritten (the second store's own finding is then only
+  printed and logged, `marker=foreign`); and without the watchdog python
+  neither the re-lint nor the backup runs. A project name that could leave
+  its folder (`..`, a slash, a newline) makes the hook skip both the re-lint
+  marker and the backup; a bad backup directory skips only the backup, the
+  re-lint still runs. Every file the hook creates (bundle part, marker temp)
+  is created exclusively (the bundle is written through the exclusive open itself) and never through a planted symlink, and a bundle or
+  marker path that is a symlink or a directory is refused instead of being
+  moved into.
+
 ## [0.3.0] — 2026-10-15
 
 Upgrading: the decision index schema generation moves from 5 to 6 (it now

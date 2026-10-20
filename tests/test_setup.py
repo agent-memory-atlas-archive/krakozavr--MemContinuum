@@ -257,6 +257,62 @@ class TestBootstrapInstall(BootstrapCase):
         self.assertEqual(self.read_settings()["permissions"], {"allow": ["Bash(ls:*)"]})
         self.assertTrue(Path(str(self.settings) + ".bak-memcontinuum").is_file())
 
+    def _config_var(self, name):
+        """config.sh as sourced by a hook with NAME unset first."""
+        out = subprocess.run(
+            ["bash", "-c", f'unset {name}; . "$1"; printf %s "${{{name}:-}}"',
+             "x", str(Path(self.mc_home, "config.sh"))],
+            capture_output=True, text=True,
+        )
+        return out.stdout
+
+    def test_backup_flags_are_recorded_and_survive_a_rerun_without_them(self):
+        backup = Path(self.tmp) / "back up's"
+        backup.mkdir()
+        self.assertEqual(self.bootstrap("--backup-dir", str(backup), "--backup-keep", "4").returncode, 0)
+        self.assertEqual(self._config_var("MEMCONTINUUM_BACKUP_DIR"), str(backup))
+        self.assertEqual(self._config_var("MEMCONTINUUM_BACKUP_KEEP"), "4")
+        # A re-run WITHOUT the flags keeps the recorded values...
+        self.assertEqual(self.bootstrap().returncode, 0)
+        self.assertEqual(self._config_var("MEMCONTINUUM_BACKUP_DIR"), str(backup))
+        self.assertEqual(self._config_var("MEMCONTINUUM_BACKUP_KEEP"), "4")
+        # ...one flag changes only its own value...
+        self.assertEqual(self.bootstrap("--backup-keep", "7").returncode, 0)
+        self.assertEqual(self._config_var("MEMCONTINUUM_BACKUP_DIR"), str(backup))
+        self.assertEqual(self._config_var("MEMCONTINUUM_BACKUP_KEEP"), "7")
+        # ...and an explicit empty --backup-dir turns backups off.
+        self.assertEqual(self.bootstrap("--backup-dir", "").returncode, 0)
+        self.assertEqual(self._config_var("MEMCONTINUUM_BACKUP_DIR"), "")
+
+    def test_empty_env_backup_dir_beats_the_recorded_config_line(self):
+        backup = Path(self.tmp) / "bk"
+        backup.mkdir()
+        self.assertEqual(self.bootstrap("--backup-dir", str(backup)).returncode, 0)
+        cfg = str(Path(self.mc_home, "config.sh"))
+        lib = str(Path(__file__).resolve().parent.parent / "scripts" / "mc-registry-lib.sh")
+        out = subprocess.run(
+            ["bash", "-c", 'MEMCONTINUUM_BACKUP_DIR=""; . "$1"; printf "[%s]" "${MEMCONTINUUM_BACKUP_DIR-unset}"; '
+             '. "$2"; mc_backup_settings "$1"; printf "[%s]" "$MC_BACKUP_DIR"', "x", cfg, lib],
+            capture_output=True, text=True)
+        self.assertEqual(out.stdout, "[][]", out.stderr)
+
+    def test_no_backup_flags_means_no_backup_lines(self):
+        self.assertEqual(self.bootstrap().returncode, 0)
+        config = Path(self.mc_home, "config.sh").read_text(encoding="utf-8")
+        self.assertNotIn("MEMCONTINUUM_BACKUP_DIR=", config)
+        self.assertEqual(self._config_var("MEMCONTINUUM_BACKUP_DIR"), "")
+
+    def test_backup_flags_reject_bad_values(self):
+        self.assertNotEqual(self.bootstrap("--backup-dir", "relative/dir").returncode, 0)
+        self.assertNotEqual(self.bootstrap("--backup-keep", "0").returncode, 0)
+        self.assertNotEqual(self.bootstrap("--backup-keep", "many").returncode, 0)
+        self.assertNotEqual(self.bootstrap("--backup-keep", "00").returncode, 0)
+
+    def test_backup_keep_is_normalised_to_plain_decimal(self):
+        for given, want in (("08", "8"), ("010", "10"), ("007", "7")):
+            self.assertEqual(self.bootstrap("--backup-keep", given).returncode, 0, given)
+            self.assertEqual(self._config_var("MEMCONTINUUM_BACKUP_KEEP"), want)
+
     def test_rerunning_never_duplicates_the_hook(self):
         for _ in range(3):
             self.assertEqual(self.bootstrap().returncode, 0)

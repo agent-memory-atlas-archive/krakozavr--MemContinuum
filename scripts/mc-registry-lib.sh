@@ -1283,6 +1283,164 @@ mc_resolve_home() {
     return 0
 }
 
+# mc_config_read_var CONFIG_FILE NAME
+#
+# Prints the value NAME has in a config.sh AS IT STANDS ON DISK (empty when
+# the file or the name is absent), ignoring the calling environment: NAME is
+# unset inside the subshell first, for the same reason as
+# mc_config_managed_python (config.sh writes its lines conditionally so an
+# env override wins at hook time; a disk read must not see that override).
+# Optional extra arguments name more variables to unset first (a caller
+# reading one name of a pair config.sh writes together). Used for the
+# store-backup settings by memcontinuum-setup.sh (preserve the
+# recorded values on a re-run without the flags) and memcontinuum-update.sh.
+mc_config_read_var() {
+    local config="${1:-}" name="${2:-}"
+    [ -n "$config" ] && [ -n "$name" ] && [ -f "$config" ] || return 0
+    (
+        shift 2
+        unset "$name" "$@"
+        # shellcheck source=/dev/null
+        . "$config" >/dev/null 2>&1
+        eval "printf '%s' \"\${$name:-}\""
+    )
+}
+
+# mc_backup_keep_normalize VALUE
+#
+# The ONE definition of a valid MEMCONTINUUM_BACKUP_KEEP (the hook, setup and
+# the updater all call it). Digits only, leading zeros stripped textually
+# (never through $(( )), where 08/010 are octal), at least 1, at most eight
+# digits. Sets MC_BACKUP_KEEP_NORM to the plain decimal ("" when invalid);
+# returns 0 when valid, 1 otherwise.
+mc_backup_keep_normalize() {
+    local k="${1:-}"
+    MC_BACKUP_KEEP_NORM=""
+    case "$k" in ''|*[!0-9]*) return 1 ;; esac
+    k="${k#"${k%%[!0]*}"}"
+    case "$k" in ''|?????????*) return 1 ;; esac
+    MC_BACKUP_KEEP_NORM="$k"
+    return 0
+}
+
+# mc_backup_name_ok PROJECT BASENAME [SUFFIX]
+#
+# True when BASENAME is exactly <PROJECT>-YYYYMMDD-HHMM<SUFFIX> (8 digits, dash,
+# 4 digits; SUFFIX defaults to ".bundle", the .part sweep passes
+# ".bundle.part"). The ONE definition of a bundle name: the glob
+# `<project>-[0-9]*-[0-9]*` alone also matches `proj-1notes-2manual.bundle`.
+# PROJECT is quoted, so it is literal in the pattern.
+mc_backup_name_ok() {
+    case "$2" in
+        "$1"-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]"${3:-.bundle}") return 0 ;;
+    esac
+    return 1
+}
+
+# mc_backup_part_ok PROJECT BASENAME
+#
+# True when BASENAME is a temporary a backup run may leave behind:
+# <PROJECT>-YYYYMMDD-HHMM.bundle.part, ...bundle.part.<digits> (pid-suffixed,
+# current form) or ...bundle.part.lock (earlier named `git bundle create`).
+mc_backup_part_ok() {
+    mc_backup_name_ok "$1" "$2" .bundle.part && return 0
+    mc_backup_name_ok "$1" "$2" .bundle.part.lock && return 0
+    case "$2" in
+        "$1"-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9].bundle.part.*)
+            case "${2##*.bundle.part.}" in ''|*[!0-9]*) return 1 ;; esac
+            return 0 ;;
+    esac
+    return 1
+}
+
+# mc_backup_bundle_list SUBDIR PROJECT
+#
+# Fills the array MC_BACKUP_BUNDLES with the files in SUBDIR that satisfy
+# mc_backup_name_ok, in name order -- the ONE definition of "a bundle of this
+# store" (the hook prunes by it, mc_backup_state reads the newest by it; manual
+# bundles with the same name count). An array, never a newline-joined string:
+# a path is never split, so no serialisation step can turn one path into two
+# deletion candidates. Callers iterate by index (an empty array under `set -u`
+# is unsafe on bash 3.2).
+mc_backup_bundle_list() {
+    local f
+    MC_BACKUP_BUNDLES=()
+    for f in "$1/$2"-[0-9]*-[0-9]*.bundle; do
+        [ -e "$f" ] || continue
+        mc_backup_name_ok "$2" "${f##*/}" || continue
+        MC_BACKUP_BUNDLES[${#MC_BACKUP_BUNDLES[@]}]="$f"
+    done
+    return 0
+}
+
+# mc_backup_settings [CONFIG_FILE]
+#
+# Sets MC_BACKUP_DIR and MC_BACKUP_KEEP the way hooks/post-commit-reindex.sh
+# resolves them: the environment first, then CONFIG_FILE (default
+# $MEMCONTINUUM_HOME/config.sh). MC_BACKUP_DIR is empty when backups are off;
+# MC_BACKUP_KEEP is 10 when unset, the normalized number when valid, and the
+# word "invalid" when set to something mc_backup_keep_normalize refuses.
+mc_backup_settings() {
+    local config="${1:-${MEMCONTINUUM_HOME:-$HOME/.memcontinuum}/config.sh}"
+    MC_BACKUP_DIR="${MEMCONTINUUM_BACKUP_DIR:-}"
+    MC_BACKUP_KEEP="${MEMCONTINUUM_BACKUP_KEEP:-}"
+    # Presence, not non-emptiness: MEMCONTINUUM_BACKUP_DIR='' in the
+    # environment is an explicit "off" that config.sh must not override.
+    [ -n "${MEMCONTINUUM_BACKUP_DIR+x}" ] || MC_BACKUP_DIR="$(mc_config_read_var "$config" MEMCONTINUUM_BACKUP_DIR)"
+    [ -n "$MC_BACKUP_KEEP" ] || MC_BACKUP_KEEP="$(mc_config_read_var "$config" MEMCONTINUUM_BACKUP_KEEP)"
+    if [ -z "$MC_BACKUP_KEEP" ]; then
+        MC_BACKUP_KEEP=10
+    elif mc_backup_keep_normalize "$MC_BACKUP_KEEP"; then
+        MC_BACKUP_KEEP="$MC_BACKUP_KEEP_NORM"
+    else
+        MC_BACKUP_KEEP="invalid"
+    fi
+    return 0
+}
+
+# mc_backup_state STORE PROJECT
+#
+# Sets MC_BACKUP_STATE for the updater's `backup` column (needs
+# mc_backup_settings first):
+#   off         no backup directory configured
+#   unreadable  directory configured but missing or unreadable, this store's
+#               subfolder exists but cannot be read, or the newest bundle
+#               cannot be read (git bundle list-heads fails)
+#   none        directory present, no bundle for this store in it
+#   current     the newest bundle's HEAD equals the store's HEAD
+#   behind      otherwise
+# "Newest" is by name sort over mc_backup_bundle_list.
+mc_backup_state() {
+    local store="$1" project="$2" sub newest="" heads bundle_head store_head n
+    MC_BACKUP_STATE="off"
+    [ -n "${MC_BACKUP_DIR:-}" ] || return 0
+    if [ ! -d "$MC_BACKUP_DIR" ] || [ ! -r "$MC_BACKUP_DIR" ] || [ ! -x "$MC_BACKUP_DIR" ]; then
+        MC_BACKUP_STATE="unreadable"
+        return 0
+    fi
+    sub="$MC_BACKUP_DIR/$project"
+    if [ -d "$sub" ] && { [ ! -r "$sub" ] || [ ! -x "$sub" ]; }; then
+        MC_BACKUP_STATE="unreadable"
+        return 0
+    fi
+    mc_backup_bundle_list "$sub" "$project"
+    n=${#MC_BACKUP_BUNDLES[@]}
+    [ "$n" -gt 0 ] && newest="${MC_BACKUP_BUNDLES[$((n - 1))]}"
+    if [ -z "$newest" ]; then
+        MC_BACKUP_STATE="none"
+        return 0
+    fi
+    if ! heads="$(git bundle list-heads "$newest" HEAD 2>/dev/null)"; then
+        MC_BACKUP_STATE="unreadable"
+        return 0
+    fi
+    MC_BACKUP_STATE="behind"
+    bundle_head="${heads%% *}"
+    store_head="$(git -C "$store" rev-parse HEAD 2>/dev/null)" || return 0
+    [ -n "$bundle_head" ] && [ "$bundle_head" = "$store_head" ] && MC_BACKUP_STATE="current"
+    return 0
+}
+
 # mc_config_managed_python CONFIG_FILE
 #
 # Read MEMCONTINUUM_PYTHON and MEMCONTINUUM_VENV_MANAGED off a config.sh AS
@@ -1313,17 +1471,8 @@ mc_config_managed_python() {
     MC_CONFIG_PYTHON=""
     MC_CONFIG_MANAGED="0"
     [ -n "$config" ] && [ -f "$config" ] || return 1
-    MC_CONFIG_PYTHON="$(
-        unset MEMCONTINUUM_PYTHON MEMCONTINUUM_VENV_MANAGED
-        # shellcheck source=/dev/null
-        . "$config" >/dev/null 2>&1
-        printf '%s' "${MEMCONTINUUM_PYTHON:-}"
-    )"
-    MC_CONFIG_MANAGED="$(
-        unset MEMCONTINUUM_PYTHON MEMCONTINUUM_VENV_MANAGED
-        # shellcheck source=/dev/null
-        . "$config" >/dev/null 2>&1
-        printf '%s' "${MEMCONTINUUM_VENV_MANAGED:-0}"
-    )"
+    MC_CONFIG_PYTHON="$(mc_config_read_var "$config" MEMCONTINUUM_PYTHON MEMCONTINUUM_VENV_MANAGED)"
+    MC_CONFIG_MANAGED="$(mc_config_read_var "$config" MEMCONTINUUM_VENV_MANAGED MEMCONTINUUM_PYTHON)"
+    [ -n "$MC_CONFIG_MANAGED" ] || MC_CONFIG_MANAGED="0"
     return 0
 }

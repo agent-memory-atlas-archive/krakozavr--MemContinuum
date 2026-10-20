@@ -218,7 +218,7 @@ class UpdateTestBase(unittest.TestCase):
         self.assertTrue(lines, out)
         header = lines[0].split("\t")
         self.assertEqual(header, ["repo", "claude-dir", "stamped", "engine", "store-match",
-                                   "rules", "skill", "store-hooks", "action"])
+                                   "rules", "skill", "store-hooks", "backup", "action"])
         return [dict(zip(header, l.split("\t"))) for l in lines[1:]]
 
 
@@ -1170,6 +1170,95 @@ class TestStoreHooksColumn(UpdateTestBase):
                 rows2 = self.table_rows(proc.stdout)
                 self.assertEqual(rows2[0]["store-hooks"], expected_state, proc.stdout)
                 self.assertEqual(rows2[0]["action"], "ok", proc.stdout)
+
+
+class TestBackupColumn(UpdateTestBase):
+    """0.4.0: the backup column (off/none/current/behind/unreadable) and the
+    machine line's backup field. Reads only; --apply never creates a bundle."""
+
+    def _run(self):
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc.stdout
+
+    def _bundle(self, dest_dir, name="proj-20261019-1000.bundle"):
+        sub = Path(dest_dir, "proj")
+        sub.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "-C", self.store, "bundle", "create", str(sub / name), "--all"],
+                       check=True, capture_output=True)
+
+    def _write_config(self, backup_dir, keep=None):
+        cfg = Path(self.home, ".memcontinuum", "config.sh")
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        lines = [f"MEMCONTINUUM_BACKUP_DIR='{backup_dir}'"]
+        if keep:
+            lines.append(f"MEMCONTINUUM_BACKUP_KEEP='{keep}'")
+        cfg.write_text("\n".join(lines) + "\n")
+
+    def test_off_when_unset(self):
+        out = self._run()
+        self.assertEqual(self.table_rows(out)[0]["backup"], "off")
+        self.assertIn("backup: off", out)
+
+    def test_none_current_behind_unreadable(self):
+        backup = Path(self.tmp, "bk")
+        backup.mkdir()
+        self._write_config(backup, keep=5)
+        out = self._run()
+        self.assertEqual(self.table_rows(out)[0]["backup"], "none")
+        self.assertIn(f"backup: {backup} (keep 5)", out)
+
+        self._bundle(backup)
+        self.assertEqual(self.table_rows(self._run())[0]["backup"], "current")
+
+        subprocess.run(["git", "-C", self.store, "-c", "user.email=t@e.com", "-c", "user.name=T",
+                        "commit", "-q", "--allow-empty", "-m", "later"],
+                       check=True, capture_output=True)
+        self.assertEqual(self.table_rows(self._run())[0]["backup"], "behind")
+
+        shutil.rmtree(backup)
+        self.assertEqual(self.table_rows(self._run())[0]["backup"], "unreadable")
+
+    def test_corrupt_newest_bundle_is_unreadable_not_behind(self):
+        backup = Path(self.tmp, "bk")
+        backup.mkdir()
+        self._write_config(backup)
+        sub = Path(backup, "proj")
+        sub.mkdir()
+        (sub / "proj-20261019-1000.bundle").write_text("not a bundle")
+        self.assertEqual(self.table_rows(self._run())[0]["backup"], "unreadable")
+
+    def test_invalid_keep_is_named_not_silently_defaulted(self):
+        backup = Path(self.tmp, "bk")
+        backup.mkdir()
+        self._write_config(backup, keep="08x")
+        self.assertIn(f"backup: {backup} (keep invalid)", self._run())
+
+    def test_unrecoverable_row_with_known_store_and_project_still_gets_backup_state(self):
+        backup = Path(self.tmp, "bk")
+        backup.mkdir()
+        self._write_config(backup)
+        self._bundle(backup)
+        write_row(self.home, "https://example.invalid/x.git", "wired",
+                  note=f"store={self.store} project=proj")
+        out = self._run()
+        row = [r for r in self.table_rows(out) if "example.invalid" in r["repo"]][0]
+        self.assertEqual(row["action"], "unrecoverable")
+        self.assertEqual(row["backup"], "current")
+
+    def test_unrecoverable_row_without_project_is_unknown(self):
+        write_row(self.home, "https://example.invalid/y.git", "wired", note="store=/somewhere")
+        out = self._run()
+        row = [r for r in self.table_rows(out) if "example.invalid" in r["repo"]][0]
+        self.assertEqual(row["backup"], "unknown")
+
+    def test_apply_does_not_create_a_bundle(self):
+        backup = Path(self.tmp, "bk")
+        backup.mkdir()
+        self._write_config(backup)
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(list(backup.rglob("*.bundle")), [])
 
 
 class TestMachineFlag(UpdateTestBase):

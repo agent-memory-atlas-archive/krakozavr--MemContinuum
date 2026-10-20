@@ -623,6 +623,9 @@ fi
 # glob-expand there is refused outright rather than silently mismatching.
 case "$PROJECT" in
     ""|*[!A-Za-z0-9._-]*) fail "--project must match [A-Za-z0-9._-]+ (got: $PROJECT)" 2 ;;
+    # "." and ".." pass the class above but are path traversals once the
+    # name is used as a path segment (backup folder, <project>.sqlite stem).
+    .|..) fail "--project must not be \".\" or \"..\" (got: $PROJECT)" 2 ;;
 esac
 
 # fix-round-4 R5: this refusal needs no python and must be checked before

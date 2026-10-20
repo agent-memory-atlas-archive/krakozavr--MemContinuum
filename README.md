@@ -247,7 +247,8 @@ Two layers, and mixing them up is the usual source of confusion:
 
 ```bash
 bash memcontinuum-setup.sh [--venv DIR] [--python PATH] [--claude-dir DIR]
-                           [--no-model-warm] [--dry-run] [--uninstall]
+                           [--no-model-warm] [--backup-dir DIR] [--backup-keep N]
+                           [--dry-run] [--uninstall]
 ```
 
 `--venv DIR` creates the venv (default `<checkout>/.venv`), or `--python PATH`
@@ -256,6 +257,11 @@ uses an existing one that already has `requirements.txt` installed.
 `--no-model-warm` skips the one-time ~100 MB model download — it is on by
 default because, left lazy, that download lands inside somebody's first reindex,
 where it looks like a hang. `--dry-run` prints the plan and writes nothing.
+
+`--backup-dir DIR` turns on store backups: after each store commit the hook
+writes a verified `git bundle` to `DIR/<project>/` and keeps the newest
+`--backup-keep N` (default 10). `DIR` must already exist; see
+`hooks/install-hooks.md` for the layout and how to restore.
 
 Run it with neither `--venv` nor `--python`, from a real terminal, and it asks
 which python you want (use this python, or create or reuse the engine venv)

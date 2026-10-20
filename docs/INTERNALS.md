@@ -415,6 +415,66 @@ Budget: this channel runs inside the SAME 2s watchdog every other
 fixture (ext4, fts mode, a real hit): ~0.29s end to end for the whole
 hook run, five-sample average — comfortably inside budget.
 
+**Post-commit re-lint.** `git commit --no-verify` skips `pre-commit`, not
+`post-commit`. After the reindex pass, `post-commit-reindex.sh`
+re-runs the two `pre-commit-append-only.sh` checks through the shared
+`hooks/mc-store-lint.sh` (`mc_store_lint_schema`, `mc_store_lint_append_only`;
+sourced, bash 3.2 safe, they set result variables and never exit), with the
+same marker-trust rule: a verdict counts only with memlint's own summary line
+(`memlint: N error(s)` / `changed=`); an engine crash is
+`relint=skipped:engine-failure`. The only difference is the ref: `HEAD` before
+the commit, `HEAD~1` after it (the index equals `HEAD` for the committed
+paths). A root commit gets the schema pass only. A finding prints a banner on
+stderr, logs `relint=failed:<schema|append-only|both>`, and writes the sticky
+`$MEMCONTINUUM_HOME/<project>.relint-failed` marker that `sessionstart-remind.sh`
+surfaces as one line at startup/resume/clear. The marker's first line is
+`root=<physical store root>`: only a clean run of the same root removes it
+(otherwise `relint=ok marker=foreign`), and an engine crash never does. The
+marker is keyed by project name only, so a renamed project leaves its marker
+under the old name (no migration; the nag stops when the file is deleted).
+Without a resolved watchdog python (the script fell through unguarded) the
+re-lint and backup log `skipped:no-watchdog` and do nothing. It can
+not change the exit code, and its cost is the two lints (~0.8s on a 150-file
+store). The pre-commit hook's working-tree-versus-index gap is inherited.
+
+**Store backup bundle.** The same guarded child, after the re-lint, writes a
+`git bundle create --all` into `$MEMCONTINUUM_BACKUP_DIR/<project>/` when that
+directory is configured (environment, then `config.sh`, resolved by the
+config.sh sourcing `mc-watchdog.sh` already does; the installed wrapper is
+deliberately not extended, because `mc_installer_wrapper_shape` requires
+exactly five lines). The directory must pre-exist; the bundle is written to
+`<name>.part.<pid>` (unique per run) and the exclusive open IS the write
+(`rm -f`, then `set -C` on the very redirection git's stdout uses: a planted
+symlink is refused, not followed; stdout form `git bundle create -`, so no
+`.lock`). Grammar-checked leftovers (`.part.<digits>`, old `.part`, old
+`.part.lock`) older than twice the budget (default 30 s, so 60 s; the budget is
+normalised by `mc_backup_keep_normalize`, bad value -> 30) are swept, never by
+name order. The part is verified, and
+renamed through `mc_safe_replace` (refuses a symlink or directory destination:
+`failed:dest`; the re-lint marker uses a unique `.new.$$` temp and the same
+rename; `marker=write-failed`); the manifest line and the newest-N prune (by name sort, manual
+bundles with the same pattern included) follow a successful rename only.
+Failures are `backup=failed:<reason>` and never touch the exit code. Cost is
+about 0.5s for the bundle on a real store, inside the existing 30s budget,
+which is unchanged. `memcontinuum-update.sh` reports it: the machine line
+(`backup: <dir> (keep N)` / `backup: off`) and a per-store `backup` column
+(`mc_backup_state` in `scripts/mc-registry-lib.sh`: off, none, current,
+behind, unreadable, and `unknown` on a row that records no project). The
+KEEP rule is one function, `mc_backup_keep_normalize`, shared by the hook,
+setup and the updater; the bundle name is defined once by `mc_backup_name_ok`
+(exact `<project>-YYYYMMDD-HHMM.bundle`) and `mc_backup_bundle_list` fills an
+array from it (never a newline-joined string, so a path is never split). The
+project name and backup dir are validated once, before any path is built
+(`relint=skipped:bad-project backup=skipped:bad-project` / `skipped:bad-dir`);
+a symlinked project folder is `backup=failed:bad-project`. A post-commit
+re-lint of an amended ROOT commit is schema-checked only (no `HEAD~1`);
+amending a store's root commit is not a supported case; for `--amend`
+post-commit compares against the amended commit's parent, so a link added by
+the amended commit and rewritten in the amend reads as an add (pre-commit
+compared against the replaced commit), while links present in the parent are
+still caught; `repo-init.sh`
+refuses `.` and `..` as `--project`. `--apply` never creates a bundle.
+
 **Logging, per hook.** The seven project-level hooks each write exactly one
 `outcome=` line per run to `$MEMCONTINUUM_HOME/hook.log`.
 Diagnostic lines may precede it (`pre-edit-chain.sh` logs a missing-python note
@@ -423,7 +483,7 @@ guarded hook cannot write its own outcome line then — it may be mid-call, or m
 never have reached that code — so `mc-watchdog.sh` writes
 `outcome=watchdog-killed hook=<name>` itself before exiting. The three hooks
 outside that rule are deliberate: `post-commit-reindex.sh` writes its own
-`post-commit-reindex: rc=… elapsed=… project=… root=… embed=pending|clean|skipped`
+`post-commit-reindex: rc=… elapsed=… project=… root=… embed=pending|clean|skipped relint=… backup=…`
 line instead, `pre-commit-append-only.sh` writes its own line, one of
 `pre-commit-append-only: rc=1 changed=<n> project=…` (refused the commit),
 `rc=0 changed=<n> project=…` (clean), or `skipped=<reason> project=…` — an
