@@ -3651,15 +3651,42 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
         self.assertIn("backup=ok", self._last_postcommit_line())
         self.assertEqual(len(list(sub.glob("*.bundle"))), 1)
 
+    def _age(self, path, seconds):
+        t = time.time() - seconds
+        os.utime(path, (t, t), follow_symlinks=False)
+
     def test_stale_part_lock_is_swept(self):
         sub = self.backup / self.PROJECT
         sub.mkdir()
         stale = sub / f"{self.PROJECT}-20200101-0900.bundle.part.lock"
         stale.write_text("x")
+        self._age(stale, 600)
         proc = self._good_commit(self._env(MEMCONTINUUM_BACKUP_DIR=str(self.backup)))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse(stale.exists())
         self.assertIn("part-swept=1", self._last_postcommit_line())
+
+    def test_fresh_part_of_another_pid_survives_and_old_one_is_swept(self):
+        sub = self.backup / self.PROJECT
+        sub.mkdir()
+        fresh = sub / f"{self.PROJECT}-20200101-0900.bundle.part.4242"
+        fresh.write_text("live")
+        old = sub / f"{self.PROJECT}-20200101-0901.bundle.part.4243"
+        old.write_text("dead")
+        self._age(old, 600)
+        proc = self._good_commit(self._env(MEMCONTINUUM_BACKUP_DIR=str(self.backup)))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(fresh.read_text(), "live")
+        self.assertFalse(old.exists())
+        self.assertIn("part-swept=1", self._last_postcommit_line())
+
+    def test_part_name_is_unique_per_invocation(self):
+        sub = self.backup / self.PROJECT
+        sub.mkdir()
+
+        text = Path(__file__).resolve().parent.parent.joinpath("hooks", "post-commit-reindex.sh").read_text()
+        self.assertIn('part="$final.part.$$"', text)
+        self.assertIn("( set -C; git -C", text)
 
     def test_directory_at_final_bundle_name_is_refused(self):
         sub = self.backup / self.PROJECT
@@ -3935,6 +3962,7 @@ class TestPostCommitRelintAndBackup(unittest.TestCase):
         sub.mkdir()
         stale = sub / f"{self.PROJECT}-20200101-0900.bundle.part"
         stale.write_text("half a bundle")
+        self._age(stale, 600)
         line = self._backup_line_after(MEMCONTINUUM_BACKUP_DIR=str(self.backup))
         self.assertIn("backup=ok part-swept=1", line)
         self.assertFalse(stale.exists())

@@ -1337,6 +1337,22 @@ mc_backup_name_ok() {
     return 1
 }
 
+# mc_backup_part_ok PROJECT BASENAME
+#
+# True when BASENAME is a temporary a backup run may leave behind:
+# <PROJECT>-YYYYMMDD-HHMM.bundle.part, ...bundle.part.<digits> (pid-suffixed,
+# current form) or ...bundle.part.lock (earlier named `git bundle create`).
+mc_backup_part_ok() {
+    mc_backup_name_ok "$1" "$2" .bundle.part && return 0
+    mc_backup_name_ok "$1" "$2" .bundle.part.lock && return 0
+    case "$2" in
+        "$1"-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9].bundle.part.*)
+            case "${2##*.bundle.part.}" in ''|*[!0-9]*) return 1 ;; esac
+            return 0 ;;
+    esac
+    return 1
+}
+
 # mc_backup_bundle_list SUBDIR PROJECT
 #
 # Fills the array MC_BACKUP_BUNDLES with the files in SUBDIR that satisfy

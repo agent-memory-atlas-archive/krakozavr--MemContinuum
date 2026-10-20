@@ -24,7 +24,7 @@
   its folder (`..`, a slash, a newline) makes the hook skip both the re-lint
   marker and the backup; a bad backup directory skips only the backup, the
   re-lint still runs. Every file the hook creates (bundle part, marker temp)
-  is created exclusively and never through a planted symlink, and a bundle or
+  is created exclusively (the bundle is written through the exclusive open itself) and never through a planted symlink, and a bundle or
   marker path that is a symlink or a directory is refused instead of being
   moved into.
 

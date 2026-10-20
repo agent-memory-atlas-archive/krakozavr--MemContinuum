@@ -389,9 +389,9 @@ mc_post_commit_relint || RELINT="skipped:error"
 # --- 4. store backup bundle ---------------------------------------------------
 # Off unless MEMCONTINUUM_BACKUP_DIR is set (env, else config.sh). The dir
 # must be absolute and already exist; only the per-store subfolder is
-# created. Written as <name>.part, verified, then renamed over the final name
-# (a bundle is a snapshot of the refs at commit time; two commits in one
-# minute share a name and the later snapshot replaces the earlier).
+# created. Written as <name>.part.<pid> (unique per invocation), verified, then
+# renamed over the final name (a bundle is a snapshot of the refs at commit
+# time; two commits in one minute share a name and the later one wins).
 # Any failure -> backup=failed:<reason>, the .part removed, exit code untouched.
 BACKUP="off"
 MC_PART_NOW=""
@@ -402,7 +402,7 @@ mc_backup_cleanup_part() {
 mc_post_commit_backup() {
     local dir="${MEMCONTINUUM_BACKUP_DIR:-}" keep rawkeep="${MEMCONTINUUM_BACKUP_KEEP:-}" keep_bad=0
     local sub real_dir real_sub name part final head commits stat f
-    local n others_count excess i swept=0 prune_failed=0 suffix=""
+    local budget maxage age n others_count excess i swept=0 prune_failed=0 suffix=""
     [ -n "$dir" ] || { BACKUP="off"; return 0; }
     if [ "$MC_NO_WATCHDOG" -eq 1 ]; then BACKUP="skipped:no-watchdog"; return 0; fi
     # PROJECT and DIR were validated once, above, before any path was built.
@@ -411,6 +411,7 @@ mc_post_commit_backup() {
     if ! type mc_backup_keep_normalize >/dev/null 2>&1 \
             || ! type mc_backup_bundle_list >/dev/null 2>&1 \
             || ! type mc_backup_name_ok >/dev/null 2>&1 \
+            || ! type mc_backup_part_ok >/dev/null 2>&1 \
             || ! type mc_physical >/dev/null 2>&1; then
         BACKUP="skipped:no-lib"; return 0
     fi
@@ -433,34 +434,35 @@ mc_post_commit_backup() {
     esac
     sub="$real_sub"
     name="$PROJECT-$(date +%Y%m%d-%H%M 2>/dev/null).bundle"
-    part="$sub/$name.part"
     final="$sub/$name"
-    # A watchdog SIGKILL skips every trap, so a killed run leaves its .part
-    # behind: sweep the ones that sort before this run's own at the start of
-    # the next run (and a TERM/exit trap removes this run's own).
-    # (Also the *.bundle.part.lock files the old named `git bundle create`
-    # form left behind when it was killed.)
-    for f in "$sub/$PROJECT"-[0-9]*-[0-9]*.bundle.part "$sub/$PROJECT"-[0-9]*-[0-9]*.bundle.part.lock; do
+    part="$final.part.$$"
+    # A watchdog SIGKILL skips every trap, so a killed run leaves its temp
+    # behind. Sweep only grammar-checked leftovers (<name>.part.<digits>, the
+    # old <name>.part, <name>.part.lock) whose mtime is older than twice the
+    # watchdog budget: a younger one may belong to a live, overlapping hook.
+    # Never by name order.
+    budget="${MEMCONTINUUM_POST_COMMIT_BUDGET:-30}"
+    case "$budget" in ''|*[!0-9]*) budget=30 ;; esac
+    maxage=$((budget * 2))
+    for f in "$sub/$PROJECT"-[0-9]*-[0-9]*.bundle.part "$sub/$PROJECT"-[0-9]*-[0-9]*.bundle.part.*; do
         [ -e "$f" ] || [ -L "$f" ] || continue
-        case "$f" in
-            *.part.lock) mc_backup_name_ok "$PROJECT" "${f##*/}" .bundle.part.lock || continue ;;
-            *) mc_backup_name_ok "$PROJECT" "${f##*/}" .bundle.part || continue ;;
-        esac
-        if [[ "$f" < "$part" ]]; then
+        mc_backup_part_ok "$PROJECT" "${f##*/}" || continue
+        age="$("$PY" -c 'import os, sys, time
+print(int(time.time() - os.lstat(sys.argv[1]).st_mtime))' "$f" 2>/dev/null)"
+        case "$age" in ''|*[!0-9]*) continue ;; esac
+        if [ "$age" -gt "$maxage" ]; then
             rm -f "$f" 2>/dev/null && swept=$((swept + 1))
         fi
     done
     [ "$swept" -gt 0 ] && suffix=" part-swept=$swept"
     MC_PART_NOW="$part"
     trap mc_backup_cleanup_part EXIT
-    # Created exclusively: unlink any planted symlink (never its target), then
-    # noclobber-create; the bundle goes to stdout so git makes no .lock file.
+    # The exclusive create IS the write: noclobber applies to the very
+    # redirection git's stdout goes through, so no path is reopened and a
+    # symlink swapped in is refused, not followed. The bundle goes to stdout
+    # so git makes no .lock file.
     rm -f "$part" 2>/dev/null
-    if [ -e "$part" ] || [ -L "$part" ]; then BACKUP="failed:part$suffix"; return 0; fi
-    if ! ( set -C; : >"$part" ) 2>/dev/null; then
-        BACKUP="failed:part$suffix"; return 0
-    fi
-    if ! git -C "$MEMCONTINUUM_ROOT" bundle create - --all >"$part" 2>/dev/null \
+    if ! ( set -C; git -C "$MEMCONTINUUM_ROOT" bundle create - --all >"$part" ) 2>/dev/null \
             || [ -L "$part" ]; then
         rm -f "$part" 2>/dev/null; BACKUP="failed:bundle-create$suffix"; return 0
     fi
