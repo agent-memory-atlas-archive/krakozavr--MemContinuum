@@ -1652,6 +1652,73 @@ a window) raises its own FLAG there.
 Ordinary coreutils (`cat`, `dirname`, `date`, `mkdir`, …) are used freely — what
 is avoided is specifically the two GNU-only binaries macOS lacks.
 
+## Write-safety checklist for hooks and scripts
+
+Every new hook or script that writes outside the store cites this list in its
+brief. Each rule names the code that already implements it; reuse that code
+rather than writing a second copy. Background lives in
+[hooks and the fail-open contract](#hooks-and-the-fail-open-contract), the
+post-commit re-lint and backup paragraphs there, and
+[the watchdog](#the-watchdog); shell portability is in
+[bash 3.2 discipline](#bash-32-discipline).
+
+1. **Validate names before building any path.** The two values that become
+   path segments are checked once, in the validation block of
+   `hooks/post-commit-reindex.sh` (before the reindex, ahead of any
+   project-derived path), not inside each section.
+   - Project name: empty, `.`, `..`, a `/` or a control character is
+     `PATH_UNSAFE`; the hook logs `skipped:bad-project` and exits having built
+     no project-derived path. A name outside `[A-Za-z0-9._-]` is `BAD_PROJECT`
+     only: the reindex still runs, the re-lint marker and backup are skipped.
+     `scripts/repo-init.sh` refuses `.` and `..` as `--project`.
+   - Backup directory: empty means off; it must be absolute, and a control
+     character is `BAD_DIR`. Only the backup section is skipped
+     (`skipped:bad-dir`).
+
+   Compare paths through `mc_physical` (`scripts/mc-registry-lib.sh`) so a
+   symlink cannot alias a protected path; the backup uses it to contain
+   `<dir>/<project>` inside the real backup directory.
+2. **A configured root must pre-exist; the hook creates only its own
+   subfolder.** Never `mkdir -p` a user-configured destination: on WSL an
+   unmounted `/mnt/d` would receive the files on the Linux root and the hook
+   would report success. A missing directory logs `skipped:dir-missing`.
+3. **Published files are created exclusively, under a per-invocation name, and
+   the exclusive create is the write.** This covers the bundle
+   (`<name>.part.<pid>`) and the re-lint marker (`.new.$$`): any stale file of
+   that name is `rm -f`'d, then `( set -C; cmd > "$part" )` creates it.
+   Never create then write, and never share a temp name between overlapping
+   invocations. `MANIFEST.txt` is the other pattern, for an append-only log:
+   `>>` only after checking it is not a symlink or a non-regular file.
+4. **A replaced artifact is published by rename, and the rename refuses
+   symlink or directory targets.** `mc_safe_replace` in
+   `hooks/post-commit-reindex.sh` refuses a
+   symlink or directory destination, then calls `os.replace`. It does not
+   check filesystems: the caller must create the temp file beside its
+   destination so the rename stays atomic. No `mv` over a path a user controls.
+5. **Sweep leftovers by age and exact grammar, never by loose glob.** A temp
+   file is removed only when it is older than twice the hook's watchdog budget
+   (an invalid budget counts as 30 s) and its name passes `mc_backup_part_ok`;
+   a fresh file from an overlapping
+   run is never a candidate. Published bundles are different: the prune lists
+   them with `mc_backup_bundle_list` (exact `mc_backup_name_ok` grammar, name
+   order) and keeps the newest N by that order, with the bundle just written
+   excluded explicitly.
+6. **Never `$(( ))` on a value you did not normalise.** A leading zero is octal
+   in bash (`08` crashes, `010` is misread). Keep one normaliser per setting,
+   shared by every reader; `mc_backup_keep_normalize` (hook, setup and updater)
+   is the model.
+7. **A verdict needs a positive signal, not a zero exit.** Each lint check is
+   trusted only when its own marker is present: `MC_LINT_SCHEMA_SUMMARY` for
+   the schema pass, the append-only `changed=` count (`MC_LINT_CHANGED`) for
+   the append-only pass (`hooks/mc-store-lint.sh`). A crash or a missing
+   python is `skipped`, never `ok` and never a finding, but a crash in one
+   check does not hide a genuine finding from the other. A sticky marker is
+   cleared only by a genuinely clean run whose recorded root matches (a marker
+   with no recorded root is cleared too).
+8. **Nothing after the main job may change the exit code**, and each extra
+   section logs its own `key=value` on the one `hook.log` line (the post-commit
+   line format is under the per-hook logging list above).
+
 ## bash 3.2 discipline
 
 Stock macOS ships bash 3.2.57, so every shell script here — hooks, installer,
