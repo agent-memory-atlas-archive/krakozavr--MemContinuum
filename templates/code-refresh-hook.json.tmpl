@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MEMCONTINUUM_RENDERED={{RENDERED}} MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/code-refresh.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MEMCONTINUUM_RENDERED={{RENDERED}} MEMCONTINUUM_ROOT={{STORE}} {{CODE_ROOT_ENV}}MEMCONTINUUM_PROJECT={{PROJECT}} MEMCONTINUUM_PYTHON={{PYTHON}} bash {{HOOKS_DIR}}/code-refresh.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

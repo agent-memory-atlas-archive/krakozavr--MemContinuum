@@ -5426,5 +5426,130 @@ class TestGitignoreHonouredByCodeWalk(unittest.TestCase):
             self.assertEqual(len(seen), 2, seen)  # one walk for reindex, one for the report
 
 
+class TestHealSharedWithCodeRefresh(unittest.TestCase):
+    """TOP-0137 L2 step 4: heal_code_index is the ONE incremental call both
+    code-search and hooks/code-refresh.sh make. It names its caller, can
+    hand its messages back instead of printing them, says WHY it did not
+    heal (over-limit vs fail-open exception vs a held refresh lock) and
+    treats a deleted file as heal-eligible."""
+
+    def _indexed(self, td):
+        root = Path(td) / "code"; root.mkdir()
+        (root / "a.py").write_text("def alpha():\n    pass\n")
+        (root / "b.py").write_text("def beta():\n    pass\n")
+        db = Path(td) / "idx-code.sqlite"
+        code_reindex(root, db, lang="python")
+        return root, db
+
+    def _heal(self, db, **kw):
+        conn = memidx.open_code_db(db)
+        report = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+        out = {}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            after, conn2 = memidx.heal_code_index(
+                conn, db, memidx.DEFAULT_PROJECT, report, limit=kw.pop("limit", 500), result=out, **kw
+            )
+        return report, after, conn2, out, err.getvalue()
+
+    def test_a_deleted_file_alone_makes_the_heal_eligible_and_purges_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._indexed(td)
+            (root / "b.py").unlink()
+            report, after, conn, out, err = self._heal(db)
+            self.assertEqual((report["changed"], report["removed"]), (1, 1))
+            self.assertEqual(out["outcome"], "healed")
+            self.assertEqual(after["changed"], 0)
+            names = {r["symbol"] for r in conn.execute("SELECT symbol FROM chunks")}
+            conn.close()
+            self.assertEqual(names, {"alpha"})
+
+    def test_result_dict_captures_messages_and_nothing_reaches_stderr(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._indexed(td)
+            (root / "a.py").write_text("def alpha2():\n    pass\n")
+            report, after, conn, out, err = self._heal(db, caller="code-refresh")
+            conn.close()
+            self.assertEqual(err, "")
+            self.assertEqual(out["outcome"], "healed")
+            self.assertEqual(out["reindexed"], 1)
+            self.assertEqual(out["messages"], ["code-refresh: index healed (1 file(s) re-indexed)"])
+
+    def test_default_caller_and_stderr_output_are_unchanged_for_code_search(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._indexed(td)
+            (root / "a.py").write_text("def alpha3():\n    pass\n")
+            conn = memidx.open_code_db(db)
+            report = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                _, conn2 = memidx.heal_code_index(conn, db, memidx.DEFAULT_PROJECT, report, limit=500)
+            conn2.close()
+            self.assertIn("code-search: index healed (1 file(s) re-indexed)", err.getvalue())
+
+    def test_over_limit_and_exception_and_failed_rc_are_distinguishable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._indexed(td)
+            (root / "a.py").write_text("def a2():\n    pass\n")
+            (root / "b.py").write_text("def b2():\n    pass\n")
+            _, _, conn, out, _ = self._heal(db, limit=1, caller="code-refresh")
+            conn.close()
+            self.assertEqual(out["outcome"], "over-limit")
+            self.assertIn("code-refresh: index is stale (2 file(s) changed", out["messages"][0])
+
+            with mock.patch.object(memidx, "cmd_code_reindex", side_effect=RuntimeError("boom")):
+                _, _, conn, out, _ = self._heal(db)
+            conn.close()
+            self.assertEqual((out["outcome"], out["exc"]), ("error", "RuntimeError"))
+
+            with mock.patch.object(memidx, "cmd_code_reindex", return_value=3):
+                _, _, conn, out, _ = self._heal(db)
+            conn.close()
+            self.assertEqual((out["outcome"], out["rc"]), ("reindex-failed", 3))
+
+    def test_heal_skips_with_a_notice_when_the_refresh_lock_is_held(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._indexed(td)
+            (root / "a.py").write_text("def a4():\n    pass\n")
+            lock = memidx._code_refresh_lock_path(db, memidx.DEFAULT_PROJECT)
+            import fcntl
+            fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                conn = memidx.open_code_db(db)
+                report = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    after, conn2 = memidx.heal_code_index(conn, db, memidx.DEFAULT_PROJECT, report, limit=500)
+                conn2.close()
+            finally:
+                os.close(fd)
+            self.assertIn("code-search: a code-index refresh is already running (lock held); not healing now", err.getvalue())
+            self.assertEqual(after["state"], "stale")
+            self.assertEqual(err.getvalue().count("\n"), 1)
+            conn = memidx.open_code_db(db)
+            names = {r["symbol"] for r in conn.execute("SELECT symbol FROM chunks")}
+            conn.close()
+            self.assertNotIn("a4", names)
+
+    def test_code_search_process_skips_its_heal_when_the_lock_is_held(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._indexed(td)
+            (root / "a.py").write_text("def a5():\n    pass\n")
+            lock = memidx._code_refresh_lock_path(db, memidx.DEFAULT_PROJECT)
+            fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                          "memidx.main(['code-search', '--db', %r, 'alpha', '--mode', 'fts'])") % (str(TOOLS_DIR), str(db))
+                r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+            finally:
+                os.close(fd)
+            self.assertIn("a code-index refresh is already running", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertNotIn("heal failed", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

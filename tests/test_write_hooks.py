@@ -11,6 +11,7 @@ under test is real environment handling, not a reimplementation of the shell
 logic in Python.
 """
 import contextlib
+import fcntl
 import hashlib
 import inspect
 import io
@@ -55,6 +56,7 @@ PRECOMPACT_HOOK = HOOKS_DIR / "precompact-persist.sh"
 SESSIONSTART_HOOK = HOOKS_DIR / "sessionstart-remind.sh"
 USERPROMPT_HOOK = HOOKS_DIR / "userprompt-remind.sh"
 SESSIONEND_HOOK = HOOKS_DIR / "sessionend-stamp.sh"
+CODE_REFRESH_HOOK = HOOKS_DIR / "code-refresh.sh"
 MEMLIB = HOOKS_DIR / "memlib.sh"
 MC_PATH_LIB = HOOKS_DIR / "mc-path-lib.sh"
 # A decoy PYTHONPATH entry ahead of a synthetic poison dir elsewhere in this
@@ -6295,6 +6297,365 @@ class TestSessionEndStamp(HookTestBase):
         self.assertEqual(proc.stdout.strip(), "")
         after = self.load_state(session_id)
         self.assertIn("ended_at", after)
+
+
+# ---------------------------------------------------------------------------
+# 6c. code-refresh.sh (TOP-0137 L2 step 4): Stop + SessionStart code-index freshness
+# ---------------------------------------------------------------------------
+
+
+class TestCodeRefreshHook(HookTestBase):
+    """Every test runs in the HookTestBase temp HOME; nothing touches the
+    real ~/.memcontinuum. Each run is checked for the four invariants the
+    hook promises on every path: exit 0, empty stdout, empty stderr, and
+    exactly one `code-refresh outcome=` line in hook.log."""
+
+    def setUp(self):
+        super().setUp()
+        self.db = self.home / f"{self.project}-code.sqlite"
+        self.marker = self.home / f"{self.project}.code-stale"
+        self.lock = self.home / f"{self.project}.code-refresh.lock"
+
+    def build_code_index(self):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = memidx.cmd_code_reindex(ns(
+                code_root=str(self.code_root), db=str(self.db), project=self.project,
+                no_embed=True, full=False, lang="python", drop_root=None,
+            ))
+        self.assertEqual(rc, 0)
+
+    def refresh_env(self, **overrides):
+        merged = {"MEMCONTINUUM_CODE_ROOTS": json.dumps([str(self.code_root)])}
+        merged.update(overrides)
+        return self.base_env(**merged)
+
+    def payload(self, event, session_id="s-refresh"):
+        return json.dumps({"session_id": session_id, "hook_event_name": event, "cwd": str(self.code_root)})
+
+    def log_lines(self):
+        log = self.home / "hook.log"
+        if not log.exists():
+            return []
+        return [l for l in log.read_text().splitlines() if " code-refresh outcome=" in l]
+
+    def run_hook(self, event="Stop", env=None, timeout=20.0, payload=None):
+        before = len(self.log_lines())
+        proc, elapsed = run_script(
+            CODE_REFRESH_HOOK, payload if payload is not None else self.payload(event),
+            env or self.refresh_env(), timeout=timeout,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "", "a Stop hook that prints is fed back to the model")
+        self.assertEqual(proc.stderr, "")
+        lines = self.log_lines()
+        self.assertEqual(len(lines) - before, 1, lines)
+        return lines[-1], elapsed
+
+    def chunk_symbols(self):
+        conn = memidx.open_code_db(self.db)
+        try:
+            return {r["symbol"] for r in conn.execute("SELECT symbol FROM chunks")}
+        finally:
+            conn.close()
+
+    def head_sha(self):
+        conn = memidx.open_code_db(self.db)
+        try:
+            return conn.execute("SELECT head_sha FROM code_meta WHERE project=?", (self.project,)).fetchone()[0]
+        finally:
+            conn.close()
+
+    def commit_all(self, msg="change"):
+        subprocess.run(["git", "add", "-A"], cwd=self.code_root, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", msg], cwd=self.code_root, check=True)
+
+    def patched_python(self, patch_src):
+        """A MEMCONTINUUM_PYTHON wrapper that runs memidx.py code-refresh
+        with `patch_src` applied first (the watchdog launcher and every
+        other call go straight to the real interpreter)."""
+        runner = Path(self.td) / "patched-code-refresh.py"
+        runner.write_text(
+            "import sys, time\n"
+            f"sys.path.insert(0, {str(TOOLS_DIR)!r})\n"
+            "import memidx\n" + patch_src + "\n"
+            "sys.exit(memidx.main(sys.argv[2:]))\n"
+        )
+        wrapper = Path(self.td) / "patched-python"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            'for a in "$@"; do\n'
+            '  if [ "$a" = "code-refresh" ]; then exec "' + VENV_PYTHON + '" "' + str(runner) + '" "$@"; fi\n'
+            "done\n"
+            'exec "' + VENV_PYTHON + '" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        return str(wrapper)
+
+    def test_bash_syntax_valid(self):
+        result = subprocess.run([MC_BASH, "-n", str(CODE_REFRESH_HOOK)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_uninitialized_skips_and_creates_nothing(self):
+        line, _ = self.run_hook("Stop")
+        self.assertIn("outcome=skip reason=uninitialized", line)
+        self.assertFalse(self.db.exists(), "the hook must never create a code db")
+        self.assertFalse(self.marker.exists())
+
+    def test_current_index_skips(self):
+        self.build_code_index()
+        line, _ = self.run_hook("Stop")
+        self.assertIn("outcome=skip reason=current", line)
+        self.assertIn(f"project={self.project}", line)
+        self.assertIn("roots=1 unrecorded=0 changed=0 removed=0 healed=0", line)
+        self.assertIn("event=Stop session=s-refresh", line)
+        self.assertFalse(self.marker.exists())
+
+    def test_stop_refreshes_an_edited_file_without_a_commit(self):
+        self.build_code_index()
+        (self.code_root / "src" / "mapped.py").write_text("def brand_new_symbol():\n    return 1\n")
+        line, _ = self.run_hook("Stop")
+        self.assertIn("outcome=refreshed reason=healed", line)
+        self.assertIn("changed=1 removed=0 healed=1", line)
+        self.assertIn("brand_new_symbol", self.chunk_symbols())
+        self.assertFalse(self.marker.exists())
+        line, _ = self.run_hook("Stop")
+        self.assertIn("outcome=skip reason=current", line)
+
+    def test_stop_refreshes_after_a_commit_and_advances_head_sha(self):
+        self.build_code_index()
+        before = self.head_sha()
+        self.assertEqual(before, git_head(self.code_root))
+        (self.code_root / "src" / "mapped.py").write_text("def committed_symbol():\n    return 2\n")
+        self.commit_all()
+        line, _ = self.run_hook("Stop")
+        self.assertIn("outcome=refreshed", line)
+        self.assertIn("changed=1", line)
+        self.assertNotEqual(self.head_sha(), before)
+        self.assertEqual(self.head_sha(), git_head(self.code_root))
+        self.assertIn("committed_symbol", self.chunk_symbols())
+
+    def test_a_commit_that_changes_nothing_indexed_only_advances_head_sha(self):
+        """An empty commit moves HEAD with no content change: the preflight's
+        git trigger verifies and refreshes head_sha itself (skip=current)."""
+        self.build_code_index()
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "empty"], cwd=self.code_root, check=True)
+        line, _ = self.run_hook("Stop")
+        self.assertIn("outcome=skip reason=current", line)
+        self.assertEqual(self.head_sha(), git_head(self.code_root))
+
+    def test_deleted_file_is_purged_removed_only(self):
+        self.build_code_index()
+        (self.code_root / "src" / "unmapped.py").write_text("def doomed_symbol():\n    return 3\n")
+        self.run_hook("Stop")
+        self.assertIn("doomed_symbol", self.chunk_symbols())
+        (self.code_root / "src" / "unmapped.py").unlink()
+        line, _ = self.run_hook("Stop")
+        self.assertIn("outcome=refreshed", line)
+        self.assertIn("removed=1", line)
+        self.assertNotIn("doomed_symbol", self.chunk_symbols())
+
+    def test_sessionstart_preflights_only_and_writes_the_marker(self):
+        self.build_code_index()
+        (self.code_root / "src" / "mapped.py").write_text("def pending_symbol():\n    return 4\n")
+        line, _ = self.run_hook("SessionStart")
+        self.assertIn("outcome=skip reason=stale-marked", line)
+        self.assertIn("changed=1", line)
+        self.assertNotIn("pending_symbol", self.chunk_symbols(), "SessionStart must never reindex")
+        text = self.marker.read_text()
+        self.assertRegex(text, r"^reason=stale changed=1 since=\S+ roots=1\n$")
+        # the first Stop refreshes and clears it
+        line, _ = self.run_hook("Stop")
+        self.assertIn("outcome=refreshed", line)
+        self.assertIn("pending_symbol", self.chunk_symbols())
+        self.assertFalse(self.marker.exists())
+
+    def test_current_preflight_clears_a_leftover_marker(self):
+        self.build_code_index()
+        self.marker.write_text("reason=refreshing since=2026-01-01T00:00:00+00:00 roots=1\n")
+        self.run_hook("SessionStart")
+        self.assertFalse(self.marker.exists())
+
+    def test_unrecorded_root_is_counted_and_left_alone(self):
+        self.build_code_index()
+        other = Path(self.td) / "other-root"
+        other.mkdir()
+        (other / "o.py").write_text("def o():\n    return 0\n")
+        env = self.refresh_env(MEMCONTINUUM_CODE_ROOTS=json.dumps([str(self.code_root), str(other)]))
+        line, _ = self.run_hook("Stop", env=env)
+        self.assertIn("unrecorded=1", line)
+        self.assertIn("roots=1", line)
+        self.assertNotIn("o", self.chunk_symbols())
+
+    def test_lock_held_skips_and_leaves_the_marker_untouched(self):
+        self.build_code_index()
+        (self.code_root / "src" / "mapped.py").write_text("def locked_out():\n    return 5\n")
+        sentinel = "reason=refreshing since=2026-01-01T00:00:00+00:00 roots=9\n"
+        self.marker.write_text(sentinel)
+        fd = os.open(str(self.lock), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            line, _ = self.run_hook("Stop")
+        finally:
+            os.close(fd)
+        self.assertIn("outcome=skip reason=locked", line)
+        self.assertEqual(self.marker.read_text(), sentinel)
+        self.assertNotIn("locked_out", self.chunk_symbols())
+
+    def test_reindex_failure_rewrites_the_marker_with_the_reason(self):
+        self.build_code_index()
+        (self.code_root / "src" / "mapped.py").write_text("def x():\n    return 6\n")
+        py = self.patched_python("memidx.cmd_code_reindex = lambda a: 3")
+        line, _ = self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_PYTHON=py))
+        self.assertIn("outcome=failed reason=reindex-failed", line)
+        self.assertRegex(self.marker.read_text(), r"^reason=reindex-failed rc=3 since=\S+ roots=1\n$")
+        self.assertIn("detail=code-refresh: heal did not complete (code-reindex exit 3)", line)
+
+    def test_heal_exception_rewrites_the_marker_with_the_type(self):
+        self.build_code_index()
+        (self.code_root / "src" / "mapped.py").write_text("def y():\n    return 7\n")
+        py = self.patched_python("def _boom(a):\n    raise RuntimeError('injected')\nmemidx.cmd_code_reindex = _boom")
+        line, _ = self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_PYTHON=py))
+        self.assertIn("outcome=failed reason=heal-error", line)
+        self.assertRegex(self.marker.read_text(), r"^reason=heal-error RuntimeError since=\S+ roots=1\n$")
+
+    def test_over_limit_refusal_is_written_into_the_marker(self):
+        self.build_code_index()
+        (self.code_root / "src" / "mapped.py").write_text("def p():\n    return 8\n")
+        (self.code_root / "src" / "unmapped.py").write_text("def q():\n    return 9\n")
+        line, _ = self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_CODE_REFRESH_LIMIT="1"))
+        self.assertIn("outcome=failed reason=over-limit", line)
+        self.assertRegex(self.marker.read_text(), r"^reason=over-limit changed=2 since=\S+ roots=1\n$")
+        self.assertNotIn("p", self.chunk_symbols())
+        self.assertNotIn("q", self.chunk_symbols())
+
+    def test_limit_with_leading_zero_is_decimal_not_octal(self):
+        self.build_code_index()
+        (self.code_root / "src" / "mapped.py").write_text("def zz():\n    return 1\n")
+        line, _ = self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_CODE_REFRESH_LIMIT="08"))
+        self.assertIn("outcome=refreshed", line)
+
+    def test_watchdog_kill_leaves_the_refreshing_marker_and_one_kill_line(self):
+        self.build_code_index()
+        (self.code_root / "src" / "mapped.py").write_text("def slow():\n    return 1\n")
+        py = self.patched_python("memidx.cmd_code_reindex = lambda a: time.sleep(60)")
+        before = len(self.log_lines())
+        proc, elapsed = run_script(
+            CODE_REFRESH_HOOK, self.payload("Stop"),
+            self.refresh_env(MEMCONTINUUM_PYTHON=py, MEMCONTINUUM_CODE_REFRESH_BUDGET="1"), timeout=15.0,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertLess(elapsed, 4.0, f"the watchdog must bound the run, took {elapsed:.2f}s")
+        log = (self.home / "hook.log").read_text()
+        self.assertEqual(log.count("outcome=watchdog-killed hook=code-refresh.sh"), 1, log)
+        self.assertEqual(len(self.log_lines()), before, "a killed run writes no code-refresh line of its own")
+        self.assertRegex(self.marker.read_text(), r"^reason=refreshing since=\S+ roots=1\n$")
+
+    def test_sessionstart_budget_is_two_seconds_not_the_refresh_budget(self):
+        self.build_code_index()
+        py = self.patched_python("memidx.cmd_code_reindex = lambda a: time.sleep(60)\n"
+                                 "memidx.code_index_report = lambda *a, **k: time.sleep(60)")
+        proc, elapsed = run_script(
+            CODE_REFRESH_HOOK, self.payload("SessionStart"),
+            self.refresh_env(MEMCONTINUUM_PYTHON=py, MEMCONTINUUM_CODE_REFRESH_BUDGET="30"), timeout=15.0,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(elapsed, 4.5, f"SessionStart is a 2 s class hook, took {elapsed:.2f}s")
+        self.assertIn("outcome=watchdog-killed hook=code-refresh.sh", (self.home / "hook.log").read_text())
+
+    def test_invalid_budget_falls_back_to_the_default(self):
+        self.build_code_index()
+        for bad in ("abc", "0", "0.0", "-3", "1.2.3", ""):
+            line, _ = self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_CODE_REFRESH_BUDGET=bad))
+            self.assertIn("outcome=skip reason=current", line, bad)
+
+    def test_unsafe_project_name_builds_no_path(self):
+        env = self.refresh_env(MEMCONTINUUM_PROJECT="../victim")
+        line, _ = self.run_hook("Stop", env=env)
+        self.assertIn("outcome=skip reason=bad-project", line)
+        self.assertEqual(list(Path(self.td).glob("victim*")), [])
+        self.assertEqual(list(self.home.glob("*victim*")), [])
+
+    def test_missing_home_directory_is_not_created(self):
+        gone = Path(self.td) / "no-such-home"
+        proc, _ = run_script(CODE_REFRESH_HOOK, self.payload("Stop"), self.refresh_env(MEMCONTINUUM_HOME=str(gone)))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertFalse(gone.exists())
+
+    def test_symlink_marker_is_not_followed_or_replaced(self):
+        self.build_code_index()
+        (self.code_root / "src" / "mapped.py").write_text("def s():\n    return 1\n")
+        victim = Path(self.td) / "victim.txt"
+        victim.write_text("precious\n")
+        self.marker.symlink_to(victim)
+        line, _ = self.run_hook("SessionStart")
+        self.assertIn("marker=write-failed", line)
+        self.assertEqual(victim.read_text(), "precious\n")
+        self.assertTrue(self.marker.is_symlink())
+
+    def test_stale_marker_temps_are_swept_by_age_and_exact_name(self):
+        self.build_code_index()
+        old = self.home / f"{self.project}.code-stale.new.4242"
+        fresh = self.home / f"{self.project}.code-stale.new.4343"
+        lookalike = self.home / f"{self.project}.code-stale.new.4242.bak"
+        other = self.home / f"{self.project}.code-stale-keep"
+        for f in (old, fresh, lookalike, other):
+            f.write_text("x")
+        aged = time.time() - 3600
+        os.utime(old, (aged, aged))
+        os.utime(lookalike, (aged, aged))
+        os.utime(other, (aged, aged))
+        self.run_hook("Stop")
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists(), "a fresh temp of an overlapping run is never a candidate")
+        self.assertTrue(lookalike.exists())
+        self.assertTrue(other.exists())
+
+    def test_no_watchdog_logs_a_skip_and_does_nothing(self):
+        self.build_code_index()
+        (self.code_root / "src" / "mapped.py").write_text("def nw():\n    return 1\n")
+        env = self.refresh_env(MC_WATCHDOG_LIB_PATH="/nonexistent/mc-watchdog.sh")
+        line, _ = self.run_hook("Stop", env=env)
+        self.assertIn("outcome=skip reason=no-watchdog", line)
+        self.assertNotIn("nw", self.chunk_symbols())
+
+    def test_completes_under_poisoned_pythonpath(self):
+        self.build_code_index()
+        line, _ = self.run_hook("Stop", env=self.poisoned_base_env(
+            MEMCONTINUUM_CODE_ROOTS=json.dumps([str(self.code_root)])))
+        self.assertIn("outcome=skip reason=current", line)
+
+    def test_hostile_session_id_cannot_forge_log_keys(self):
+        self.build_code_index()
+        payload = json.dumps({"session_id": "x outcome=refreshed\nfake=1", "hook_event_name": "Stop"})
+        line, _ = self.run_hook("Stop", payload=payload)
+        self.assertNotIn("\n", line)
+        self.assertEqual(line.count("outcome="), 1, line)
+
+    def test_malformed_payload_still_logs_one_line(self):
+        self.build_code_index()
+        line, _ = self.run_hook("Stop", payload="{{{ garbage")
+        self.assertIn("event=unknown", line)
+
+    def test_sessionstart_remind_surfaces_the_marker_then_stops(self):
+        env = self.base_env()
+        self.marker.write_text("reason=reindex-failed rc=3 since=2026-10-22T10:00:00+00:00 roots=1\n")
+        proc, _ = run_script(SESSIONSTART_HOOK, self.session_start_payload("s-cs-1", source="startup"), env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(
+            f"code index for {self.project} may be stale: reindex-failed rc=3 since 2026-10-22T10:00:00+00:00 "
+            "-- memidx.py code-reindex refreshes it", ctx)
+        self.assertIn("code-stale=shown", (self.home / "hook.log").read_text())
+        self.marker.unlink()
+        proc, _ = run_script(SESSIONSTART_HOOK, self.session_start_payload("s-cs-2", source="startup"), env)
+        self.assertEqual(proc.stdout, "")
+
+    def test_sessionstart_remind_ignores_an_unparseable_marker(self):
+        self.marker.write_text("garbage\n")
+        proc, _ = run_script(SESSIONSTART_HOOK, self.session_start_payload("s-cs-3", source="startup"), self.base_env())
+        self.assertEqual(proc.stdout, "")
 
 
 # ---------------------------------------------------------------------------

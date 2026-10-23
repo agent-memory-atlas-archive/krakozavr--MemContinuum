@@ -25,7 +25,7 @@ Contents: [hooks](#hooks-and-the-fail-open-contract) ·
 
 ## Hooks and the fail-open contract
 
-Ten hook scripts live under `hooks/`, alongside three shared libraries
+Eleven hook scripts live under `hooks/`, alongside three shared libraries
 (`memlib.sh`, sourced unconditionally by the five write-side hooks; `mc-watchdog.sh`; and
 `mc-path-lib.sh`, one pure side-effect-free function -- symlink-safe
 containment -- sourced by `memlib.sh` and directly by `newfile-nudge.sh`,
@@ -35,7 +35,7 @@ known-but-unwired-language branch (newlang-nudge), to reuse
 `mc_state_file_for`/`mc_update_state_json` for that nudge's per-session
 dedupe -- never on the common already-wired path, which still pays nothing
 extra).
-Seven of the ten are wired into a project's
+Eight of the eleven are wired into a project's
 `.claude/settings.local.json` by `scripts/repo-init.sh`; `post-commit-reindex.sh`
 and `pre-commit-append-only.sh` are invoked from the store's own git
 `post-commit`/`pre-commit`; `memcontinuum-detect.sh` is
@@ -50,6 +50,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 | `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`/`clear`, initializes session state (captures the code/store roots' git HEAD, prunes state older than 24h; `clear` resets the session's counters and pending nudges but carries the edit ledger over, `resume` keeps everything), then attempts the standing-decisions digest (see [standing decisions](#standing-decisions)); on `source: compact`, injects what `precompact-persist.sh` left pending, with the digest appended after it |
 | `userprompt-remind.sh` | `UserPromptSubmit` | never reads the diff; never reads the prompt text UNLESS the opted-in prompt-query channel is ON for this project (see "Prompt-derived queries" below), in which case it may derive search terms from the prompt, in process, and discard it; fires the coverage, commit, look-back, or prompt-query nudge |
 | `sessionend-stamp.sh` | `SessionEnd` | stamps session end into state |
+| `code-refresh.sh` | `Stop` and `SessionStart` (projects with a code root) | keeps the code index fresh: runs the existing preflight (`code_index_report`), and on `Stop` the same incremental text heal `code-search` makes (`heal_code_index`, no embeddings; see [code-index freshness](#code-index-freshness)). `SessionStart` preflights only and writes the `<project>.code-stale` marker. Silent on every path; one `hook.log` line per run |
 | `post-commit-reindex.sh` | store's git `post-commit` | a bounded content-only reindex after every commit; spawns a background embed-worker when vectors are left behind |
 | `pre-commit-append-only.sh` | store's git `pre-commit` | runs `memlint.py --against-ref HEAD --staged`; BLOCKS the commit on an append-only violation (a recorded link's body edited, or a link removed, deleted, or renamed — its three lifecycle fields may each move forward once); fails open (lets the commit through) on an unborn HEAD, a missing python, its own cwd not being the store, or any engine failure |
 | `memcontinuum-detect.sh` | `SessionStart`, user level | classifies an un-initialized repo and emits its ask into the assistant's context once; no python, no watchdog, no logging by default |
@@ -475,7 +476,7 @@ compared against the replaced commit), while links present in the parent are
 still caught; `repo-init.sh`
 refuses `.` and `..` as `--project`. `--apply` never creates a bundle.
 
-**Logging, per hook.** The seven project-level hooks each write exactly one
+**Logging, per hook.** The eight project-level hooks each write exactly one
 `outcome=` line per run to `$MEMCONTINUUM_HOME/hook.log`.
 Diagnostic lines may precede it (`pre-edit-chain.sh` logs a missing-python note
 before its own `outcome=`). A watchdog kill is included in "every run": the
@@ -497,6 +498,10 @@ that shape: nothing was compared). `memidx.py stats` reports these under a
 `skipped:<reason>` outcome its own `outcomes` dict names), exactly like
 every other hook kind — these lines carry no `outcome=` field of their own
 and are never folded into `user_prompts`.
+`code-refresh.sh` writes
+`code-refresh outcome=<refreshed|skip|failed> reason=… project=… roots=… unrecorded=… changed=… removed=… healed=… elapsed=…s event=<Stop|SessionStart> session=…`
+(plus `marker=write-failed` and `detail=…` when they apply); the line is produced by
+`memidx.py code-refresh` and logged by the hook, and `memidx.py stats` files it under `other`.
 `memcontinuum-detect.sh` writes nothing at all unless
 `$MEMCONTINUUM_DETECT_LOG` is set — it runs in every repo on the machine, so its
 default is silence.
@@ -826,10 +831,10 @@ only the pointer.
 `scripts/mc_settings_merge.py` is the single settings-merge implementation,
 shared by `repo-init.sh` and by `memcontinuum-setup.sh`'s detector-hook merge.
 
-It identifies "its own" hook entries by two things at once: one of the seven
+It identifies "its own" hook entries by two things at once: one of the eight
 script basenames (`pre-edit-chain.sh`, `newfile-nudge.sh`, `ledger-post-edit.sh`,
 `precompact-persist.sh`, `sessionstart-remind.sh`, `userprompt-remind.sh`,
-`sessionend-stamp.sh`) appearing in a hook item's `command`, **and** a
+`sessionend-stamp.sh`, `code-refresh.sh`) appearing in a hook item's `command`, **and** a
 `MEMCONTINUUM_PROJECT=` marker carried in that command. The marker is what lets
 two projects share one `--claude-dir`: an entry naming our scripts but marked
 for a different project survives the other project's re-run.
@@ -838,7 +843,7 @@ for a different project survives the other project's re-run.
 embedded unquoted as that identity marker in every hook command line the merge
 step's identity check depends on. The constraint is not merely "no `/`".
 
-An entry naming one of the seven scripts with **no** `MEMCONTINUUM_PROJECT=`
+An entry naming one of the eight scripts with **no** `MEMCONTINUUM_PROJECT=`
 marker at all is treated as wiring from before that marker existed, and stays
 sweepable by any project's re-run of a shared `--claude-dir`. Re-running
 `repo-init.sh` for a project rewrites that project's entries with the marker.
@@ -1018,7 +1023,7 @@ word-splits every path containing a space and glob-expands the rest.
 Every rendered hook line, every rendered `<claude-dir>/rules/memcontinuum.md`,
 and the installed `memory-search` skill copy carry a stamp:
 `MEMCONTINUUM_RENDERED=<fingerprint>` as one more env token on each of the
-seven hook command lines, and `<!-- memcontinuum-rendered: <fingerprint> -->`
+eight hook command lines, and `<!-- memcontinuum-rendered: <fingerprint> -->`
 as an HTML comment — the rules file's second line (after its identity-marker
 first line); the skill copy's, right after the frontmatter's closing `---`
 (never at byte 0 — the skill loader needs the opening `---` to stay line 1).
@@ -1603,6 +1608,17 @@ would turn the exact slowness the check exists to catch into a bypass. It
 still sources `mc-watchdog.sh` for the `MEMCONTINUUM_HOME`/`config.sh`
 pointer-chain resolution the guard block also performs, but never invokes
 that guard block itself.
+
+| hook | budget |
+|---|---|
+| the five write-side hooks, `newfile-nudge.sh`, `pre-edit-chain.sh` | 2 s |
+| `sessionend-stamp.sh` | 1.2 s |
+| `code-refresh.sh` on `SessionStart` | 2 s |
+| `code-refresh.sh` on `Stop` | `MEMCONTINUUM_CODE_REFRESH_BUDGET`, default 8 s (a current index refreshes in 0.2-0.7 s, a weeks-stale one in 1.4-2.8 s, measured with `--no-embed`) |
+| `post-commit-reindex.sh` | `MEMCONTINUUM_POST_COMMIT_BUDGET`, default 30 s |
+
+`code-refresh.sh` picks its budget from the event: it peeks `hook_event_name` from a bounded
+prefix of the payload before the guard, the same way `ledger-post-edit.sh` peeks `tool_name`.
 
 `pre-edit-chain.sh`'s own inner budget is confirmed against a real
 measurement of its wired command line across the engine's own store and two
@@ -2191,6 +2207,48 @@ from `code_project.langs` afterwards; there is no hardcoded default. The
 initial code-reindex in `repo-init.sh` hard-fails the install on a non-zero
 exit (exit 13, distinct from the decision-store reindex's exit 7): per-file
 handling already fails open, so a non-zero exit there is structural.
+
+### Code-index freshness
+
+`hooks/code-refresh.sh` (`Stop` and `SessionStart`) keeps an existing code index current. It owns
+no staleness logic: `memidx.py code-refresh` calls the preflight every reader already uses,
+`code_index_report` (five stat signals, sha-256 on drift, the git HEAD trigger), and, on `Stop`
+only, `heal_code_index` with `caller="code-refresh"` and `lock_held=True`. The heal is the same
+incremental text pass `code-search` makes (`no_embed` follows `embedding_mode`,
+`retry_not_indexed=False`, `full=False`, rc checked); embeddings are not part of it. A deleted
+file counts toward `changed` (`_root_report` adds `removed` into it), so a deletion alone makes
+the heal eligible and purges the file's rows.
+
+`heal_code_index` returns `(report, conn)` as before. Passed a `result` dict it fills in `outcome`
+(`ineligible`, `over-limit`, `locked`, `reindex-failed`, `healed`, `error`), `rc`, `exc`,
+`reindexed` and `messages`, and then prints nothing; without one, its messages go to stderr
+prefixed by `caller` (default `code-search`).
+
+Mutual exclusion is a non-blocking `flock` on `<home>/<project>.code-refresh.lock`
+(`_acquire_code_refresh_lock`, opened `O_NOFOLLOW`). The hook holds it for its whole run, preflight
+included, because the preflight may commit stat-cache refreshes; `code-search`'s heal takes it for
+the duration of the heal and skips with a one-line notice when it is held.
+
+`<home>/<project>.code-stale` is the honest-staleness marker: `reason=<r> since=<iso> roots=<n>`.
+`refreshing` is written before a `Stop` heal and removed after a clean one (rc 0 and nothing left
+to repair); a failure, a `--heal-limit` refusal or a fail-open exception rewrites it with the
+reason; a watchdog kill leaves `refreshing` (per-file savepoints, nothing corrupt); a preflight
+that finds nothing to repair removes it. `SessionStart` writes `stale changed=<n>` and never
+reindexes. `sessionstart-remind.sh` shows the marker as one line next to the re-lint marker.
+
+A root with no `code_meta` row is counted (`unrecorded=`) and left alone: the first index of a
+root remains an explicit `code-reindex --lang`. No git `post-commit` hook is installed in code
+repos: a commit made in a session is caught by the next `Stop`, one made outside any session by the
+next `SessionStart`, and the index can lag by the commits made between two sessions.
+
+**Walker and `.gitignore`.** `_iter_code_tree` is the one enumerator under `iter_code_files`,
+`iter_code_source_files` (and so `code-reindex` and `_root_report`) and `code_census`. Inside a git
+work tree it lists `git ls-files -z --cached --others --exclude-standard` (one call, 5 s timeout)
+and applies the same noise-directory and nested-worktree pruning plus an existence check
+(`--cached` lists a tracked file deleted from the work tree); git missing, timing out, failing, or a
+root that is itself a `.gitignore`d directory of a parent repo falls back to the `os.walk`
+unchanged and says so once on stderr. Because both the report and the reindex use it, ignored
+content an older walk indexed shows up as `removed` and is purged by the next refresh.
 
 ### Root-scoped indexing
 

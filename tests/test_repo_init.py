@@ -43,6 +43,7 @@ OUR_SCRIPTS = [
     "sessionstart-remind.sh",
     "userprompt-remind.sh",
     "sessionend-stamp.sh",
+    "code-refresh.sh",
 ]
 
 
@@ -468,10 +469,11 @@ class TestFreshInstall(unittest.TestCase):
 
     def test_every_rendered_hook_line_carries_the_stamp(self):
         """D1: MEMCONTINUUM_RENDERED=<engine short sha> on every hook line
-        this installer renders -- all seven scripts (the five always-wired
+        this installer renders -- all eight scripts (the five always-wired
         write-side hooks, plus pre-edit-chain.sh rendered twice for
-        Edit/Write, plus newfile-nudge.sh -- eight command lines total for
-        an install with one --code-root, this fixture's shape)."""
+        Edit/Write, plus newfile-nudge.sh, plus code-refresh.sh rendered on
+        SessionStart and Stop -- ten command lines total for an install with
+        one --code-root, this fixture's shape)."""
         data = json.loads(self.settings_path.read_text())
         commands = [
             h.get("command", "")
@@ -480,7 +482,7 @@ class TestFreshInstall(unittest.TestCase):
             for h in group.get("hooks", [])
             if "command" in h
         ]
-        self.assertEqual(len(commands), 8, commands)
+        self.assertEqual(len(commands), 10, commands)
         token = f"MEMCONTINUUM_RENDERED={self._engine_sha()}"
         for cmd in commands:
             self.assertIn(token, cmd, cmd)
@@ -549,12 +551,15 @@ class TestReinstallIdempotent(unittest.TestCase):
 
     def test_no_duplicate_entries(self):
         data = json.loads(self.settings_after_2)
-        for event in ["PostToolUse", "PreCompact", "SessionStart", "UserPromptSubmit", "SessionEnd"]:
+        for event, expected_n in [
+            ("PostToolUse", 1), ("PreCompact", 1), ("SessionStart", 2), ("UserPromptSubmit", 1),
+            ("SessionEnd", 1), ("Stop", 1),
+        ]:
             our_items = [
                 h for group in data["hooks"][event] for h in group.get("hooks", [])
                 if any(s in h.get("command", "") for s in OUR_SCRIPTS)
             ]
-            self.assertEqual(len(our_items), 1, (event, our_items))
+            self.assertEqual(len(our_items), expected_n, (event, our_items))
         pre_items = [
             h for group in data["hooks"]["PreToolUse"] for h in group.get("hooks", [])
         ]
@@ -1007,6 +1012,103 @@ class TestNoCodeRoot(unittest.TestCase):
 
 
 @unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
+class TestCodeRefreshWiring(unittest.TestCase):
+    """TOP-0137 L2 step 4: hooks/code-refresh.sh is wired on Stop and
+    SessionStart for a project with code roots, and for nothing else."""
+
+    @staticmethod
+    def _refresh_items(data, event):
+        return [
+            h for g in data["hooks"].get(event, []) for h in g.get("hooks", [])
+            if "code-refresh.sh" in h.get("command", "")
+        ]
+
+    def _install(self, home, project="cr", with_code=True, claude_dir=None, store=None):
+        store = store or str(Path(home) / "store")
+        claude_dir = claude_dir or str(Path(home) / ".claude")
+        args = ["--project", project, "--store", store, "--claude-dir", claude_dir]
+        if with_code:
+            code = str(Path(home) / f"code-{project}")
+            os.makedirs(code, exist_ok=True)
+            args += ["--code-root", code]
+        proc = run_install(args, home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads((Path(claude_dir) / "settings.local.json").read_text())
+
+    def test_code_root_project_gets_stop_and_sessionstart_lines(self):
+        home = sandbox_home()
+        try:
+            data = self._install(home)
+            code = str(Path(home) / "code-cr")
+            for event in ("Stop", "SessionStart"):
+                items = self._refresh_items(data, event)
+                self.assertEqual(len(items), 1, (event, items))
+                cmd = items[0]["command"]
+                for token in ("MEMCONTINUUM_RENDERED=", "MEMCONTINUUM_PROJECT=cr",
+                              f"MEMCONTINUUM_CODE_ROOT={code}", "MEMCONTINUUM_CODE_ROOTS=",
+                              "MEMCONTINUUM_PYTHON="):
+                    self.assertIn(token, cmd, (event, cmd))
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_store_only_project_gets_nothing_new(self):
+        home = sandbox_home()
+        try:
+            data = self._install(home, with_code=False)
+            self.assertNotIn("Stop", data["hooks"])
+            self.assertEqual(self._refresh_items(data, "SessionStart"), [])
+            self.assertNotIn("code-refresh.sh", json.dumps(data))
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_rerun_is_idempotent_and_dropping_the_code_root_unwires_it(self):
+        home = sandbox_home()
+        try:
+            first = self._install(home)
+            second = self._install(home)
+            self.assertEqual(first, second)
+            self.assertEqual(len(self._refresh_items(second, "Stop")), 1)
+            third = self._install(home, with_code=False)
+            self.assertNotIn("code-refresh.sh", json.dumps(third))
+            self.assertNotIn("Stop", third["hooks"])
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_foreign_stop_entry_survives_the_sweep(self):
+        home = sandbox_home()
+        try:
+            claude_dir = Path(home) / ".claude"
+            claude_dir.mkdir(parents=True)
+            (claude_dir / "settings.local.json").write_text(json.dumps({
+                "hooks": {"Stop": [
+                    {"hooks": [{"type": "command", "command": "echo foreign-stop"}]},
+                    {"matcher": "x", "hooks": [{"type": "command", "command": "echo foreign-two"}]},
+                ]},
+            }))
+            for _ in range(2):  # fresh and re-run
+                data = self._install(home)
+            commands = [h["command"] for g in data["hooks"]["Stop"] for h in g["hooks"]]
+            self.assertIn("echo foreign-stop", commands)
+            self.assertIn("echo foreign-two", commands)
+            self.assertEqual(len([c for c in commands if "code-refresh.sh" in c]), 1, commands)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_other_projects_refresh_line_survives_this_projects_sweep(self):
+        home = sandbox_home()
+        try:
+            claude_dir = str(Path(home) / ".claude")
+            self._install(home, project="alpha", claude_dir=claude_dir, store=str(Path(home) / "store-a"))
+            data = self._install(home, project="beta", claude_dir=claude_dir, store=str(Path(home) / "store-b"))
+            stop = [h["command"] for g in data["hooks"]["Stop"] for h in g["hooks"]]
+            self.assertEqual(len(stop), 2, stop)
+            self.assertTrue(any("MEMCONTINUUM_PROJECT=alpha " in c for c in stop), stop)
+            self.assertTrue(any("MEMCONTINUUM_PROJECT=beta " in c for c in stop), stop)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+@unittest.skipUnless(VENV_PYTHON, _SKIP_NO_VENV)
 class TestIdempotentDropToZeroCodeRoots(unittest.TestCase):
     def test_rerun_without_code_root_removes_stale_pretooluse_entries(self):
         """Re-running with FEWER --code-roots than the previous run (down to
@@ -1192,13 +1294,17 @@ class TestMultipleCodeRoots(unittest.TestCase):
             expected_root = f"MEMCONTINUUM_CODE_ROOT={root_a}"
             expected_roots = f"MEMCONTINUUM_CODE_ROOTS={shlex.quote(json.dumps([root_a, root_b]))}"
 
-            for event in ("PostToolUse", "PreCompact", "SessionStart", "UserPromptSubmit", "SessionEnd"):
+            # SessionStart carries two lines (sessionstart-remind.sh and
+            # code-refresh.sh, TOP-0137 L2 step 4); Stop carries code-refresh.sh.
+            for event, expected_n in (("PostToolUse", 1), ("PreCompact", 1), ("SessionStart", 2),
+                                      ("UserPromptSubmit", 1), ("SessionEnd", 1), ("Stop", 1)):
                 groups = data["hooks"][event]
                 items = [h for g in groups for h in g.get("hooks", [])]
-                self.assertEqual(len(items), 1, (event, items))
-                cmd = items[0]["command"]
-                self.assertIn(expected_root, cmd, (event, cmd))
-                self.assertIn(expected_roots, cmd, (event, cmd))
+                self.assertEqual(len(items), expected_n, (event, items))
+                for item in items:
+                    cmd = item["command"]
+                    self.assertIn(expected_root, cmd, (event, cmd))
+                    self.assertIn(expected_roots, cmd, (event, cmd))
 
             pre_items = [h for g in data["hooks"]["PreToolUse"] for h in g.get("hooks", [])]
             pre_edit_items = [h for h in pre_items if "pre-edit-chain.sh" in h["command"]]

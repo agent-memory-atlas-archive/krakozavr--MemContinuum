@@ -51,7 +51,7 @@ SKILL_SRC="$ENGINE_ROOT/skills/memory-search/SKILL.md"
 # reaching any of these scripts.
 MC_BASH_BIN="${BASH:-bash}"
 
-OUR_HOOK_SCRIPTS="pre-edit-chain.sh newfile-nudge.sh ledger-post-edit.sh precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh sessionend-stamp.sh"
+OUR_HOOK_SCRIPTS="pre-edit-chain.sh newfile-nudge.sh ledger-post-edit.sh precompact-persist.sh sessionstart-remind.sh userprompt-remind.sh sessionend-stamp.sh code-refresh.sh"
 
 # The stamp that goes onto every hook line, the rules file, and the installed
 # skill copy, so a later `memcontinuum-update.sh` can tell a current rendered
@@ -1255,6 +1255,7 @@ OUR_SCRIPTS = [
     "sessionstart-remind.sh",
     "userprompt-remind.sh",
     "sessionend-stamp.sh",
+    "code-refresh.sh",
 ]
 
 
@@ -1371,6 +1372,29 @@ except json.JSONDecodeError as e:
 for event, groups in write_block["hooks"].items():
     blocks.setdefault(event, []).extend(groups)
 
+# --- code-refresh block (only if there is at least one code root) ---
+# TOP-0137 L2 step 4: hooks/code-refresh.sh on Stop (preflight + incremental
+# heal) and SessionStart (preflight + stale marker only). Same env block as
+# the write hooks above -- it reads MEMCONTINUUM_CODE_ROOTS like the ledger
+# does. A store-only project (no code root) gets nothing.
+if code_roots:
+    refresh_rendered = render(read_tmpl("code-refresh-hook.json.tmpl"), {
+        "STORE": esc_cmd(store),
+        "PROJECT": esc_cmd(project),
+        "PYTHON": esc_cmd(python_bin),
+        "HOOKS_DIR": esc_cmd(hooks_dir),
+        "CODE_ROOT_ENV": code_root_env,
+        "RENDERED": esc_cmd(rendered_sha),
+    })
+    try:
+        refresh_block = json.loads(refresh_rendered)
+    except json.JSONDecodeError as e:
+        print("ERROR: rendered code-refresh-hook template is not valid JSON: %s" % e, file=sys.stderr)
+        print(refresh_rendered, file=sys.stderr)
+        sys.exit(1)
+    for event, groups in refresh_block["hooks"].items():
+        blocks.setdefault(event, []).extend(groups)
+
 # --- pre-edit block (only if there is at least one code root) ---
 if code_roots:
     pair_tmpl = read_tmpl("code-root-filter-pair.json.tmpl")
@@ -1461,7 +1485,7 @@ settings_path = os.path.join(claude_dir, "settings.local.json")
 # see scripts/mc_settings_merge.py.
 ALL_EVENTS = sorted({
     "PreToolUse", "PostToolUse", "PreCompact",
-    "SessionStart", "UserPromptSubmit", "SessionEnd",
+    "SessionStart", "UserPromptSubmit", "SessionEnd", "Stop",
 })
 
 if not dry_run:
@@ -1846,7 +1870,7 @@ else
    id, title, area, code_refs, links: [...]), then reindex:
      PYTHONPATH= $PYTHON_BIN $MEMIDX reindex --root $STORE --project $PROJECT
    (the store's post-commit hook does this automatically after a commit).
-3. Uninstall: remove the seven hook entries below from
+3. Uninstall: remove the hook entries below from
      $CLAUDE_DIR/settings.local.json
    (identified by these script basenames in their "command" fields --
    safe to hand-delete, or restore $CLAUDE_DIR/settings.local.json.bak-memcontinuum):
