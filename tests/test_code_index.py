@@ -5295,5 +5295,136 @@ class TestIndexIntegrityFailure(unittest.TestCase):
             self.assertIsInstance(ctx.exception.cause, sqlite3.OperationalError)
 
 
+class TestGitignoreHonouredByCodeWalk(unittest.TestCase):
+    """TOP-0137 L2 step 4: the code-tree walk enumerates through ONE
+    `git ls-files --cached --others --exclude-standard` when the root is in
+    a work tree, so gitignored content (a cloned corpus under docs/, build
+    output) is never indexed; the os.walk fallback is unchanged."""
+
+    def _repo(self, td):
+        root = Path(td) / "code"
+        (root / "src").mkdir(parents=True)
+        (root / "vendor_clone").mkdir()
+        (root / "src" / "keep.py").write_text("def keep():\n    return 1\n")
+        (root / "vendor_clone" / "ignored.py").write_text("def ignored():\n    return 2\n")
+        (root / ".gitignore").write_text("vendor_clone/\n")
+        _init_git_repo(root)
+        return root
+
+    @staticmethod
+    def _paths(db):
+        conn = memidx.open_code_db(db)
+        try:
+            return {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
+        finally:
+            conn.close()
+
+    def test_gitignored_subfolder_is_not_indexed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repo(td)
+            db = Path(td) / "idx-code.sqlite"
+            self.assertEqual(code_reindex(root, db, lang="python"), 0)
+            self.assertEqual(self._paths(db), {"src/keep.py"})
+            walked = {str(p.relative_to(root)) for p in memidx.iter_code_files(root)}
+            self.assertNotIn("vendor_clone/ignored.py", walked)
+            self.assertIn("src/keep.py", walked)
+
+    def test_untracked_unignored_file_is_indexed_and_deleted_tracked_file_is_skipped(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repo(td)
+            (root / "src" / "new_untracked.py").write_text("def fresh():\n    return 3\n")
+            (root / "src" / "keep.py").unlink()  # tracked, deleted from the work tree
+            listed = {str(p.relative_to(root)) for p in memidx.iter_code_files(root)}
+            self.assertIn("src/new_untracked.py", listed)
+            self.assertNotIn("src/keep.py", listed)
+
+    def test_walker_still_prunes_noise_dirs_and_nested_worktrees_in_git_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repo(td)
+            wt = root / ".worktrees" / "feat"
+            wt.mkdir(parents=True)
+            (wt / "other.py").write_text("def other():\n    return 4\n")
+            (wt / ".git").write_text("gitdir: /nonexistent/.git/worktrees/feat\n")
+            (root / "node_modules").mkdir()
+            (root / "node_modules" / "dep.py").write_text("def dep():\n    return 5\n")
+            listed = {str(p.relative_to(root)) for p in memidx.iter_code_files(root)}
+            self.assertFalse(any(x.startswith((".worktrees/", "node_modules/")) for x in listed), listed)
+
+    def test_fallback_without_git_walks_the_tree_and_says_so_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repo(td)
+            empty = Path(td) / "emptybin"
+            empty.mkdir()
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"PATH": str(empty)}), \
+                    mock.patch.object(memidx, "_GIT_WALK_FALLBACK_SAID", False), \
+                    contextlib.redirect_stderr(err):
+                first = {str(p.relative_to(root)) for p in memidx.iter_code_files(root)}
+                second = {str(p.relative_to(root)) for p in memidx.iter_code_files(root)}
+            self.assertIn("vendor_clone/ignored.py", first)  # os.walk honours no .gitignore
+            self.assertEqual(first, second)
+            self.assertEqual(err.getvalue().count("git file list unavailable"), 1, err.getvalue())
+
+    def test_non_work_tree_root_falls_back_to_the_walk(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "plain"
+            root.mkdir()
+            (root / "a.py").write_text("def a():\n    return 1\n")
+            with contextlib.redirect_stderr(io.StringIO()):
+                listed = {str(p.relative_to(root)) for p in memidx.iter_code_files(root)}
+            self.assertEqual(listed, {"a.py"})
+
+    def test_root_that_is_itself_gitignored_is_still_indexed(self):
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td) / "parent"
+            (parent / "ign").mkdir(parents=True)
+            (parent / ".gitignore").write_text("ign/\n")
+            (parent / "ign" / "a.py").write_text("def a():\n    return 1\n")
+            _init_git_repo(parent)
+            with contextlib.redirect_stderr(io.StringIO()):
+                listed = {str(p.relative_to(parent / "ign")) for p in memidx.iter_code_files(parent / "ign")}
+            self.assertEqual(listed, {"a.py"})
+
+    def test_ignored_content_an_older_walk_indexed_counts_as_removed_and_is_purged(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repo(td)
+            db = Path(td) / "idx-code.sqlite"
+            empty = Path(td) / "emptybin"
+            empty.mkdir()
+            # An older full reindex (no gitignore awareness) let the clone in.
+            with mock.patch.dict(os.environ, {"PATH": str(empty)}), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(code_reindex(root, db, lang="python"), 0)
+            self.assertEqual(self._paths(db), {"src/keep.py", "vendor_clone/ignored.py"})
+            conn = memidx.open_code_db(db)
+            rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            conn.close()
+            self.assertEqual(rep["state"], "stale")
+            self.assertEqual(rep["roots"][0]["removed"], 1)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(code_reindex(root, db, lang="python"), 0)
+            # cmd_code_reindex and _root_report share one enumerator: same removed count.
+            self.assertIn("1 removed", out.getvalue())
+            self.assertEqual(self._paths(db), {"src/keep.py"})
+
+    def test_report_and_reindex_use_the_same_enumerator(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repo(td)
+            seen = []
+            real = memidx._iter_code_tree
+
+            def spy(r, skip_dirs):
+                seen.append(str(r))
+                return real(r, skip_dirs)
+
+            db = Path(td) / "idx-code.sqlite"
+            with mock.patch.object(memidx, "_iter_code_tree", spy):
+                code_reindex(root, db, lang="python")
+                conn = memidx.open_code_db(db)
+                memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+                conn.close()
+            self.assertEqual(len(seen), 2, seen)  # one walk for reindex, one for the report
+
+
 if __name__ == "__main__":
     unittest.main()

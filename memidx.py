@@ -4330,6 +4330,98 @@ def _prune_dirnames_for_code_walk(dirpath, dirnames, skip_dirs):
     ]
 
 
+_GIT_WALK_FALLBACK_SAID = False
+
+
+def _git_listed_files(root: Path) -> list | None:
+    """ONE `git -C <root> ls-files -z --cached --others --exclude-standard`
+    (5 s timeout): every tracked file plus every untracked, NOT-ignored
+    file under `root`, as root-relative path strings. None -- never an
+    exception -- when git is missing, times out, fails, or `root` is not
+    inside a work tree (the caller then walks the tree itself)."""
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            capture_output=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    listed = [os.fsdecode(b) for b in res.stdout.split(b"\0") if b]
+    if not listed:
+        # An empty list is also what git answers for a root that is itself
+        # a .gitignore'd directory of a parent repo (nothing under it is
+        # "untracked and not ignored"). That is not "no files": hand the
+        # walk back to os.walk rather than index nothing.
+        try:
+            ign = subprocess.run(
+                ["git", "-C", str(root), "check-ignore", "-q", "."], capture_output=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if ign.returncode == 0:
+            return None
+    return listed
+
+
+def _iter_code_tree(root: Path, skip_dirs):
+    """The ONE enumerator under every code-tree walk (iter_code_files,
+    iter_code_source_files -- and through it cmd_code_reindex and
+    _root_report -- and code_census): yields every file under `root` that
+    survives the noise-dir pruning (`skip_dirs`, plus a nested linked
+    worktree's own toplevel -- see _prune_dirnames_for_code_walk).
+
+    When `root` is inside a git work tree the file list comes from git
+    (_git_listed_files), so .gitignore'd content -- a gitignored clone
+    under docs/, a build output -- is never indexed. `--cached` lists a
+    tracked file deleted from the work tree and a submodule's gitlink; the
+    existence check below drops both (a symlink to a directory is dropped
+    too: os.walk files it under dirnames). When git is missing, times out,
+    or `root` is not a work tree the walk falls back to os.walk unchanged,
+    saying so once on stderr: such a root keeps indexing ignored content,
+    and the operator should know."""
+    global _GIT_WALK_FALLBACK_SAID
+    listed = _git_listed_files(root)
+    if listed is None:
+        if not _GIT_WALK_FALLBACK_SAID:
+            _GIT_WALK_FALLBACK_SAID = True
+            print(
+                f"memidx: git file list unavailable for {root} (git missing, timed out, or not a "
+                "work tree) -- walking the directory tree; .gitignore is not honoured for it",
+                file=sys.stderr,
+            )
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = _prune_dirnames_for_code_walk(dirpath, dirnames, skip_dirs)
+            for fname in filenames:
+                yield Path(dirpath) / fname
+        return
+    dir_ok: dict = {"": True}
+
+    def ancestor_ok(rel_dir: str) -> bool:
+        ok = dir_ok.get(rel_dir)
+        if ok is None:
+            parent, _, name = rel_dir.rpartition("/")
+            ok = (
+                ancestor_ok(parent) and name not in skip_dirs
+                and not os.path.isfile(os.path.join(root, rel_dir, ".git"))
+            )
+            dir_ok[rel_dir] = ok
+        return ok
+
+    seen = set()
+    for rel in sorted(listed, key=lambda r: (r.rpartition("/")[0], r)):
+        if rel in seen:
+            continue
+        seen.add(rel)
+        if not ancestor_ok(rel.rpartition("/")[0]):
+            continue
+        path = Path(root) / rel
+        if not os.path.lexists(path) or os.path.isdir(path):
+            continue
+        yield path
+
+
 def iter_code_files(code_root: Path):
     """Every non-binary file under `code_root`, noise dirs pruned (Task 6:
     chunkers.UNIVERSAL_SKIP_DIRS -- the same set CODE_SKIP_DIR_NAMES
@@ -4340,13 +4432,10 @@ def iter_code_files(code_root: Path):
     filter lives in resolve_symbol_to_path's own loop, not here. Also
     prunes a nested linked worktree's own toplevel -- see
     _prune_dirnames_for_code_walk."""
-    for dirpath, dirnames, filenames in os.walk(code_root):
-        dirnames[:] = _prune_dirnames_for_code_walk(dirpath, dirnames, chunkers.UNIVERSAL_SKIP_DIRS)
-        for fname in filenames:
-            fpath = Path(dirpath) / fname
-            if is_binary_file(fpath):
-                continue
-            yield fpath
+    for fpath in _iter_code_tree(code_root, chunkers.UNIVERSAL_SKIP_DIRS):
+        if is_binary_file(fpath):
+            continue
+        yield fpath
 
 
 def _resolve_symbol_via_code_index(code_root: Path, symbol: str, project: str) -> tuple[str, str] | None:
@@ -6028,6 +6117,10 @@ def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter
     _prune_dirnames_for_code_walk's own docstring for why and for the
     accepted submodule-content side effect.
 
+    TOP-0137 L2 step 4: enumeration goes through `_iter_code_tree`, which
+    lists a git work tree's files with `git ls-files` (so .gitignore is
+    honoured) and falls back to os.walk otherwise -- see its docstring.
+
     `skipped`, when passed a Counter, is mutated in place: every walked file
     that is NOT yielded because its extension is unsupported (no language
     at all) or resolves to a lang outside the wired set (engine-supported
@@ -6046,19 +6139,16 @@ def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter
     wired = list(langs or ["swift"])
     wired_set = set(wired)
     skip_dirs = CODE_SKIP_DIR_NAMES | chunkers.common_skip_dirs(wired)
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = _prune_dirnames_for_code_walk(dirpath, dirnames, skip_dirs)
-        for fname in sorted(filenames):
-            path = Path(dirpath) / fname
-            lang = lang_for_source_file(path)
-            if lang is not None and lang in wired_set:
-                rel_parts = _root_relative_parts(path, root)
-                if chunkers.path_is_skipped_for_lang(rel_parts, lang):
-                    continue
-                yield path
+    for path in _iter_code_tree(root, skip_dirs):
+        lang = lang_for_source_file(path)
+        if lang is not None and lang in wired_set:
+            rel_parts = _root_relative_parts(path, root)
+            if chunkers.path_is_skipped_for_lang(rel_parts, lang):
                 continue
-            if skipped is not None:
-                skipped[chunkers.extension_of(fname) or NO_EXTENSION_BUCKET] += 1
+            yield path
+            continue
+        if skipped is not None:
+            skipped[chunkers.extension_of(path.name) or NO_EXTENSION_BUCKET] += 1
 
 
 # ---------------------------------------------------------------------------
@@ -7038,26 +7128,24 @@ def code_census(root: Path) -> dict:
         row = counts.setdefault(key, {"files": 0, "status": status})
         row["files"] += 1
 
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = _prune_dirnames_for_code_walk(dirpath, dirnames, skip_dirs)
-        for fname in sorted(filenames):
-            path = Path(dirpath) / fname
-            # lang_for_source_file is the one resolution rule the whole
-            # code-index side shares: extension first (I2 compound-aware,
-            # so `foo.blade.php` is never folded into `.php`), else a
-            # shebang sniff for an extensionless file (controller-scope
-            # addition, Task 5 reviewer finding -- the "second silent
-            # gap": extensionless scripts used to vanish from the census
-            # entirely).
-            lang = lang_for_source_file(path)
-            if lang is None:
-                ext = chunkers.extension_of(fname)
-                bump(ext or NO_EXTENSION_BUCKET, "unsupported")
-                continue
-            rel_parts = _root_relative_parts(path, root)
-            if chunkers.path_is_skipped_for_lang(rel_parts, lang):
-                continue
-            bump(lang, "supported")
+    for path in _iter_code_tree(root, skip_dirs):
+        fname = path.name
+        # lang_for_source_file is the one resolution rule the whole
+        # code-index side shares: extension first (I2 compound-aware,
+        # so `foo.blade.php` is never folded into `.php`), else a
+        # shebang sniff for an extensionless file (controller-scope
+        # addition, Task 5 reviewer finding -- the "second silent
+        # gap": extensionless scripts used to vanish from the census
+        # entirely).
+        lang = lang_for_source_file(path)
+        if lang is None:
+            ext = chunkers.extension_of(fname)
+            bump(ext or NO_EXTENSION_BUCKET, "unsupported")
+            continue
+        rel_parts = _root_relative_parts(path, root)
+        if chunkers.path_is_skipped_for_lang(rel_parts, lang):
+            continue
+        bump(lang, "supported")
 
     return counts
 
