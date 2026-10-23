@@ -6257,11 +6257,13 @@ def _git_head_sha(root: Path) -> str | None:
     Design R3 (audit MC-P1-02): also the first call of `_root_report`'s
     git trigger (is HEAD still what code_meta says?) -- timeout lowered
     from 5s to 2s to fit inside that trigger's overall 3s-per-report git
-    budget."""
+    budget; since the code-refresh fix round the timeout is `_git_ls_timeout()`
+    (5 s default, half the hook watchdog budget under `code-refresh`), the
+    same helper the code-tree walker uses."""
     try:
         result = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=2,
+            capture_output=True, text=True, timeout=_git_ls_timeout(),
         )
     # Design R7 (audit MC-P2-03, TOP-0123 L7): narrowed from a bare
     # except Exception -- subprocess.run's own documented failure modes
@@ -8021,7 +8023,9 @@ def cmd_code_refresh(args) -> int:
     a failed heal, a --heal-limit refusal or a fail-open exception rewrites
     it with the reason; a killed run leaves `refreshing` behind, which is the
     truth (per-file savepoints, nothing corrupt). A preflight that finds
-    nothing to heal removes a leftover marker too. Mutual exclusion with a
+    nothing to heal but is `degraded` (a missing root, a not-indexed file)
+    writes the marker as `degraded missing-root=<n> not-indexed=<n>`; only a
+    `current` or `metadata-current` report removes a leftover marker. Mutual exclusion with a
     code-search heal is a non-blocking flock on
     `<project>.code-refresh.lock`; lock held -> skip, marker untouched."""
     t0 = time.monotonic()

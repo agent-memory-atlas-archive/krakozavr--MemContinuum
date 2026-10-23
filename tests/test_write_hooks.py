@@ -6787,7 +6787,8 @@ class TestCodeRefreshHook(HookTestBase):
         must be killed silently."""
         gone = Path(self.td) / "no-home-at-kill"
         hang = Path(self.td) / "hang.sh"
-        hang.write_text("#!/usr/bin/env bash\nsleep 60\n")
+        ran = Path(self.td) / "child-ran.txt"
+        hang.write_text(f"#!/usr/bin/env bash\necho started > {shlex.quote(str(ran))}\nsleep 60\n")
         driver = (
             f'SCRIPT_DIR={shlex.quote(str(HOOKS_DIR))}\n'
             f'source {shlex.quote(str(HOOKS_DIR / "mc-watchdog.sh"))}\n'
@@ -6797,6 +6798,9 @@ class TestCodeRefreshHook(HookTestBase):
         start = time.monotonic()
         proc = subprocess.run([MC_BASH, "-c", driver], env=env, capture_output=True, text=True, timeout=20)
         self.assertLess(time.monotonic() - start, 6.0, proc.stderr)
+        self.assertTrue(ran.exists(), "the hanging child never started: the launcher did not run it")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout, "")
         self.assertFalse(gone.exists(), "the kill-line logger must not create a missing home")
 
     def test_budget_is_normalised_once_by_the_shell(self):
@@ -6827,7 +6831,7 @@ class TestCodeRefreshHook(HookTestBase):
             "import subprocess as _sp\n"
             "_orig = _sp.run\n"
             "def _rec(*a, **k):\n"
-            "    if a and a[0][:1] == ['git'] and ('ls-files' in a[0] or 'check-ignore' in a[0]):\n"
+            "    if a and a[0][:1] == ['git'] and ('ls-files' in a[0] or 'check-ignore' in a[0] or 'rev-parse' in a[0]):\n"
             f"        open({str(out)!r}, 'a').write(repr(k.get('timeout')) + '\\n')\n"
             "    return _orig(*a, **k)\n"
             "memidx.subprocess.run = _rec\n"

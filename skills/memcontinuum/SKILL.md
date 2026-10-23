@@ -394,7 +394,7 @@ Either direction, at any point in a repo's life:
   - **A `.claude` directory can be shared by more than one project** —
     every hook line above also carries `MEMCONTINUUM_PROJECT=<name>` in
     the same command string, and two projects' entries use the identical
-    seven basenames. Before reading anything off a matched line, confirm
+    eight basenames. Before reading anything off a matched line, confirm
     it also carries `MEMCONTINUUM_PROJECT=` followed by THIS repo's own
     project (step 1's `project=` line) — matching on basename alone can
     read another project's roots, extensions, or never-list instead of
