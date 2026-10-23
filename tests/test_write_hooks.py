@@ -30,6 +30,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TOOLS_DIR))
@@ -6316,10 +6317,10 @@ class TestCodeRefreshHook(HookTestBase):
         self.marker = self.home / f"{self.project}.code-stale"
         self.lock = self.home / f"{self.project}.code-refresh.lock"
 
-    def build_code_index(self):
+    def build_code_index(self, root=None):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             rc = memidx.cmd_code_reindex(ns(
-                code_root=str(self.code_root), db=str(self.db), project=self.project,
+                code_root=str(root or self.code_root), db=str(self.db), project=self.project,
                 no_embed=True, full=False, lang="python", drop_root=None,
             ))
         self.assertEqual(rc, 0)
@@ -6637,6 +6638,214 @@ class TestCodeRefreshHook(HookTestBase):
         self.build_code_index()
         line, _ = self.run_hook("Stop", payload="{{{ garbage")
         self.assertIn("event=unknown", line)
+
+    # -- fix round 1 (TOP-0137 L2 step 4) ------------------------------------
+
+    def db_fingerprint(self):
+        """Every table's name and row count, plus the file bytes' sha256."""
+        conn = sqlite3.connect(f"file:{self.db}?mode=ro", uri=True)
+        try:
+            names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+            counts = {n: conn.execute(f'SELECT COUNT(*) FROM "{n}"').fetchone()[0] for n in names}
+        finally:
+            conn.close()
+        return counts, hashlib.sha256(self.db.read_bytes()).hexdigest()
+
+    def set_schema(self, version):
+        conn = sqlite3.connect(self.db)
+        try:
+            if version is None:
+                conn.execute("DROP TABLE code_schema")
+            else:
+                conn.execute("UPDATE code_schema SET version=?", (version,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_old_schema_db_is_never_rebuilt_on_either_event(self):
+        for label, version in (("schema-0", None), ("schema-previous", memidx.CODE_SCHEMA_VERSION - 1)):
+            for event in ("Stop", "SessionStart"):
+                with self.subTest(db=label, event=event):
+                    for f in (self.db, self.marker):
+                        f.unlink(missing_ok=True)
+                    self.build_code_index()
+                    (self.code_root / "src" / "mapped.py").write_text(f"def old_{label.replace('-', '_')}_{event}():\n    return 1\n")
+                    self.set_schema(version)
+                    before = self.db_fingerprint()
+                    line, _ = self.run_hook(event)
+                    self.assertIn("outcome=skip reason=stale-marked", line)
+                    self.assertEqual(self.db_fingerprint(), before, "the old-schema db must be byte-identical")
+                    self.assertRegex(self.marker.read_text(),
+                                     r"^reason=stale schema-older-than-engine since=\S+ roots=0\n$")
+
+    def test_db_newer_than_engine_fails_without_touching_it(self):
+        self.build_code_index()
+        self.set_schema(memidx.CODE_SCHEMA_VERSION + 1)
+        before = self.db_fingerprint()
+        for event in ("Stop", "SessionStart"):
+            line, _ = self.run_hook(event)
+            self.assertIn("outcome=failed reason=db-newer-than-engine", line)
+        self.assertEqual(self.db_fingerprint(), before)
+
+    def test_lock_error_skips_and_never_follows_a_planted_symlink(self):
+        self.build_code_index()
+        (self.code_root / "src" / "mapped.py").write_text("def lock_err():\n    return 1\n")
+        victim = Path(self.td) / "lock-victim.txt"
+        victim.write_text("precious\n")
+        self.lock.symlink_to(victim)
+        line, _ = self.run_hook("Stop")
+        self.assertIn("outcome=skip reason=lock-error", line)
+        self.assertEqual(victim.read_text(), "precious\n")
+        self.assertNotIn("lock_err", self.chunk_symbols())
+        self.assertFalse(self.marker.exists())
+
+    def test_missing_root_on_sessionstart_writes_the_degraded_marker(self):
+        self.build_code_index()
+        self.marker.write_text("reason=refreshing since=2026-01-01T00:00:00+00:00 roots=1\n")
+        moved = Path(self.td) / "code-moved"
+        self.code_root.rename(moved)
+        try:
+            line, _ = self.run_hook("SessionStart")
+        finally:
+            moved.rename(self.code_root)
+        self.assertIn("outcome=skip reason=degraded", line)
+        self.assertRegex(self.marker.read_text(),
+                         r"^reason=degraded missing-root=1 not-indexed=0 since=\S+ roots=1\n$")
+
+    def test_current_preflight_with_a_missing_root_never_clears_the_marker_on_stop(self):
+        self.build_code_index()
+        moved = Path(self.td) / "code-moved"
+        self.code_root.rename(moved)
+        try:
+            line, _ = self.run_hook("Stop")
+        finally:
+            moved.rename(self.code_root)
+        self.assertIn("outcome=skip reason=degraded", line)
+        self.assertTrue(self.marker.exists())
+
+    def test_stop_heal_that_leaves_a_root_missing_is_not_refreshed(self):
+        self.build_code_index()
+        other = Path(self.td) / "other-indexed"
+        (other / "src").mkdir(parents=True)
+        (other / "src" / "o.py").write_text("def other_fn():\n    return 0\n")
+        git_init(other)
+        self.build_code_index(root=other)
+        env = self.refresh_env(MEMCONTINUUM_CODE_ROOTS=json.dumps([str(self.code_root), str(other)]))
+        line, _ = self.run_hook("Stop", env=env)
+        self.assertIn("outcome=skip reason=current", line)
+        (self.code_root / "src" / "mapped.py").write_text("def healed_but_degraded():\n    return 1\n")
+        gone = Path(self.td) / "other-gone"
+        other.rename(gone)
+        try:
+            line, _ = self.run_hook("Stop", env=env)
+        finally:
+            gone.rename(other)
+        self.assertIn("outcome=failed reason=degraded", line)
+        self.assertNotIn("outcome=refreshed", line)
+        self.assertIn("healed_but_degraded", self.chunk_symbols())
+        self.assertRegex(self.marker.read_text(),
+                         r"^reason=degraded missing-root=1 not-indexed=0 since=\S+ roots=2\n$")
+
+    def test_stdin_held_open_does_not_hang_the_hook(self):
+        self.build_code_index()
+        env = self.refresh_env()
+        start = time.monotonic()
+        proc = subprocess.Popen([MC_BASH, str(CODE_REFRESH_HOOK)], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
+        try:
+            proc.stdin.write(self.payload("Stop", session_id="s-held"))
+            proc.stdin.flush()  # the writer stays connected: stdin is NOT closed
+            rc = proc.wait(timeout=15)
+        finally:
+            elapsed = time.monotonic() - start
+            if proc.poll() is None:
+                proc.kill()
+            proc.stdin.close()
+            proc.stdout.close()
+            proc.stderr.close()
+        self.assertEqual(rc, 0)
+        self.assertLess(elapsed, 8.0, f"a held-open stdin hung the hook for {elapsed:.1f}s")
+        lines = self.log_lines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("event=Stop session=s-held", lines[0])
+
+    def test_marker_unwritable_on_stop_does_not_start_the_heal(self):
+        self.build_code_index()
+        (self.code_root / "src" / "mapped.py").write_text("def should_not_heal():\n    return 1\n")
+        victim = Path(self.td) / "victim.txt"
+        victim.write_text("precious\n")
+        self.marker.symlink_to(victim)
+        line, _ = self.run_hook("Stop")
+        self.assertIn("outcome=skip reason=marker-unwritable", line)
+        self.assertIn("marker=write-failed", line)
+        self.assertNotIn("should_not_heal", self.chunk_symbols())
+        self.assertEqual(victim.read_text(), "precious\n")
+
+    def test_watchdog_kill_with_a_missing_home_creates_nothing(self):
+        """The shared launcher's kill-line logger (hooks/mc-watchdog.sh) used
+        to os.makedirs the home; a hung guarded child under a missing home
+        must be killed silently."""
+        gone = Path(self.td) / "no-home-at-kill"
+        hang = Path(self.td) / "hang.sh"
+        hang.write_text("#!/usr/bin/env bash\nsleep 60\n")
+        driver = (
+            f'SCRIPT_DIR={shlex.quote(str(HOOKS_DIR))}\n'
+            f'source {shlex.quote(str(HOOKS_DIR / "mc-watchdog.sh"))}\n'
+            f'MC_WATCHDOG_BUDGET=1 "$MC_GUARD_PY" -c "$MC_WATCHDOG_LAUNCHER_PY" "$BASH" {shlex.quote(str(hang))}\n'
+        )
+        env = self.refresh_env(MEMCONTINUUM_HOME=str(gone))
+        start = time.monotonic()
+        proc = subprocess.run([MC_BASH, "-c", driver], env=env, capture_output=True, text=True, timeout=20)
+        self.assertLess(time.monotonic() - start, 6.0, proc.stderr)
+        self.assertFalse(gone.exists(), "the kill-line logger must not create a missing home")
+
+    def test_budget_is_normalised_once_by_the_shell(self):
+        self.build_code_index()
+        out = Path(self.td) / "sweep-age.txt"
+        py = self.patched_python(
+            f"memidx._sweep_code_stale_temps = lambda m, age: open({str(out)!r}, 'w').write(repr(age))")
+        for raw in (".5", "1e-3", "abc"):
+            with self.subTest(budget=raw):
+                out.unlink(missing_ok=True)
+                self.run_hook("Stop", env=self.refresh_env(
+                    MEMCONTINUUM_PYTHON=py, MEMCONTINUUM_CODE_REFRESH_BUDGET=raw))
+                self.assertEqual(out.read_text(), "16.0", "shell default 8 s, doubled")
+        out.unlink(missing_ok=True)
+        self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_PYTHON=py, MEMCONTINUUM_CODE_REFRESH_BUDGET="3"))
+        self.assertEqual(out.read_text(), "6.0")
+
+    def test_git_listing_timeout_is_half_the_watchdog_budget(self):
+        self.build_code_index()
+        out = Path(self.td) / "git-timeouts.txt"
+        src = (
+            "import subprocess as _sp\n"
+            "_orig = _sp.run\n"
+            "def _rec(*a, **k):\n"
+            "    if a and a[0][:1] == ['git'] and ('ls-files' in a[0] or 'check-ignore' in a[0]):\n"
+            f"        open({str(out)!r}, 'a').write(repr(k.get('timeout')) + '\\n')\n"
+            "    return _orig(*a, **k)\n"
+            "memidx.subprocess.run = _rec\n"
+        )
+        py = self.patched_python(src)
+        self.run_hook("SessionStart", env=self.refresh_env(MEMCONTINUUM_PYTHON=py))
+        self.assertEqual(set(out.read_text().split()), {"1.0"}, out.read_text())
+        out.unlink()
+        self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_PYTHON=py))
+        self.assertEqual(set(out.read_text().split()), {"4.0"}, out.read_text())
+
+    def test_git_ls_timeout_helper_defaults_and_normalises(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("MEMCONTINUUM_GIT_LS_TIMEOUT", None)
+            self.assertEqual(memidx._git_ls_timeout(), 5.0)
+            for raw, want in (("1.5", 1.5), ("junk", 5.0), ("0", 5.0), ("-2", 5.0), ("nan", 5.0), ("inf", 5.0)):
+                os.environ["MEMCONTINUUM_GIT_LS_TIMEOUT"] = raw
+                self.assertEqual(memidx._git_ls_timeout(), want, raw)
+
+    def test_truncated_payload_prefix_still_yields_the_event(self):
+        self.build_code_index()
+        big = json.dumps({"session_id": "s-big", "hook_event_name": "Stop", "last_assistant_message": "x" * 9000})
+        line, _ = self.run_hook("Stop", payload=big)
+        self.assertIn("event=Stop session=s-big", line)
 
     def test_sessionstart_remind_surfaces_the_marker_then_stops(self):
         env = self.base_env()

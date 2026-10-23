@@ -46,8 +46,23 @@ MEMIDX="$SCRIPT_DIR/../memidx.py"
 # The event decides the watchdog budget (Stop: the refresh budget; anything
 # else: the 2 s SessionStart class), so it is peeked from a bounded prefix of
 # the payload BEFORE the guard, the same way ledger-post-edit.sh peeks
-# tool_name; the guarded child reads the payload again from the pipe below.
-PAYLOAD="$(cat)"
+# tool_name; the guarded child receives that prefix again from the pipe below
+# (memidx.py code-refresh reads the two fields it needs from a prefix).
+# The read is bounded in BYTES (4096) and in TIME (about 2 s), builtins only:
+# a writer that keeps stdin open must not hang the hook before the watchdog
+# exists. It reads one character at a time because bash 3.2 DISCARDS what a
+# timed-out `read -n N -t T` had already collected; here whatever arrived is
+# kept. EOF, a timeout or a NUL ends the loop.
+PAYLOAD=""
+MC_RD_N=0
+MC_RD_T0=$SECONDS
+while [ "$MC_RD_N" -lt 4096 ] && [ $((SECONDS - MC_RD_T0)) -lt 2 ]; do
+    MC_RD_CH=""
+    IFS= read -r -d '' -n 1 -t 1 MC_RD_CH || break
+    [ -n "$MC_RD_CH" ] || break
+    PAYLOAD="$PAYLOAD$MC_RD_CH"
+    MC_RD_N=$((MC_RD_N + 1))
+done
 MC_PREFIX="${PAYLOAD:0:4096}"
 MC_EVENT=""
 case "$MC_PREFIX" in

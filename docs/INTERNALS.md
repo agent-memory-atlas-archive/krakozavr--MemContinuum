@@ -1597,7 +1597,7 @@ Python launcher that kills the whole child process group once a budget expires â
 Guarded: the five write-side hooks, plus `newfile-nudge.sh` (which has no
 write-side state of its own but shares the same guard rather than growing a
 second bespoke timeout story for the one hook that happens to be fast),
-`pre-edit-chain.sh`, and `post-commit-reindex.sh` (its own budget,
+`pre-edit-chain.sh`, `code-refresh.sh` (budget by event, table below), and `post-commit-reindex.sh` (its own budget,
 `MEMCONTINUUM_POST_COMMIT_BUDGET`, default 30 seconds -- generous on purpose:
 its guarded content pass is measured well under a second; the budget is a
 backstop against a hung/slow filesystem, not a tuned ceiling). Unguarded:
@@ -1618,7 +1618,13 @@ that guard block itself.
 | `post-commit-reindex.sh` | `MEMCONTINUUM_POST_COMMIT_BUDGET`, default 30 s |
 
 `code-refresh.sh` picks its budget from the event: it peeks `hook_event_name` from a bounded
-prefix of the payload before the guard, the same way `ledger-post-edit.sh` peeks `tool_name`.
+prefix of the payload before the guard, the same way `ledger-post-edit.sh` peeks `tool_name`. That
+read is bounded in bytes (4096) and in time (about 2 s) and uses shell builtins only, one character
+at a time (bash 3.2 discards what a timed-out `read -n` had collected), so a writer that keeps
+stdin open cannot hang the hook before the watchdog exists; the worker receives the prefix and
+takes the two fields it needs from it even when the JSON is cut short. The shell normalises
+`MEMCONTINUUM_CODE_REFRESH_BUDGET` once and exports the result as `MC_WATCHDOG_BUDGET`; the
+Python side reads only that.
 
 `pre-edit-chain.sh`'s own inner budget is confirmed against a real
 measurement of its wired command line across the engine's own store and two
@@ -2231,10 +2237,17 @@ the duration of the heal and skips with a one-line notice when it is held.
 
 `<home>/<project>.code-stale` is the honest-staleness marker: `reason=<r> since=<iso> roots=<n>`.
 `refreshing` is written before a `Stop` heal and removed after a clean one (rc 0 and nothing left
-to repair); a failure, a `--heal-limit` refusal or a fail-open exception rewrites it with the
-reason; a watchdog kill leaves `refreshing` (per-file savepoints, nothing corrupt); a preflight
-that finds nothing to repair removes it. `SessionStart` writes `stale changed=<n>` and never
-reindexes. `sessionstart-remind.sh` shows the marker as one line next to the re-lint marker.
+to repair, and the report is `current` or `metadata-current`); a failure, a `--heal-limit` refusal
+or a fail-open exception rewrites it with the reason; a watchdog kill leaves `refreshing`
+(per-file savepoints, nothing corrupt); a preflight that finds nothing to repair removes it only
+when the report is `current`/`metadata-current`. A `degraded` report (a recorded root is missing,
+a file is not-indexed) keeps or writes `degraded missing-root=<n> not-indexed=<n>`
+(`outcome=skip reason=degraded`, or `failed reason=degraded` after a heal that left it so). If the
+`refreshing` marker cannot be written the heal does not start (`skip reason=marker-unwritable`).
+`SessionStart` writes `stale changed=<n>` and never reindexes. A code db older than the engine's
+schema (an unversioned one included) is never opened for rebuild by either event: the marker
+is `stale schema-older-than-engine` (`skip reason=stale-marked`) and the rebuild stays with
+`code-reindex`. `sessionstart-remind.sh` shows the marker as one line next to the re-lint marker.
 
 A root with no `code_meta` row is counted (`unrecorded=`) and left alone: the first index of a
 root remains an explicit `code-reindex --lang`. No git `post-commit` hook is installed in code
@@ -2243,7 +2256,8 @@ next `SessionStart`, and the index can lag by the commits made between two sessi
 
 **Walker and `.gitignore`.** `_iter_code_tree` is the one enumerator under `iter_code_files`,
 `iter_code_source_files` (and so `code-reindex` and `_root_report`) and `code_census`. Inside a git
-work tree it lists `git ls-files -z --cached --others --exclude-standard` (one call, 5 s timeout)
+work tree it lists `git ls-files -z --cached --others --exclude-standard` (one call; timeout `MEMCONTINUUM_GIT_LS_TIMEOUT`, default 5 s, which `code-refresh` lowers to half
+its own watchdog budget, minimum 0.5 s)
 and applies the same noise-directory and nested-worktree pruning plus an existence check
 (`--cached` lists a tracked file deleted from the work tree); git missing, timing out, failing, or a
 root that is itself a `.gitignore`d directory of a parent repo falls back to the `os.walk`

@@ -600,7 +600,7 @@ Project level, by hand:
 
    **Basename alone is not safe to hand-delete when this `.claude`
    directory is shared by more than one project** — every project's
-   entries use these same seven basenames, so a basename-only deletion
+   entries use these same eight basenames, so a basename-only deletion
    also removes the OTHER project's wiring, the exact failure
    `repo-init.sh`'s own project-aware merge exists to prevent. Every entry
    also carries `MEMCONTINUUM_PROJECT=<name>` in the same `"command"`

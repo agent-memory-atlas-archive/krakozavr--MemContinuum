@@ -4332,18 +4332,28 @@ def _prune_dirnames_for_code_walk(dirpath, dirnames, skip_dirs):
 
 
 _GIT_WALK_FALLBACK_SAID = False
+_GIT_LS_DEFAULT_TIMEOUT = 5.0
+
+
+def _git_ls_timeout() -> float:
+    """The ONE timeout for every git subprocess of the code-tree walk
+    (`MEMCONTINUUM_GIT_LS_TIMEOUT` seconds, default 5; unparseable or <= 0 is
+    the default). `code-refresh` lowers it to half its own watchdog budget so
+    a slow git is abandoned for the os.walk fallback before the hook is
+    killed."""
+    return _norm_positive_float(os.environ.get("MEMCONTINUUM_GIT_LS_TIMEOUT"), _GIT_LS_DEFAULT_TIMEOUT)
 
 
 def _git_listed_files(root: Path) -> list | None:
     """ONE `git -C <root> ls-files -z --cached --others --exclude-standard`
-    (5 s timeout): every tracked file plus every untracked, NOT-ignored
+    (timeout: _git_ls_timeout, 5 s by default): every tracked file plus every untracked, NOT-ignored
     file under `root`, as root-relative path strings. None -- never an
     exception -- when git is missing, times out, fails, or `root` is not
     inside a work tree (the caller then walks the tree itself)."""
     try:
         res = subprocess.run(
             ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-            capture_output=True, timeout=5,
+            capture_output=True, timeout=_git_ls_timeout(),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -4357,7 +4367,7 @@ def _git_listed_files(root: Path) -> list | None:
         # walk back to os.walk rather than index nothing.
         try:
             ign = subprocess.run(
-                ["git", "-C", str(root), "check-ignore", "-q", "."], capture_output=True, timeout=5,
+                ["git", "-C", str(root), "check-ignore", "-q", "."], capture_output=True, timeout=_git_ls_timeout(),
             )
         except (OSError, subprocess.SubprocessError):
             return None
@@ -7846,17 +7856,55 @@ def _norm_positive_int(raw, default: int) -> int:
     return value if value >= 1 else default
 
 
-def _code_refresh_sweep_age(raw) -> float:
-    """Seconds a leftover `<marker>.new.<pid>` temp must have aged before
-    the sweep may remove it: twice the hook's watchdog budget, an invalid
-    budget counting as 30 s, an unset one as the 8 s default."""
-    if raw is None or str(raw).strip() == "":
-        return 2 * _CODE_REFRESH_DEFAULT_BUDGET
+def _norm_positive_float(raw, default: float) -> float:
+    """The one normaliser for a positive-number env setting: finite and > 0,
+    else the default."""
     try:
-        budget = float(str(raw).strip())
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if 0 < value < float("inf") else default
+
+
+def _watchdog_budget():
+    """The hook's watchdog budget in seconds as the SHELL normalised it
+    (`MC_WATCHDOG_BUDGET`, always exported by hooks/code-refresh.sh on the
+    guarded path); None when unset or unparsable. The raw
+    MEMCONTINUUM_CODE_REFRESH_BUDGET is never read here -- one normaliser
+    (the shell's), so both sides agree on `.5` and `1e-3`."""
+    value = _norm_positive_float(os.environ.get("MC_WATCHDOG_BUDGET"), 0.0)
+    return value or None
+
+
+def _code_refresh_sweep_age(budget) -> float:
+    """Seconds a leftover `<marker>.new.<pid>` temp must have aged before
+    the sweep may remove it: twice the hook's watchdog budget; with no
+    usable budget (None) a flat 30 s."""
+    return 2 * budget if budget else 30.0
+
+
+_HOOK_FIELD_RE = {
+    key: re.compile(r'"' + key + r'"\s*:\s*"([^"\\]*)"') for key in ("hook_event_name", "session_id")
+}
+
+
+def _hook_payload_fields(text: str) -> dict:
+    """`hook_event_name` / `session_id` from the hook payload on stdin. The
+    shell hands over a bounded PREFIX of the payload, which may cut the JSON
+    short: a complete document is parsed, a truncated one is scanned for the
+    two string fields (both sit in the first few hundred bytes)."""
+    try:
+        data = json.loads(text or "{}")
     except ValueError:
-        return 2 * 30.0
-    return 2 * (budget if budget > 0 else 30.0)
+        data = None
+    if isinstance(data, dict):
+        return data
+    out = {}
+    for key, rx in _HOOK_FIELD_RE.items():
+        m = rx.search(text or "")
+        if m:
+            out[key] = m.group(1)
+    return out
 
 
 def _clean_log_token(raw, limit: int = 64) -> str:
@@ -7983,12 +8031,12 @@ def cmd_code_refresh(args) -> int:
     extra = []
     event, session = "unknown", "unknown"
     try:
-        try:
-            payload = json.loads(sys.stdin.read(1 << 20) or "{}")
-        except ValueError:
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
+        budget = _watchdog_budget()
+        if budget:
+            # Half the watchdog budget (min 0.5 s) for a git subprocess, BEFORE
+            # any walk: a slow git must fall back to os.walk, not eat the hook.
+            os.environ["MEMCONTINUUM_GIT_LS_TIMEOUT"] = str(max(0.5, budget / 2))
+        payload = _hook_payload_fields(sys.stdin.read(1 << 20))
         event = _clean_log_token(payload.get("hook_event_name"))
         session = _clean_log_token(payload.get("session_id"))
         db_path = resolve_code_db_path(args)
@@ -8022,10 +8070,19 @@ def _refresh_code_index(args, project, db_path, marker, is_stop, res, extra) -> 
         res.update(outcome="skip", reason="lock-error")
         return
     try:
-        _sweep_code_stale_temps(marker, _code_refresh_sweep_age(os.environ.get("MEMCONTINUUM_CODE_REFRESH_BUDGET")))
+        _sweep_code_stale_temps(marker, _code_refresh_sweep_age(_watchdog_budget()))
         _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, extra)
     finally:
         os.close(lock_fd)
+
+
+_CODE_STATES_CURRENT = ("current", "metadata-current")
+
+
+def _degraded_marker_reason(report: dict) -> str:
+    """`degraded missing-root=<n> not-indexed=<n>` from a code_index_report."""
+    missing = sum(1 for r in report["roots"] if not r["exists"])
+    return f"degraded missing-root={missing} not-indexed={report['not_indexed']}"
 
 
 def _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, extra) -> None:
@@ -8041,8 +8098,11 @@ def _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, ext
     if schema == -1:
         res.update(outcome="failed", reason="unreadable-db")
         return
-    if 0 < schema < CODE_SCHEMA_VERSION and not is_stop:
-        # open_code_db would REBUILD an older db; a SessionStart hook must not.
+    if schema < CODE_SCHEMA_VERSION:
+        # open_code_db would DROP and rebuild an older db (schema 0 -- a
+        # legacy unversioned db -- included) and the heal would then run
+        # against an empty index. Neither event may: the rebuild stays with
+        # an explicit code-reindex (or code-search).
         if not _write_code_stale_marker(marker, "stale schema-older-than-engine", 0):
             extra.append("marker=write-failed")
         res.update(outcome="skip", reason="stale-marked")
@@ -8064,10 +8124,17 @@ def _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, ext
             return
         needs_heal = report["changed"] > 0 or report["availability_changed"]
         if not needs_heal:
-            # Positive signal (rule 7): the same detector every reader uses
-            # found nothing to repair, so a leftover marker is a lie now.
-            _clear_code_stale_marker(marker)
-            res.update(outcome="skip", reason="current" if report["state"] in ("current", "metadata-current") else "degraded")
+            if report["state"] in _CODE_STATES_CURRENT:
+                # Positive signal (rule 7): the same detector every reader uses
+                # found nothing to repair, so a leftover marker is a lie now.
+                _clear_code_stale_marker(marker)
+                res.update(outcome="skip", reason="current")
+                return
+            # degraded (a missing root, a not-indexed file): nothing to heal,
+            # and not current either -- the marker says so.
+            if not _write_code_stale_marker(marker, _degraded_marker_reason(report), res["roots"]):
+                extra.append("marker=write-failed")
+            res.update(outcome="skip", reason="degraded")
             return
         if not is_stop:
             if not _write_code_stale_marker(marker, f"stale changed={report['changed']}", res["roots"]):
@@ -8075,7 +8142,11 @@ def _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, ext
             res.update(outcome="skip", reason="stale-marked")
             return
         if not _write_code_stale_marker(marker, "refreshing", res["roots"]):
+            # "A kill leaves `refreshing` behind" cannot be kept, so the work
+            # does not start (code-search's own heal still covers search).
             extra.append("marker=write-failed")
+            res.update(outcome="skip", reason="marker-unwritable")
+            return
         limit = _norm_positive_int(os.environ.get("MEMCONTINUUM_CODE_REFRESH_LIMIT"), _CODE_REFRESH_DEFAULT_LIMIT)
         hres: dict = {}
         after, conn = heal_code_index(
@@ -8086,8 +8157,16 @@ def _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, ext
             extra.append("detail=" + "; ".join(hres["messages"]))
         outcome = hres["outcome"]
         if outcome == "healed" and after["changed"] == 0 and not after["availability_changed"]:
-            _clear_code_stale_marker(marker)
-            res.update(outcome="refreshed", reason="healed")
+            if after["state"] in _CODE_STATES_CURRENT:
+                _clear_code_stale_marker(marker)
+                res.update(outcome="refreshed", reason="healed")
+                return
+            # healed, yet still degraded (a root went missing, a file stays
+            # not-indexed): not "refreshed", and the marker stays.
+            reason = _degraded_marker_reason(after)
+            if not _write_code_stale_marker(marker, reason, res["roots"]):
+                extra.append("marker=write-failed")
+            res.update(outcome="failed", reason="degraded")
             return
         reasons = {
             "reindex-failed": f"reindex-failed rc={hres['rc']}",
