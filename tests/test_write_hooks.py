@@ -6814,6 +6814,12 @@ class TestCodeRefreshHook(HookTestBase):
         self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_PYTHON=py, MEMCONTINUUM_CODE_REFRESH_BUDGET="3"))
         self.assertEqual(out.read_text(), "6.0")
 
+    def test_sweep_age_fallback_is_twice_the_default_budget(self):
+        """Write-safety rule 5: no usable budget counts as 30 s, so 60 s."""
+        self.assertEqual(memidx._code_refresh_sweep_age(None), 60.0)
+        self.assertEqual(memidx._code_refresh_sweep_age(0), 60.0)
+        self.assertEqual(memidx._code_refresh_sweep_age(8.0), 16.0)
+
     def test_git_listing_timeout_is_half_the_watchdog_budget(self):
         self.build_code_index()
         out = Path(self.td) / "git-timeouts.txt"

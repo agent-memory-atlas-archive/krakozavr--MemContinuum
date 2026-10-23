@@ -7878,9 +7878,9 @@ def _watchdog_budget():
 
 def _code_refresh_sweep_age(budget) -> float:
     """Seconds a leftover `<marker>.new.<pid>` temp must have aged before
-    the sweep may remove it: twice the hook's watchdog budget; with no
-    usable budget (None) a flat 30 s."""
-    return 2 * budget if budget else 30.0
+    the sweep may remove it: twice the hook's watchdog budget (write-safety
+    rule 5); with no usable budget (None) the budget counts as 30 s, so 60 s."""
+    return 2 * (budget if budget else 30.0)
 
 
 _HOOK_FIELD_RE = {
