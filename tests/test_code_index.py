@@ -5295,5 +5295,261 @@ class TestIndexIntegrityFailure(unittest.TestCase):
             self.assertIsInstance(ctx.exception.cause, sqlite3.OperationalError)
 
 
+class TestGitignoreHonouredByCodeWalk(unittest.TestCase):
+    """TOP-0137 L2 step 4: the code-tree walk enumerates through ONE
+    `git ls-files --cached --others --exclude-standard` when the root is in
+    a work tree, so gitignored content (a cloned corpus under docs/, build
+    output) is never indexed; the os.walk fallback is unchanged."""
+
+    def _repo(self, td):
+        root = Path(td) / "code"
+        (root / "src").mkdir(parents=True)
+        (root / "vendor_clone").mkdir()
+        (root / "src" / "keep.py").write_text("def keep():\n    return 1\n")
+        (root / "vendor_clone" / "ignored.py").write_text("def ignored():\n    return 2\n")
+        (root / ".gitignore").write_text("vendor_clone/\n")
+        _init_git_repo(root)
+        return root
+
+    @staticmethod
+    def _paths(db):
+        conn = memidx.open_code_db(db)
+        try:
+            return {r["path"] for r in conn.execute("SELECT DISTINCT path FROM chunks")}
+        finally:
+            conn.close()
+
+    def test_gitignored_subfolder_is_not_indexed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repo(td)
+            db = Path(td) / "idx-code.sqlite"
+            self.assertEqual(code_reindex(root, db, lang="python"), 0)
+            self.assertEqual(self._paths(db), {"src/keep.py"})
+            walked = {str(p.relative_to(root)) for p in memidx.iter_code_files(root)}
+            self.assertNotIn("vendor_clone/ignored.py", walked)
+            self.assertIn("src/keep.py", walked)
+
+    def test_untracked_unignored_file_is_indexed_and_deleted_tracked_file_is_skipped(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repo(td)
+            (root / "src" / "new_untracked.py").write_text("def fresh():\n    return 3\n")
+            (root / "src" / "keep.py").unlink()  # tracked, deleted from the work tree
+            listed = {str(p.relative_to(root)) for p in memidx.iter_code_files(root)}
+            self.assertIn("src/new_untracked.py", listed)
+            self.assertNotIn("src/keep.py", listed)
+
+    def test_walker_still_prunes_noise_dirs_and_nested_worktrees_in_git_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repo(td)
+            wt = root / ".worktrees" / "feat"
+            wt.mkdir(parents=True)
+            (wt / "other.py").write_text("def other():\n    return 4\n")
+            (wt / ".git").write_text("gitdir: /nonexistent/.git/worktrees/feat\n")
+            (root / "node_modules").mkdir()
+            (root / "node_modules" / "dep.py").write_text("def dep():\n    return 5\n")
+            listed = {str(p.relative_to(root)) for p in memidx.iter_code_files(root)}
+            self.assertFalse(any(x.startswith((".worktrees/", "node_modules/")) for x in listed), listed)
+
+    def test_fallback_without_git_walks_the_tree_and_says_so_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repo(td)
+            empty = Path(td) / "emptybin"
+            empty.mkdir()
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"PATH": str(empty)}), \
+                    mock.patch.object(memidx, "_GIT_WALK_FALLBACK_SAID", False), \
+                    contextlib.redirect_stderr(err):
+                first = {str(p.relative_to(root)) for p in memidx.iter_code_files(root)}
+                second = {str(p.relative_to(root)) for p in memidx.iter_code_files(root)}
+            self.assertIn("vendor_clone/ignored.py", first)  # os.walk honours no .gitignore
+            self.assertEqual(first, second)
+            self.assertEqual(err.getvalue().count("git file list unavailable"), 1, err.getvalue())
+
+    def test_non_work_tree_root_falls_back_to_the_walk(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "plain"
+            root.mkdir()
+            (root / "a.py").write_text("def a():\n    return 1\n")
+            with contextlib.redirect_stderr(io.StringIO()):
+                listed = {str(p.relative_to(root)) for p in memidx.iter_code_files(root)}
+            self.assertEqual(listed, {"a.py"})
+
+    def test_root_that_is_itself_gitignored_is_still_indexed(self):
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td) / "parent"
+            (parent / "ign").mkdir(parents=True)
+            (parent / ".gitignore").write_text("ign/\n")
+            (parent / "ign" / "a.py").write_text("def a():\n    return 1\n")
+            _init_git_repo(parent)
+            with contextlib.redirect_stderr(io.StringIO()):
+                listed = {str(p.relative_to(parent / "ign")) for p in memidx.iter_code_files(parent / "ign")}
+            self.assertEqual(listed, {"a.py"})
+
+    def test_ignored_content_an_older_walk_indexed_counts_as_removed_and_is_purged(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repo(td)
+            db = Path(td) / "idx-code.sqlite"
+            empty = Path(td) / "emptybin"
+            empty.mkdir()
+            # An older full reindex (no gitignore awareness) let the clone in.
+            with mock.patch.dict(os.environ, {"PATH": str(empty)}), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(code_reindex(root, db, lang="python"), 0)
+            self.assertEqual(self._paths(db), {"src/keep.py", "vendor_clone/ignored.py"})
+            conn = memidx.open_code_db(db)
+            rep = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            conn.close()
+            self.assertEqual(rep["state"], "stale")
+            self.assertEqual(rep["roots"][0]["removed"], 1)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(code_reindex(root, db, lang="python"), 0)
+            # cmd_code_reindex and _root_report share one enumerator: same removed count.
+            self.assertIn("1 removed", out.getvalue())
+            self.assertEqual(self._paths(db), {"src/keep.py"})
+
+    def test_report_and_reindex_use_the_same_enumerator(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._repo(td)
+            seen = []
+            real = memidx._iter_code_tree
+
+            def spy(r, skip_dirs):
+                seen.append(str(r))
+                return real(r, skip_dirs)
+
+            db = Path(td) / "idx-code.sqlite"
+            with mock.patch.object(memidx, "_iter_code_tree", spy):
+                code_reindex(root, db, lang="python")
+                conn = memidx.open_code_db(db)
+                memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+                conn.close()
+            self.assertEqual(len(seen), 2, seen)  # one walk for reindex, one for the report
+
+
+class TestHealSharedWithCodeRefresh(unittest.TestCase):
+    """TOP-0137 L2 step 4: heal_code_index is the ONE incremental call both
+    code-search and hooks/code-refresh.sh make. It names its caller, can
+    hand its messages back instead of printing them, says WHY it did not
+    heal (over-limit vs fail-open exception vs a held refresh lock) and
+    treats a deleted file as heal-eligible."""
+
+    def _indexed(self, td):
+        root = Path(td) / "code"; root.mkdir()
+        (root / "a.py").write_text("def alpha():\n    pass\n")
+        (root / "b.py").write_text("def beta():\n    pass\n")
+        db = Path(td) / "idx-code.sqlite"
+        code_reindex(root, db, lang="python")
+        return root, db
+
+    def _heal(self, db, **kw):
+        conn = memidx.open_code_db(db)
+        report = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+        out = {}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            after, conn2 = memidx.heal_code_index(
+                conn, db, memidx.DEFAULT_PROJECT, report, limit=kw.pop("limit", 500), result=out, **kw
+            )
+        return report, after, conn2, out, err.getvalue()
+
+    def test_a_deleted_file_alone_makes_the_heal_eligible_and_purges_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._indexed(td)
+            (root / "b.py").unlink()
+            report, after, conn, out, err = self._heal(db)
+            self.assertEqual((report["changed"], report["removed"]), (1, 1))
+            self.assertEqual(out["outcome"], "healed")
+            self.assertEqual(after["changed"], 0)
+            names = {r["symbol"] for r in conn.execute("SELECT symbol FROM chunks")}
+            conn.close()
+            self.assertEqual(names, {"alpha"})
+
+    def test_result_dict_captures_messages_and_nothing_reaches_stderr(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._indexed(td)
+            (root / "a.py").write_text("def alpha2():\n    pass\n")
+            report, after, conn, out, err = self._heal(db, caller="code-refresh")
+            conn.close()
+            self.assertEqual(err, "")
+            self.assertEqual(out["outcome"], "healed")
+            self.assertEqual(out["reindexed"], 1)
+            self.assertEqual(out["messages"], ["code-refresh: index healed (1 file(s) re-indexed)"])
+
+    def test_default_caller_and_stderr_output_are_unchanged_for_code_search(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._indexed(td)
+            (root / "a.py").write_text("def alpha3():\n    pass\n")
+            conn = memidx.open_code_db(db)
+            report = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                _, conn2 = memidx.heal_code_index(conn, db, memidx.DEFAULT_PROJECT, report, limit=500)
+            conn2.close()
+            self.assertIn("code-search: index healed (1 file(s) re-indexed)", err.getvalue())
+
+    def test_over_limit_and_exception_and_failed_rc_are_distinguishable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._indexed(td)
+            (root / "a.py").write_text("def a2():\n    pass\n")
+            (root / "b.py").write_text("def b2():\n    pass\n")
+            _, _, conn, out, _ = self._heal(db, limit=1, caller="code-refresh")
+            conn.close()
+            self.assertEqual(out["outcome"], "over-limit")
+            self.assertIn("code-refresh: index is stale (2 file(s) changed", out["messages"][0])
+
+            with mock.patch.object(memidx, "cmd_code_reindex", side_effect=RuntimeError("boom")):
+                _, _, conn, out, _ = self._heal(db)
+            conn.close()
+            self.assertEqual((out["outcome"], out["exc"]), ("error", "RuntimeError"))
+
+            with mock.patch.object(memidx, "cmd_code_reindex", return_value=3):
+                _, _, conn, out, _ = self._heal(db)
+            conn.close()
+            self.assertEqual((out["outcome"], out["rc"]), ("reindex-failed", 3))
+
+    def test_heal_skips_with_a_notice_when_the_refresh_lock_is_held(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._indexed(td)
+            (root / "a.py").write_text("def a4():\n    pass\n")
+            lock = memidx._code_refresh_lock_path(db, memidx.DEFAULT_PROJECT)
+            import fcntl
+            fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                conn = memidx.open_code_db(db)
+                report = memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    after, conn2 = memidx.heal_code_index(conn, db, memidx.DEFAULT_PROJECT, report, limit=500)
+                conn2.close()
+            finally:
+                os.close(fd)
+            self.assertIn("code-search: a code-index refresh is already running (lock held); not healing now", err.getvalue())
+            self.assertEqual(after["state"], "stale")
+            self.assertEqual(err.getvalue().count("\n"), 1)
+            conn = memidx.open_code_db(db)
+            names = {r["symbol"] for r in conn.execute("SELECT symbol FROM chunks")}
+            conn.close()
+            self.assertNotIn("a4", names)
+
+    def test_code_search_process_skips_its_heal_when_the_lock_is_held(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._indexed(td)
+            (root / "a.py").write_text("def a5():\n    pass\n")
+            lock = memidx._code_refresh_lock_path(db, memidx.DEFAULT_PROJECT)
+            fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                script = ("import sys; sys.path.insert(0, %r); import memidx; "
+                          "memidx.main(['code-search', '--db', %r, 'alpha', '--mode', 'fts'])") % (str(TOOLS_DIR), str(db))
+                r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+            finally:
+                os.close(fd)
+            self.assertIn("a code-index refresh is already running", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertNotIn("heal failed", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

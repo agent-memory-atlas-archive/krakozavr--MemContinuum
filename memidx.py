@@ -35,6 +35,7 @@ import traceback
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from stat import S_ISREG
 from urllib.parse import quote
 
 import yaml
@@ -4330,6 +4331,108 @@ def _prune_dirnames_for_code_walk(dirpath, dirnames, skip_dirs):
     ]
 
 
+_GIT_WALK_FALLBACK_SAID = False
+_GIT_LS_DEFAULT_TIMEOUT = 5.0
+
+
+def _git_ls_timeout() -> float:
+    """The ONE timeout for every git subprocess of the code-tree walk
+    (`MEMCONTINUUM_GIT_LS_TIMEOUT` seconds, default 5; unparseable or <= 0 is
+    the default). `code-refresh` lowers it to half its own watchdog budget so
+    a slow git is abandoned for the os.walk fallback before the hook is
+    killed."""
+    return _norm_positive_float(os.environ.get("MEMCONTINUUM_GIT_LS_TIMEOUT"), _GIT_LS_DEFAULT_TIMEOUT)
+
+
+def _git_listed_files(root: Path) -> list | None:
+    """ONE `git -C <root> ls-files -z --cached --others --exclude-standard`
+    (timeout: _git_ls_timeout, 5 s by default): every tracked file plus every untracked, NOT-ignored
+    file under `root`, as root-relative path strings. None -- never an
+    exception -- when git is missing, times out, fails, or `root` is not
+    inside a work tree (the caller then walks the tree itself)."""
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            capture_output=True, timeout=_git_ls_timeout(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    listed = [os.fsdecode(b) for b in res.stdout.split(b"\0") if b]
+    if not listed:
+        # An empty list is also what git answers for a root that is itself
+        # a .gitignore'd directory of a parent repo (nothing under it is
+        # "untracked and not ignored"). That is not "no files": hand the
+        # walk back to os.walk rather than index nothing.
+        try:
+            ign = subprocess.run(
+                ["git", "-C", str(root), "check-ignore", "-q", "."], capture_output=True, timeout=_git_ls_timeout(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if ign.returncode == 0:
+            return None
+    return listed
+
+
+def _iter_code_tree(root: Path, skip_dirs):
+    """The ONE enumerator under every code-tree walk (iter_code_files,
+    iter_code_source_files -- and through it cmd_code_reindex and
+    _root_report -- and code_census): yields every file under `root` that
+    survives the noise-dir pruning (`skip_dirs`, plus a nested linked
+    worktree's own toplevel -- see _prune_dirnames_for_code_walk).
+
+    When `root` is inside a git work tree the file list comes from git
+    (_git_listed_files), so .gitignore'd content -- a gitignored clone
+    under docs/, a build output -- is never indexed. `--cached` lists a
+    tracked file deleted from the work tree and a submodule's gitlink; the
+    existence check below drops both (a symlink to a directory is dropped
+    too: os.walk files it under dirnames). When git is missing, times out,
+    or `root` is not a work tree the walk falls back to os.walk unchanged,
+    saying so once on stderr: such a root keeps indexing ignored content,
+    and the operator should know."""
+    global _GIT_WALK_FALLBACK_SAID
+    listed = _git_listed_files(root)
+    if listed is None:
+        if not _GIT_WALK_FALLBACK_SAID:
+            _GIT_WALK_FALLBACK_SAID = True
+            print(
+                f"memidx: git file list unavailable for {root} (git missing, timed out, or not a "
+                "work tree) -- walking the directory tree; .gitignore is not honoured for it",
+                file=sys.stderr,
+            )
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = _prune_dirnames_for_code_walk(dirpath, dirnames, skip_dirs)
+            for fname in filenames:
+                yield Path(dirpath) / fname
+        return
+    dir_ok: dict = {"": True}
+
+    def ancestor_ok(rel_dir: str) -> bool:
+        ok = dir_ok.get(rel_dir)
+        if ok is None:
+            parent, _, name = rel_dir.rpartition("/")
+            ok = (
+                ancestor_ok(parent) and name not in skip_dirs
+                and not os.path.isfile(os.path.join(root, rel_dir, ".git"))
+            )
+            dir_ok[rel_dir] = ok
+        return ok
+
+    seen = set()
+    for rel in sorted(listed, key=lambda r: (r.rpartition("/")[0], r)):
+        if rel in seen:
+            continue
+        seen.add(rel)
+        if not ancestor_ok(rel.rpartition("/")[0]):
+            continue
+        path = Path(root) / rel
+        if not os.path.lexists(path) or os.path.isdir(path):
+            continue
+        yield path
+
+
 def iter_code_files(code_root: Path):
     """Every non-binary file under `code_root`, noise dirs pruned (Task 6:
     chunkers.UNIVERSAL_SKIP_DIRS -- the same set CODE_SKIP_DIR_NAMES
@@ -4340,13 +4443,10 @@ def iter_code_files(code_root: Path):
     filter lives in resolve_symbol_to_path's own loop, not here. Also
     prunes a nested linked worktree's own toplevel -- see
     _prune_dirnames_for_code_walk."""
-    for dirpath, dirnames, filenames in os.walk(code_root):
-        dirnames[:] = _prune_dirnames_for_code_walk(dirpath, dirnames, chunkers.UNIVERSAL_SKIP_DIRS)
-        for fname in filenames:
-            fpath = Path(dirpath) / fname
-            if is_binary_file(fpath):
-                continue
-            yield fpath
+    for fpath in _iter_code_tree(code_root, chunkers.UNIVERSAL_SKIP_DIRS):
+        if is_binary_file(fpath):
+            continue
+        yield fpath
 
 
 def _resolve_symbol_via_code_index(code_root: Path, symbol: str, project: str) -> tuple[str, str] | None:
@@ -6028,6 +6128,10 @@ def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter
     _prune_dirnames_for_code_walk's own docstring for why and for the
     accepted submodule-content side effect.
 
+    TOP-0137 L2 step 4: enumeration goes through `_iter_code_tree`, which
+    lists a git work tree's files with `git ls-files` (so .gitignore is
+    honoured) and falls back to os.walk otherwise -- see its docstring.
+
     `skipped`, when passed a Counter, is mutated in place: every walked file
     that is NOT yielded because its extension is unsupported (no language
     at all) or resolves to a lang outside the wired set (engine-supported
@@ -6046,19 +6150,16 @@ def iter_code_source_files(root: Path, langs: list[str] | None, skipped: Counter
     wired = list(langs or ["swift"])
     wired_set = set(wired)
     skip_dirs = CODE_SKIP_DIR_NAMES | chunkers.common_skip_dirs(wired)
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = _prune_dirnames_for_code_walk(dirpath, dirnames, skip_dirs)
-        for fname in sorted(filenames):
-            path = Path(dirpath) / fname
-            lang = lang_for_source_file(path)
-            if lang is not None and lang in wired_set:
-                rel_parts = _root_relative_parts(path, root)
-                if chunkers.path_is_skipped_for_lang(rel_parts, lang):
-                    continue
-                yield path
+    for path in _iter_code_tree(root, skip_dirs):
+        lang = lang_for_source_file(path)
+        if lang is not None and lang in wired_set:
+            rel_parts = _root_relative_parts(path, root)
+            if chunkers.path_is_skipped_for_lang(rel_parts, lang):
                 continue
-            if skipped is not None:
-                skipped[chunkers.extension_of(fname) or NO_EXTENSION_BUCKET] += 1
+            yield path
+            continue
+        if skipped is not None:
+            skipped[chunkers.extension_of(path.name) or NO_EXTENSION_BUCKET] += 1
 
 
 # ---------------------------------------------------------------------------
@@ -6154,13 +6255,14 @@ def _git_head_sha(root: Path) -> str | None:
     non-git code_root or a missing git binary never breaks code-reindex.
 
     Design R3 (audit MC-P1-02): also the first call of `_root_report`'s
-    git trigger (is HEAD still what code_meta says?) -- timeout lowered
-    from 5s to 2s to fit inside that trigger's overall 3s-per-report git
-    budget."""
+    git trigger (is HEAD still what code_meta says?), so its timeout is
+    capped at 2 s to fit that trigger's 3 s-per-report git budget, and is
+    lower when `_git_ls_timeout()` is lower, i.e. under `code-refresh`."""
     try:
         result = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=2,
+            capture_output=True, text=True,
+            timeout=min(2.0, _git_ls_timeout()),
         )
     # Design R7 (audit MC-P2-03, TOP-0123 L7): narrowed from a bare
     # except Exception -- subprocess.run's own documented failure modes
@@ -7038,26 +7140,24 @@ def code_census(root: Path) -> dict:
         row = counts.setdefault(key, {"files": 0, "status": status})
         row["files"] += 1
 
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = _prune_dirnames_for_code_walk(dirpath, dirnames, skip_dirs)
-        for fname in sorted(filenames):
-            path = Path(dirpath) / fname
-            # lang_for_source_file is the one resolution rule the whole
-            # code-index side shares: extension first (I2 compound-aware,
-            # so `foo.blade.php` is never folded into `.php`), else a
-            # shebang sniff for an extensionless file (controller-scope
-            # addition, Task 5 reviewer finding -- the "second silent
-            # gap": extensionless scripts used to vanish from the census
-            # entirely).
-            lang = lang_for_source_file(path)
-            if lang is None:
-                ext = chunkers.extension_of(fname)
-                bump(ext or NO_EXTENSION_BUCKET, "unsupported")
-                continue
-            rel_parts = _root_relative_parts(path, root)
-            if chunkers.path_is_skipped_for_lang(rel_parts, lang):
-                continue
-            bump(lang, "supported")
+    for path in _iter_code_tree(root, skip_dirs):
+        fname = path.name
+        # lang_for_source_file is the one resolution rule the whole
+        # code-index side shares: extension first (I2 compound-aware,
+        # so `foo.blade.php` is never folded into `.php`), else a
+        # shebang sniff for an extensionless file (controller-scope
+        # addition, Task 5 reviewer finding -- the "second silent
+        # gap": extensionless scripts used to vanish from the census
+        # entirely).
+        lang = lang_for_source_file(path)
+        if lang is None:
+            ext = chunkers.extension_of(fname)
+            bump(ext or NO_EXTENSION_BUCKET, "unsupported")
+            continue
+        rel_parts = _root_relative_parts(path, root)
+        if chunkers.path_is_skipped_for_lang(rel_parts, lang):
+            continue
+        bump(lang, "supported")
 
     return counts
 
@@ -7503,7 +7603,7 @@ def code_index_report(conn: sqlite3.Connection, project: str, *, verify_content:
     if not metas:
         return {
             "state": "uninitialized", "langs": None, "embedding_mode": "none",
-            "availability_changed": False, "roots": [], "changed": 0, "failed": 0, "not_indexed": 0,
+            "availability_changed": False, "roots": [], "changed": 0, "removed": 0, "failed": 0, "not_indexed": 0,
         }
     langs = resolve_project_langs(conn, project)
     avail = chunkers.backend_availability()  # one fingerprint for every root in this call
@@ -7513,6 +7613,7 @@ def code_index_report(conn: sqlite3.Connection, project: str, *, verify_content:
         r["last_indexed_at"] = m["last_indexed_at"]
         roots.append(r)
     changed = sum(r["changed"] for r in roots)
+    removed = sum(r["removed"] for r in roots)  # already inside `changed`; reported apart for the refresh hook's log line
     failed = sum(r["failed"] for r in roots)
     not_indexed = sum(r["not_indexed"] for r in roots)
     # Fix-wave item 4 (Grok G2): a MISSING root's own availability_changed
@@ -7538,13 +7639,45 @@ def code_index_report(conn: sqlite3.Connection, project: str, *, verify_content:
     return {
         "state": state, "langs": langs, "embedding_mode": (proj["embedding_mode"] if proj else "none"),
         "availability_changed": availability_changed, "roots": roots, "changed": changed,
-        "failed": failed, "not_indexed": not_indexed,
+        "removed": removed, "failed": failed, "not_indexed": not_indexed,
     }
+
+
+def _code_refresh_lock_path(db_path: Path, project: str) -> Path:
+    return Path(db_path).parent / f"{project}.code-refresh.lock"
+
+
+def _acquire_code_refresh_lock(db_path: Path, project: str):
+    """Non-blocking exclusive flock on `<db dir>/<project>.code-refresh.lock`
+    (TOP-0137 L2 step 4): the one writer lock between the code-refresh hook
+    and a code-search heal -- two writers on one code db otherwise race and
+    the loser's heal fails open with a traceback in the debug log. Returns
+    ("ok", fd) when acquired (the caller closes fd to release), ("held", None)
+    when another refresh owns it, ("error", None) when the lock file cannot be
+    opened at all (the caller decides whether to go on without it). The file
+    is opened O_NOFOLLOW: a planted symlink is never followed."""
+    try:
+        fd = os.open(
+            str(_code_refresh_lock_path(db_path, project)),
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600,
+        )
+    except OSError:
+        return "error", None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return "held", None
+    except OSError:
+        os.close(fd)
+        return "error", None
+    return "ok", fd
 
 
 def heal_code_index(
     conn: sqlite3.Connection, db_path: Path, project: str, report: dict, *, limit: int,
-    verify_content: bool = False,
+    verify_content: bool = False, caller: str = "code-search", result: dict | None = None,
+    lock_held: bool = False,
 ):
     """Anatomy M2a Task 5: `code-search`'s one-attempt preflighted heal --
     consulted right after code_index_report, before a search ever answers.
@@ -7576,21 +7709,62 @@ def heal_code_index(
     Any exception during the heal is fail-open: the db is reopened, the
     ORIGINAL (pre-heal) report is returned unchanged, and code-search still
     answers from whatever was already indexed -- a heal that cannot finish
-    must never crash a search or leave the connection closed."""
+    must never crash a search or leave the connection closed.
+
+    TOP-0137 L2 step 4 (shared by code-search and hooks/code-refresh.sh, one
+    implementation): `caller` prefixes every message (default `code-search`).
+    `result`, when a dict is passed, is filled in -- `outcome` (`ineligible`
+    | `over-limit` | `locked` | `reindex-failed` | `healed` | `error`),
+    `rc` (worst code-reindex rc), `exc` (exception type name on `error`),
+    `reindexed` (files touched) and `messages` (every line this call would
+    have printed) -- and NOTHING is printed to stderr: the hook folds the
+    messages into its one log line. Without `result` the messages go to
+    stderr as before. Eligibility is `changed > 0` (which already counts
+    every deleted file -- `_root_report` adds `removed` into `changed`) or an
+    availability change. The heal takes the non-blocking refresh lock
+    itself (`_acquire_code_refresh_lock`) unless `lock_held` says the caller
+    already owns it; a held lock skips the heal with a one-line notice
+    (outcome `locked`) instead of racing the other writer."""
+    out = result if result is not None else {}
+    out.update({"outcome": "ineligible", "rc": 0, "exc": None, "reindexed": 0, "messages": []})
+
+    def say(msg: str) -> None:
+        out["messages"].append(msg)
+        if result is None:
+            print(msg, file=sys.stderr)
+
     eligible = report["state"] in ("stale", "degraded") and (report["changed"] > 0 or report["availability_changed"])
     if not eligible:
         return report, conn
     if report["changed"] > limit:
+        out["outcome"] = "over-limit"
         # Fix-wave item 7: name the report's actual state, not a hardcoded
         # "stale" -- this refusal fires for a `degraded` report too (heal
         # is eligible on `stale` OR `degraded`), and "index is stale" is
         # simply wrong when the report says degraded.
-        print(
-            f"code-search: index is {report['state']} ({report['changed']} file(s) changed since "
-            f"the last code-reindex, above --heal-limit {limit}); run code-reindex",
-            file=sys.stderr,
+        say(
+            f"{caller}: index is {report['state']} ({report['changed']} file(s) changed since "
+            f"the last code-reindex, above --heal-limit {limit}); run code-reindex"
         )
         return report, conn
+    lock_fd = None
+    if not lock_held:
+        lock_state, lock_fd = _acquire_code_refresh_lock(db_path, project)
+        if lock_state == "held":
+            out["outcome"] = "locked"
+            say(f"{caller}: a code-index refresh is already running (lock held); not healing now")
+            return report, conn
+    try:
+        return _heal_code_index_locked(conn, db_path, project, report, verify_content, caller, out, say)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def _heal_code_index_locked(conn, db_path, project, report, verify_content, caller, out, say):
+    """The body of heal_code_index once eligibility, the limit and the
+    refresh lock are settled -- split out only so the lock's try/finally
+    stays one visible block; see heal_code_index for the contract."""
     langs = ",".join(report["langs"] or [])
     no_embed = report["embedding_mode"] != "full"
     # Task 5 decision: matches the actual per-run summary line printed at
@@ -7613,26 +7787,30 @@ def heal_code_index(
         for r in report["roots"]:
             if not r["exists"]:
                 continue
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
                 rc = cmd_code_reindex(argparse.Namespace(
                     code_root=r["code_root"], drop_root=None, db=str(db_path), project=project,
                     lang=langs or None, no_embed=no_embed, full=False, retry_not_indexed=False,
                 ))
             reindex_rc = max(reindex_rc, rc)  # the worst rc across every root, not just the last
-            m = summary_re.search(out.getvalue())
+            m = summary_re.search(buf.getvalue())
             if m:
                 reindexed += sum(int(g) for g in m.groups())
         conn = open_code_db(db_path)
         after = code_index_report(conn, project, verify_content=verify_content)
+        out["rc"] = reindex_rc
+        out["reindexed"] = reindexed
         if reindex_rc != 0:
-            print(
-                f"code-search: heal did not complete (code-reindex exit {reindex_rc}); "
-                "answering from the current index",
-                file=sys.stderr,
+            out["outcome"] = "reindex-failed"
+            say(
+                f"{caller}: heal did not complete (code-reindex exit {reindex_rc}); "
+                "answering from the current index"
             )
-        elif after["state"] in ("current", "metadata-current"):
-            print(f"code-search: index healed ({reindexed} file(s) re-indexed)", file=sys.stderr)
+        else:
+            out["outcome"] = "healed"
+            if after["state"] in ("current", "metadata-current"):
+                say(f"{caller}: index healed ({reindexed} file(s) re-indexed)")
         return after, conn
     except Exception as exc:
         # Fix-wave item 6: `conn` may already be the REOPENED connection
@@ -7648,10 +7826,9 @@ def heal_code_index(
         except Exception:
             pass
         conn = open_code_db(db_path)
-        print(
-            f"code-search: heal failed ({type(exc).__name__}: {exc}); answering from the current index",
-            file=sys.stderr,
-        )
+        out["outcome"] = "error"
+        out["exc"] = type(exc).__name__
+        say(f"{caller}: heal failed ({type(exc).__name__}: {exc}); answering from the current index")
         # Design R7: kept broad on purpose (a heal must never crash
         # code-search, whatever kind of exception it hits -- this already
         # names type+message the same way _degraded would), but the full
@@ -7659,6 +7836,355 @@ def heal_code_index(
         # buried under this fail-open message.
         _debug_log(exc, "heal_code_index", db_path)
         return report, conn
+
+
+# ---------------------------------------------------------------------------
+# code-refresh: the hooks/code-refresh.sh entry point (TOP-0137 L2 step 4)
+# ---------------------------------------------------------------------------
+
+_CODE_REFRESH_DEFAULT_BUDGET = 8.0
+_CODE_REFRESH_DEFAULT_LIMIT = 500
+
+
+def _norm_positive_int(raw, default: int) -> int:
+    """The one normaliser for a positive-integer env setting (a leading
+    zero is decimal here, never octal; anything unparseable or < 1 is the
+    default)."""
+    try:
+        value = int(str(raw).strip(), 10)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 1 else default
+
+
+def _norm_positive_float(raw, default: float) -> float:
+    """The one normaliser for a positive-number env setting: finite and > 0,
+    else the default."""
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if 0 < value < float("inf") else default
+
+
+def _watchdog_budget():
+    """The hook's watchdog budget in seconds as the SHELL normalised it
+    (`MC_WATCHDOG_BUDGET`, always exported by hooks/code-refresh.sh on the
+    guarded path); None when unset or unparsable. The raw
+    MEMCONTINUUM_CODE_REFRESH_BUDGET is never read here -- one normaliser
+    (the shell's), so both sides agree on `.5` and `1e-3`."""
+    value = _norm_positive_float(os.environ.get("MC_WATCHDOG_BUDGET"), 0.0)
+    return value or None
+
+
+def _code_refresh_sweep_age(budget) -> float:
+    """Seconds a leftover `<marker>.new.<pid>` temp must have aged before
+    the sweep may remove it: twice the hook's watchdog budget (write-safety
+    rule 5); with no usable budget (None) the budget counts as 30 s, so 60 s."""
+    return 2 * (budget if budget else 30.0)
+
+
+_HOOK_FIELD_RE = {
+    key: re.compile(r'"' + key + r'"\s*:\s*"([^"\\]*)"') for key in ("hook_event_name", "session_id")
+}
+
+
+def _hook_payload_fields(text: str) -> dict:
+    """`hook_event_name` / `session_id` from the hook payload on stdin. The
+    shell hands over a bounded PREFIX of the payload, which may cut the JSON
+    short: a complete document is parsed, a truncated one is scanned for the
+    two string fields (both sit in the first few hundred bytes)."""
+    try:
+        data = json.loads(text or "{}")
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        return data
+    out = {}
+    for key, rx in _HOOK_FIELD_RE.items():
+        m = rx.search(text or "")
+        if m:
+            out[key] = m.group(1)
+    return out
+
+
+def _clean_log_token(raw, limit: int = 64) -> str:
+    """A payload value reduced to a hook.log-safe token: [A-Za-z0-9._-]
+    only, so a hostile session_id can neither split the line nor forge a
+    key=value pair."""
+    token = re.sub(r"[^A-Za-z0-9._-]", "", str(raw or ""))[:limit]
+    return token or "unknown"
+
+
+def _write_code_stale_marker(marker: Path, reason: str, roots: int) -> bool:
+    """Publish `<project>.code-stale` (`reason=<r> since=<iso> roots=<n>`).
+    Write-safety: a per-process temp name beside the destination, created
+    exclusively (O_EXCL|O_NOFOLLOW) after removing any stale file of that
+    exact name, then os.replace -- refused when the destination is a
+    symlink or a directory. False on any failure (the caller logs it)."""
+    tmp = marker.parent / f"{marker.name}.new.{os.getpid()}"
+    try:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"reason={reason} since={datetime.now().astimezone().isoformat(timespec='seconds')} roots={roots}\n")
+        if marker.is_symlink() or marker.is_dir():
+            raise OSError("marker path is a symlink or a directory")
+        os.replace(str(tmp), str(marker))
+        return True
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def _clear_code_stale_marker(marker: Path) -> None:
+    """Remove the marker (a symlink is unlinked itself, never followed)."""
+    try:
+        if marker.is_symlink() or marker.is_file():
+            marker.unlink()
+    except OSError:
+        pass
+
+
+def _sweep_code_stale_temps(marker: Path, min_age: float) -> None:
+    """Remove `<marker>.new.<digits>` leftovers of a killed run: exact name
+    grammar, regular files only, older than `min_age` (a fresh file of an
+    overlapping run is never a candidate)."""
+    pat = re.compile(re.escape(marker.name) + r"\.new\.[0-9]+$")
+    try:
+        names = os.listdir(marker.parent)
+    except OSError:
+        return
+    now = time.time()
+    for name in names:
+        if not pat.match(name):
+            continue
+        path = marker.parent / name
+        try:
+            st = os.lstat(path)
+            if S_ISREG(st.st_mode) and now - st.st_mtime > min_age:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _env_code_roots() -> list:
+    """MEMCONTINUUM_CODE_ROOTS (JSON list), else the single legacy
+    MEMCONTINUUM_CODE_ROOT, resolved -- the same rule memlib.sh's
+    mc_code_roots applies."""
+    roots = []
+    raw = os.environ.get("MEMCONTINUUM_CODE_ROOTS", "")
+    if raw:
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            data = []
+        if isinstance(data, list):
+            roots = [r for r in data if isinstance(r, str) and r]
+    elif os.environ.get("MEMCONTINUUM_CODE_ROOT"):
+        roots = [os.environ["MEMCONTINUUM_CODE_ROOT"]]
+    out = []
+    for r in roots:
+        try:
+            out.append(str(Path(r).resolve()))
+        except OSError:
+            out.append(r)
+    return out
+
+
+def cmd_code_refresh(args) -> int:
+    """hooks/code-refresh.sh's worker: the code index's freshness pass.
+
+    Reads the hook JSON on stdin (`hook_event_name`, `session_id`), prints
+    EXACTLY ONE line to stdout -- `outcome=<refreshed|skip|failed>
+    reason=... project=P roots=N unrecorded=N changed=N removed=N healed=N
+    elapsed=Xs event=E session=S [marker=write-failed] [detail=...]` -- which
+    the hook shell prefixes with a timestamp and appends to hook.log. Never
+    raises, always returns 0.
+
+    The staleness detector is the existing one: `code_index_report` (stat
+    signals, sha on drift, the git HEAD trigger), then `heal_code_index`
+    (caller `code-refresh`, `lock_held=True`) -- no HEAD-compare or ledger
+    scan of its own. `Stop`: preflight, then the heal. Any other event
+    (`SessionStart`) preflights ONLY: a SessionStart hook blocks the
+    session, so a stale report there only writes the `<project>.code-stale`
+    marker (`reason=stale changed=<n>`) and the first Stop refreshes.
+    A root with no `code_meta` row is counted (`unrecorded`) and left alone.
+
+    Marker (`<db dir>/<project>.code-stale`): `reason=refreshing` is written
+    BEFORE the heal; a clean heal (rc 0 and nothing left to heal) removes it;
+    a failed heal, a --heal-limit refusal or a fail-open exception rewrites
+    it with the reason; a killed run leaves `refreshing` behind, which is the
+    truth (per-file savepoints, nothing corrupt). A preflight that finds
+    nothing to heal but is `degraded` (a missing root, a not-indexed file)
+    writes the marker as `degraded missing-root=<n> not-indexed=<n>`; only a
+    `current` or `metadata-current` report removes a leftover marker. Mutual exclusion with a
+    code-search heal is a non-blocking flock on
+    `<project>.code-refresh.lock`; lock held -> skip, marker untouched."""
+    t0 = time.monotonic()
+    project = args.project
+    res = {"outcome": "failed", "reason": "crash", "roots": 0, "unrecorded": 0, "changed": 0,
+           "removed": 0, "healed": 0}
+    extra = []
+    event, session = "unknown", "unknown"
+    try:
+        budget = _watchdog_budget()
+        if budget:
+            # Half the watchdog budget (min 0.5 s) for a git subprocess, BEFORE
+            # any walk: a slow git must fall back to os.walk, not eat the hook.
+            os.environ["MEMCONTINUUM_GIT_LS_TIMEOUT"] = str(max(0.5, budget / 2))
+        payload = _hook_payload_fields(sys.stdin.read(1 << 20))
+        event = _clean_log_token(payload.get("hook_event_name"))
+        session = _clean_log_token(payload.get("session_id"))
+        db_path = resolve_code_db_path(args)
+        marker = db_path.parent / f"{project}.code-stale"
+        _refresh_code_index(args, project, db_path, marker, event == "Stop", res, extra)
+    except Exception as exc:  # noqa: BLE001 -- a hook worker must never raise
+        res.update(outcome="failed", reason=f"crash-{type(exc).__name__}")
+        _debug_log(exc, "code-refresh")
+    elapsed = time.monotonic() - t0
+    line = (
+        f"outcome={res['outcome']} reason={res['reason']} project={project} roots={res['roots']} "
+        f"unrecorded={res['unrecorded']} changed={res['changed']} removed={res['removed']} "
+        f"healed={res['healed']} elapsed={elapsed:.1f}s event={event} session={session}"
+    )
+    for item in extra:
+        line += " " + " ".join(str(item).split())[:300]
+    print(line)
+    return 0
+
+
+def _refresh_code_index(args, project, db_path, marker, is_stop, res, extra) -> None:
+    """The body of cmd_code_refresh: fills `res` / `extra` (see there)."""
+    if not db_path.is_file():
+        res.update(outcome="skip", reason="uninitialized")
+        return
+    lock_state, lock_fd = _acquire_code_refresh_lock(db_path, project)
+    if lock_state == "held":
+        res.update(outcome="skip", reason="locked")
+        return
+    if lock_state == "error":
+        res.update(outcome="skip", reason="lock-error")
+        return
+    try:
+        _sweep_code_stale_temps(marker, _code_refresh_sweep_age(_watchdog_budget()))
+        _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, extra)
+    finally:
+        os.close(lock_fd)
+
+
+_CODE_STATES_CURRENT = ("current", "metadata-current")
+
+
+def _degraded_marker_reason(report: dict) -> str:
+    """`degraded missing-root=<n> not-indexed=<n>` from a code_index_report."""
+    missing = sum(1 for r in report["roots"] if not r["exists"])
+    return f"degraded missing-root={missing} not-indexed={report['not_indexed']}"
+
+
+def _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, extra) -> None:
+    ro = None
+    try:
+        ro = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        schema = code_schema_version(ro)
+    except sqlite3.DatabaseError:
+        schema = -1
+    finally:
+        if ro is not None:
+            ro.close()
+    if schema == -1:
+        res.update(outcome="failed", reason="unreadable-db")
+        return
+    if schema < CODE_SCHEMA_VERSION:
+        # open_code_db would DROP and rebuild an older db (schema 0 -- a
+        # legacy unversioned db -- included) and the heal would then run
+        # against an empty index. Neither event may: the rebuild stays with
+        # an explicit code-reindex (or code-search).
+        if not _write_code_stale_marker(marker, "stale schema-older-than-engine", 0):
+            extra.append("marker=write-failed")
+        res.update(outcome="skip", reason="stale-marked")
+        return
+    try:
+        conn = open_code_db(db_path)
+    except CodeIndexTooNew:
+        res.update(outcome="failed", reason="db-newer-than-engine")
+        return
+    try:
+        report = code_index_report(conn, project)
+        recorded = {r["code_root"] for r in report["roots"]}
+        res["roots"] = len(recorded)
+        res["unrecorded"] = sum(1 for r in _env_code_roots() if r not in recorded)
+        res["changed"] = report["changed"]
+        res["removed"] = report["removed"]
+        if report["state"] == "uninitialized":
+            res.update(outcome="skip", reason="uninitialized")
+            return
+        needs_heal = report["changed"] > 0 or report["availability_changed"]
+        if not needs_heal:
+            if report["state"] in _CODE_STATES_CURRENT:
+                # Positive signal (rule 7): the same detector every reader uses
+                # found nothing to repair, so a leftover marker is a lie now.
+                _clear_code_stale_marker(marker)
+                res.update(outcome="skip", reason="current")
+                return
+            # degraded (a missing root, a not-indexed file): nothing to heal,
+            # and not current either -- the marker says so.
+            if not _write_code_stale_marker(marker, _degraded_marker_reason(report), res["roots"]):
+                extra.append("marker=write-failed")
+            res.update(outcome="skip", reason="degraded")
+            return
+        if not is_stop:
+            if not _write_code_stale_marker(marker, f"stale changed={report['changed']}", res["roots"]):
+                extra.append("marker=write-failed")
+            res.update(outcome="skip", reason="stale-marked")
+            return
+        if not _write_code_stale_marker(marker, "refreshing", res["roots"]):
+            # "A kill leaves `refreshing` behind" cannot be kept, so the work
+            # does not start (code-search's own heal still covers search).
+            extra.append("marker=write-failed")
+            res.update(outcome="skip", reason="marker-unwritable")
+            return
+        limit = _norm_positive_int(os.environ.get("MEMCONTINUUM_CODE_REFRESH_LIMIT"), _CODE_REFRESH_DEFAULT_LIMIT)
+        hres: dict = {}
+        after, conn = heal_code_index(
+            conn, db_path, project, report, limit=limit, caller="code-refresh", result=hres, lock_held=True,
+        )
+        res["healed"] = hres.get("reindexed", 0)
+        if hres["messages"]:
+            extra.append("detail=" + "; ".join(hres["messages"]))
+        outcome = hres["outcome"]
+        if outcome == "healed" and after["changed"] == 0 and not after["availability_changed"]:
+            if after["state"] in _CODE_STATES_CURRENT:
+                _clear_code_stale_marker(marker)
+                res.update(outcome="refreshed", reason="healed")
+                return
+            # healed, yet still degraded (a root went missing, a file stays
+            # not-indexed): not "refreshed", and the marker stays.
+            reason = _degraded_marker_reason(after)
+            if not _write_code_stale_marker(marker, reason, res["roots"]):
+                extra.append("marker=write-failed")
+            res.update(outcome="failed", reason="degraded")
+            return
+        reasons = {
+            "reindex-failed": f"reindex-failed rc={hres['rc']}",
+            "over-limit": f"over-limit changed={report['changed']}",
+            "error": f"heal-error {hres['exc']}",
+        }
+        reason = reasons.get(outcome, f"incomplete changed={after['changed']}")
+        if not _write_code_stale_marker(marker, reason, res["roots"]):
+            extra.append("marker=write-failed")
+        res.update(outcome="failed", reason=reason.split()[0])
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def cmd_code_search(args) -> int:
@@ -9493,6 +10019,14 @@ def main(argv=None) -> int:
              "state is content-proven, not metadata-current",
     )
     p_code_search.set_defaults(func=cmd_code_search)
+
+    p_code_refresh = sub.add_parser(
+        "code-refresh",
+        description="internal/hook use (hooks/code-refresh.sh): refresh the code index when it is "
+                    "stale; reads the hook JSON on stdin, prints one log fragment",
+    )
+    add_common_args(p_code_refresh)
+    p_code_refresh.set_defaults(func=cmd_code_refresh)
 
     p_code_census = sub.add_parser("code-census")
     p_code_census.add_argument("--root", required=True)

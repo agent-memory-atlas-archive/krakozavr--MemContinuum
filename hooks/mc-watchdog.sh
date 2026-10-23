@@ -147,7 +147,10 @@ def _log_watchdog_kill():
         # line genuinely cannot know the real project, and must say so
         # rather than ever emitting a bare line with none at all.
         project = os.environ.get("MEMCONTINUUM_PROJECT") or "(pre-resolution)"
-        os.makedirs(home, exist_ok=True)
+        # Write-safety rule 2: a missing home is never created, not even for a
+        # kill line -- with no home there is nothing to log into.
+        if not os.path.isdir(home):
+            return
         # MINOR fix-round item (search fallback, TOP-0133 L1): the p50/p95
         # timing pool (memidx.py stats) is blind to the slow tail -- a
         # watchdog-killed run logs no `search-fallback`/`-empty` line at

@@ -391,6 +391,31 @@ mc_relint_note() {
         "$MC_PROJECT" "${root:+ ($root)}" "${sha:0:8}" "$summary" "$f"
 }
 
+# mc_code_stale_note -- prints ONE fact line when hooks/code-refresh.sh left
+# the sticky `<project>.code-stale` marker (`reason=<r> since=<ts> roots=<n>`:
+# a refresh that was killed mid-run, failed, was refused by --heal-limit, or a
+# SessionStart preflight that found the code index behind). The marker is
+# removed by the next refresh that finds nothing left to repair. Pure bash,
+# no python. Nothing printed when there is no marker or it is unparseable.
+# Entries of one hook event run in parallel, so a marker written by THIS
+# session's own code-refresh.sh is shown by the next session start (or never,
+# when the first Stop repairs it first) -- no ordering is relied on.
+mc_code_stale_note() {
+    local f="$MEMCONTINUUM_HOME/$MC_PROJECT.code-stale" line="" reason="" since=""
+    [ -f "$f" ] || return 0
+    IFS= read -r line <"$f" 2>/dev/null || [ -n "$line" ] || return 0
+    case "$line" in
+        reason=*" since="*) ;;
+        *) return 0 ;;
+    esac
+    reason="${line#reason=}"
+    reason="${reason%% since=*}"
+    since="${line#*" since="}"
+    since="${since%% roots=*}"
+    printf 'MemContinuum: code index for %s may be stale: %s since %s -- memidx.py code-reindex refreshes it' \
+        "$MC_PROJECT" "$reason" "$since"
+}
+
 mc_maybe_upgrade_hint() {
     STANDING_HINT_CTX=""
     [ "$STANDING_STATUS" = "skipped-upgrade-required" ] || return
@@ -602,6 +627,15 @@ print(json.dumps(state))
                 STANDING_CTX="$RELINT_NOTE"
             fi
             RELINT_TOKEN=" relint=shown"
+        fi
+        CODE_STALE_NOTE="$(mc_code_stale_note)"
+        if [ -n "$CODE_STALE_NOTE" ]; then
+            if [ -n "$STANDING_CTX" ]; then
+                STANDING_CTX="$STANDING_CTX"$'\n\n'"$CODE_STALE_NOTE"
+            else
+                STANDING_CTX="$CODE_STALE_NOTE"
+            fi
+            RELINT_TOKEN="$RELINT_TOKEN code-stale=shown"
         fi
 
         if [ -n "$STANDING_CTX" ]; then

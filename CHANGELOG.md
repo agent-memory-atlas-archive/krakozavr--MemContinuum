@@ -29,6 +29,36 @@
   marker path that is a symlink or a directory is refused instead of being
   moved into.
 
+- The code index now refreshes itself. A new `code-refresh.sh` hook, wired on
+  `Stop` and `SessionStart` for any project with a code root, checks the index
+  with the same staleness test `code-search` uses (file stat signals, a content
+  hash on drift, the git HEAD trigger). At the end of a turn it re-indexes what
+  changed, including files deleted since, in the same incremental text pass
+  `code-search` already makes; embeddings are not part of it. At session start
+  it only checks and, if the index is behind, writes
+  `<project>.code-stale`, which the next session start names in one line (the
+  first turn end repairs it). The marker is honest about failure: `refreshing`
+  stays behind if the hook is killed mid-run, and a failed pass, a pass refused
+  by the heal limit (`MEMCONTINUUM_CODE_REFRESH_LIMIT`, default 500) or an
+  exception records its reason there. The hook prints nothing, always exits 0,
+  logs one `hook.log` line per run, runs under the watchdog (8 s on `Stop`,
+  `MEMCONTINUUM_CODE_REFRESH_BUDGET`; 2 s on `SessionStart`) and never creates a
+  code index: a root that was never indexed is only counted. A lock keeps two
+  refreshes, or a refresh and a `code-search` heal, from writing one index at
+  once; the search skips its heal with a one-line notice instead. No git hook is
+  installed in your code repositories: a commit made during a session is caught
+  at the next turn end, one made outside any session at the next session start.
+  Re-run `memcontinuum-update.sh --apply` to wire it into existing projects.
+- The code index no longer reads files your `.gitignore` excludes. Inside a git
+  work tree the walk now takes the file list from `git ls-files` (tracked plus
+  untracked, minus ignored); outside one, or without git, it walks the
+  directory as before and says so on stderr. Ignored content an earlier walk
+  had indexed (a cloned corpus under `docs/`, build output) is dropped by the
+  next refresh. The language census counts the same files.
+- `heal_code_index` now names its caller in its messages, can hand them back
+  instead of printing, and reports why it did not heal (over the limit, a
+  failure, or a held lock).
+
 ## [0.3.0] — 2026-10-15
 
 Upgrading: the decision index schema generation moves from 5 to 6 (it now

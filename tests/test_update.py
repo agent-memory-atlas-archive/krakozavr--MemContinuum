@@ -3198,6 +3198,51 @@ class TestMultiRootWriteSideMigration(unittest.TestCase):
         ], self.home)
         assert proc.returncode == 0, proc.stdout + proc.stderr
 
+    def test_repo_wired_before_code_refresh_reads_stale_then_ok_after_apply(self):
+        """TOP-0137 L2 step 4: a repo wired before hooks/code-refresh.sh
+        existed has no Stop/SessionStart refresh line and carries an older
+        render stamp; the updater reports it stale (the stamp is a hash of
+        templates/* and repo-init.sh, both of which this change touched),
+        --apply renders the new lines, and the next report is ok."""
+        proc = run(DECIDE_SH, [
+            "wired", "--repo", self.repo, "--store", self.store, "--project", "multiroot",
+            "--claude-dir", self.claude_dir,
+            "--code-root", self.code_a, "--code-root", self.code_b,
+            "--langs", "python",
+        ], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        path = Path(self.claude_dir, "settings.local.json")
+        data = json.loads(path.read_text())
+        for event in ("Stop", "SessionStart"):
+            groups = []
+            for g in data["hooks"].get(event, []):
+                g["hooks"] = [h for h in g["hooks"] if "code-refresh.sh" not in h["command"]]
+                if g["hooks"]:
+                    groups.append(g)
+            if groups:
+                data["hooks"][event] = groups
+            else:
+                data["hooks"].pop(event, None)
+        old = json.dumps(data).replace(f"MEMCONTINUUM_RENDERED={engine_sha()}", "MEMCONTINUUM_RENDERED=deadbee")
+        path.write_text(old)
+        self.assertNotIn("code-refresh.sh", old)
+
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("stale", proc.stdout, proc.stdout)
+
+        proc = run(UPDATE_SH, ["--apply"], self.home)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        data = json.loads(path.read_text())
+        for event in ("Stop", "SessionStart"):
+            lines = [h["command"] for g in data["hooks"][event] for h in g["hooks"]
+                     if "code-refresh.sh" in h["command"]]
+            self.assertEqual(len(lines), 1, (event, lines))
+            self.assertIn(self.code_b, lines[0])
+        proc = run(UPDATE_SH, [], self.home)
+        self.assertIn("ok", proc.stdout)
+        self.assertNotIn("stale", proc.stdout)
+
     def test_old_shape_line_migrates_and_json_token_recovers_both_roots(self):
         # --- part 1: a NORMALLY WIRED row (registry already knows both
         # roots) whose CURRENT write-side line is still the OLD shape
@@ -3227,7 +3272,8 @@ class TestMultiRootWriteSideMigration(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         settings = Path(self.claude_dir, "settings.local.json").read_text()
         self.assertIn(f"MEMCONTINUUM_CODE_ROOT={self.code_a}", settings)
-        self.assertEqual(settings.count("MEMCONTINUUM_CODE_ROOTS="), 5, settings)
+        # five write-side lines + code-refresh.sh on SessionStart and Stop
+        self.assertEqual(settings.count("MEMCONTINUUM_CODE_ROOTS="), 7, settings)
         self.assertIn(self.code_b, settings)
 
         before_second_apply = settings

@@ -429,6 +429,48 @@ Notes:
   `$MEMCONTINUUM_HOME/<project>.embed-pending`, `<project>.embed.lock` and `<project>.embed.log`
   when its content pass leaves rows without a fresh vector.
 
+## 5. `code-refresh.sh` — code-index freshness on `Stop` and `SessionStart`
+
+Rendered from `templates/code-refresh-hook.json.tmpl` for a project that has at least one
+`--code-root` (a store-only project gets nothing). Same env block as the ledger line:
+`MEMCONTINUUM_ROOT`, `MEMCONTINUUM_CODE_ROOT`, `MEMCONTINUUM_CODE_ROOTS`, `MEMCONTINUUM_PROJECT`,
+`MEMCONTINUUM_PYTHON`. One script, two entries:
+
+| Event | What it does | Budget |
+|---|---|---|
+| `Stop` | the existing preflight (`code_index_report`: stat signals, sha on drift, git HEAD trigger), then the same incremental text heal `code-search` makes (`heal_code_index`, no embeddings) | `MEMCONTINUUM_CODE_REFRESH_BUDGET`, default 8 s |
+| `SessionStart` | preflight only, never a reindex; a stale report writes the marker | 2 s |
+
+- **Silent.** The script prints nothing on any path (a `Stop` hook's output is fed back to the
+  model) and always exits 0. The one place its result goes is `hook.log`:
+  `<ts> code-refresh outcome=<refreshed|skip|failed> reason=… project=P roots=N unrecorded=N
+  changed=N removed=N healed=N elapsed=Xs event=<Stop|SessionStart> session=S [detail=…]`.
+  Skip reasons: `uninitialized` (no code db yet, or no recorded root), `current`, `degraded`
+  (nothing left to repair), `locked`, `stale-marked` (SessionStart found the index behind).
+- **First index stays explicit.** A root with no recorded index is counted (`unrecorded=`) and
+  left alone: `memidx.py code-reindex --lang …` is still how a root is first indexed.
+- **Marker.** `$MEMCONTINUUM_HOME/<project>.code-stale` holds `reason=<r> since=<iso> roots=<n>`.
+  It is written `refreshing` before the heal and removed after a clean one; a failed heal, a
+  `--heal-limit` refusal (`MEMCONTINUUM_CODE_REFRESH_LIMIT`, default 500) or a fail-open
+  exception rewrites it (`reindex-failed rc=N`, `over-limit changed=N`, `heal-error <Type>`); a
+  watchdog kill leaves `refreshing`, which is true (per-file savepoints, nothing corrupt).
+  `sessionstart-remind.sh` shows it in one line next to the re-lint marker. Hook entries of one
+  event run in parallel, so a marker written by this session's own `SessionStart` run is shown at
+  the next session start, if the first `Stop` has not repaired it by then.
+- **One writer.** A non-blocking `flock` on `$MEMCONTINUUM_HOME/<project>.code-refresh.lock`
+  excludes a second refresh; `code-search`'s own heal takes the same lock and skips with a
+  one-line notice when it is held.
+- **No git post-commit hook in code repos, on purpose.** Installing git hooks into your project
+  repos is the invasive path `repo-init.sh` refuses for foreign hooks, and a commit nobody is
+  working on costs nothing stale. A commit made inside a session is caught by the next `Stop`
+  (before your next prompt); one made outside any session (another tool, another machine) by the
+  next `SessionStart`. The bound: the index can lag by the commits made between two sessions, and
+  it says so at session start.
+- **Ignored files.** The code walk lists a git work tree with `git ls-files --cached --others
+  --exclude-standard`, so `.gitignore`d content (a cloned corpus under `docs/`, build output) is
+  not indexed; the first refresh after upgrading drops anything an older walk let in. Outside a
+  work tree, or without git, it falls back to a plain directory walk and says so once on stderr.
+
 
 > Invocation note: every example above runs a hook as `bash <path>` rather than
 > by the path alone, matching what the templates render -- the executable bit is
@@ -437,7 +479,7 @@ Notes:
 
 > Two projects sharing one claude-dir: `scripts/repo-init.sh`'s merge step identifies its own
 > hook entries by script basename, further scoped by the `MEMCONTINUUM_PROJECT=` marker every one
-> of the seven commands carries -- `newfile-nudge.sh` (section 2 above) included. A project's
+> of the eight commands carries -- `newfile-nudge.sh` (section 2 above) included. A project's
 > re-run can only sweep entries marked for ITS OWN `--project`, or entries with no marker at all
 > (wired before this marker existed). An entry carrying no marker stays sweepable by ANY
 > project's re-run until the project that owns it re-runs `scripts/repo-init.sh` -- there is no
