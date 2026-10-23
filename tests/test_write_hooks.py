@@ -6831,17 +6831,42 @@ class TestCodeRefreshHook(HookTestBase):
             "import subprocess as _sp\n"
             "_orig = _sp.run\n"
             "def _rec(*a, **k):\n"
-            "    if a and a[0][:1] == ['git'] and ('ls-files' in a[0] or 'check-ignore' in a[0] or 'rev-parse' in a[0]):\n"
-            f"        open({str(out)!r}, 'a').write(repr(k.get('timeout')) + '\\n')\n"
+            "    if a and a[0][:1] == ['git']:\n"
+            "        for _n in ('ls-files', 'check-ignore', 'rev-parse'):\n"
+            "            if _n in a[0]:\n"
+            f"                open({str(out)!r}, 'a').write(_n + ' ' + repr(k.get('timeout')) + '\\n')\n"
             "    return _orig(*a, **k)\n"
             "memidx.subprocess.run = _rec\n"
         )
         py = self.patched_python(src)
-        self.run_hook("SessionStart", env=self.refresh_env(MEMCONTINUUM_PYTHON=py))
-        self.assertEqual(set(out.read_text().split()), {"1.0"}, out.read_text())
-        out.unlink()
-        self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_PYTHON=py))
-        self.assertEqual(set(out.read_text().split()), {"4.0"}, out.read_text())
+
+        def split(text):
+            listing, revparse = set(), set()
+            for line in text.splitlines():
+                name, _, val = line.partition(" ")
+                (revparse if name == "rev-parse" else listing).add(val)
+            return listing, revparse
+
+        for event, want_list, want_rev in (("SessionStart", "1.0", "1.0"), ("Stop", "4.0", "2.0")):
+            if out.exists():
+                out.unlink()
+            self.run_hook(event, env=self.refresh_env(MEMCONTINUUM_PYTHON=py))
+            text = out.read_text()
+            listing, revparse = split(text)
+            self.assertTrue(revparse, f"{event}: no rev-parse call recorded: {text!r}")
+            self.assertEqual(listing, {want_list}, f"{event}: {text}")
+            self.assertEqual(revparse, {want_rev}, f"{event}: {text}")
+
+    def test_git_head_sha_timeout_is_capped_at_2s_and_follows_a_lower_ls_timeout(self):
+        done = mock.Mock(returncode=0, stdout="abc\n")
+        for env_val, want in ((None, 2.0), ("1", 1.0)):
+            with mock.patch.dict(os.environ):
+                os.environ.pop("MEMCONTINUUM_GIT_LS_TIMEOUT", None)
+                if env_val is not None:
+                    os.environ["MEMCONTINUUM_GIT_LS_TIMEOUT"] = env_val
+                with mock.patch.object(memidx.subprocess, "run", return_value=done) as run:
+                    self.assertEqual(memidx._git_head_sha(Path(self.td)), "abc")
+                self.assertEqual(run.call_args.kwargs["timeout"], want, env_val)
 
     def test_git_ls_timeout_helper_defaults_and_normalises(self):
         with mock.patch.dict(os.environ):

@@ -6255,15 +6255,14 @@ def _git_head_sha(root: Path) -> str | None:
     non-git code_root or a missing git binary never breaks code-reindex.
 
     Design R3 (audit MC-P1-02): also the first call of `_root_report`'s
-    git trigger (is HEAD still what code_meta says?) -- timeout lowered
-    from 5s to 2s to fit inside that trigger's overall 3s-per-report git
-    budget; since the code-refresh fix round the timeout is `_git_ls_timeout()`
-    (5 s default, half the hook watchdog budget under `code-refresh`), the
-    same helper the code-tree walker uses."""
+    git trigger (is HEAD still what code_meta says?), so its timeout is
+    capped at 2 s to fit that trigger's 3 s-per-report git budget, and is
+    lower when `_git_ls_timeout()` is lower, i.e. under `code-refresh`."""
     try:
         result = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=_git_ls_timeout(),
+            capture_output=True, text=True,
+            timeout=min(2.0, _git_ls_timeout()),
         )
     # Design R7 (audit MC-P2-03, TOP-0123 L7): narrowed from a bare
     # except Exception -- subprocess.run's own documented failure modes
