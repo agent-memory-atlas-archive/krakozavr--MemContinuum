@@ -2302,6 +2302,13 @@ lock/marker/loop skeleton, `_run_embed_worker_loop`.
   workers: `reindex --no-embed` counts those store records, and `code-reindex --no-embed` those
   chunks, as awaiting embedding. `requirements.lock` is unchanged (same fastembed, same
   onnxruntime); CI caches the new snapshot under `fastembed-model-v2-…`.
+- **Cold-start cost in hooks.** A hook that reaches the vector channel pays python start, the
+  fastembed import (0.26-0.65 s measured) and the model load (0.17-0.26 s for the 133 MB fp32
+  file, 0.12-0.22 s for the 67 MB quantised one; no network when the model is cached). On a 3-vCPU
+  macOS CI runner that crosses the pre-edit hook's 2 s budget, so that job runs the hooks' search
+  fallback in fts mode (`MEMCONTINUUM_FALLBACK_MODE=fts`). Options for step 7: a pre-optimised or
+  serialised ORT session, a resident embedder, or the quantised file for single-query embedding
+  (identical vectors) with a fingerprint that names the logical model.
 
 ### Code-index freshness
 

@@ -113,6 +113,14 @@ jobs:
     # the actual BSD toolchain, filesystem, and the bash 3.2.57 Apple still
     # ships at /bin/bash -- none of which the bash32 job above can reach.
     runs-on: macos-latest
+    env:
+      # The macOS runner has 3 vCPUs: the hooks' hybrid search fallback loads
+      # the embedding model inside the pre-edit hook's 2 s budget and is
+      # watchdog-killed there. This job is the portability smoke for the
+      # hooks' shell; the Linux jobs exercise the hybrid path. Cold-start cost
+      # of the vector channel in hooks is a step-7 item (docs/INTERNALS.md,
+      # "Code embeddings").
+      MEMCONTINUUM_FALLBACK_MODE: fts
     steps:
       - uses: actions/checkout@v4
         with:
