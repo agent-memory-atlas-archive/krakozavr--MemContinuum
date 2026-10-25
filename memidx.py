@@ -6534,7 +6534,24 @@ def delete_code_chunks_for_path(conn: sqlite3.Connection, project: str, code_roo
 def drop_code_root(conn: sqlite3.Connection, project: str, code_root: str) -> None:
     """Remove one code root's rows from a project's index -- nothing is
     walked, so this is the correct way to retire a root that is gone for
-    good (deleted, moved, unmounted) without needing it to exist on disk."""
+    good (deleted, moved, unmounted) without needing it to exist on disk.
+
+    One explicit BEGIN IMMEDIATE transaction, committed here (rolled back on
+    any error): the file_sha snapshot is read under the write lock, so a
+    concurrent pass cannot commit a new path between the read and the
+    deletes and leave orphans no `code_meta` row points at (INC-0129, F3)."""
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _drop_code_root_rows(conn, project, code_root)
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
+def _drop_code_root_rows(conn: sqlite3.Connection, project: str, code_root: str) -> None:
     for row in conn.execute(
         "SELECT path FROM file_sha WHERE project=? AND code_root=?", (project, code_root)
     ).fetchall():
@@ -6834,7 +6851,6 @@ def cmd_code_reindex(args) -> int:
             return 1
         root_s = str(Path(args.drop_root).resolve())
         drop_code_root(conn, args.project, root_s)
-        conn.commit()
         conn.close()
         print(f"code-reindex: dropped root {root_s} from the index of {args.project!r}")
         return 0
@@ -6967,6 +6983,21 @@ def cmd_code_reindex(args) -> int:
 
     # The model is loaded ABOVE: no write transaction (this UPSERT opens
     # one) is ever held across a model load.
+    if getattr(args, "require_recorded", False):
+        # INC-0129 (gate round 1, F2): the background worker captured its root
+        # list before loading the model; a Stop that dropped this root since
+        # must not have it re-created. The write lock is taken HERE and held
+        # to the pass's final commit, so check-then-write is atomic.
+        if conn.in_transaction:
+            conn.rollback()
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute(
+            "SELECT 1 FROM code_meta WHERE project=? AND code_root=?", (args.project, root_s)
+        ).fetchone() is None:
+            conn.rollback()
+            conn.close()
+            print(f"code-reindex: root {root_s} is no longer recorded; skipped (dropped by the wiring)")
+            return 0
     conn.execute(
         "INSERT INTO code_project (project, langs, embedding_mode) VALUES (?,?,'none') "
         "ON CONFLICT(project) DO UPDATE SET langs=excluded.langs",
@@ -8204,7 +8235,7 @@ def _heal_code_index_locked(conn, db_path, project, report, verify_content, call
         for r in report["roots"]:
             if not r["exists"]:
                 continue
-            if wired is not None and r["code_root"] not in wired:
+            if wired is not None and not (_resolved_root_set([r["code_root"]]) & wired):
                 continue  # INC-0129: recorded but no longer wired -- stale, never revived
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
@@ -8380,19 +8411,39 @@ def _sweep_code_stale_temps(marker: Path, min_age: float) -> None:
 def _resolved_root_set(roots) -> set:
     """`str(Path(x).resolve())` of every root -- the form code-reindex stores
     in code_meta, so a wired list and the recorded roots compare equal."""
-    out = set()
+    return _resolve_roots_checked(roots)[0]
+
+
+def _resolve_roots_checked(roots) -> tuple:
+    """(resolved set, unresolvable raw roots). `Path.resolve()` raises OSError
+    or, on a symlink loop, RuntimeError; such a root stays in the set in its
+    raw form and is reported, so a caller that would act destructively on the
+    set can refuse."""
+    out, bad = set(), []
     for r in roots:
         try:
             out.add(str(Path(r).resolve()))
-        except OSError:
+        except (OSError, RuntimeError):
             out.add(str(r))
-    return out
+            bad.append(str(r))
+    return out, bad
 
 
-def _env_code_roots() -> list:
+def _wired_roots_unsafe_for_drop(wired_list) -> str | None:
+    """Why the stale-root drop must not run for this wiring, else None: a
+    relative root resolves against the hook's cwd (not the repo), and an
+    unresolvable one has no trustworthy identity -- either could mark a real
+    root stale (INC-0129, gate round 1 F1/F6)."""
+    if any(not os.path.isabs(str(r)) for r in wired_list):
+        return "relative-wired-root"
+    if _resolve_roots_checked(wired_list)[1]:
+        return "unresolvable-wired-root"
+    return None
+
+
+def _env_code_roots_raw() -> list:
     """MEMCONTINUUM_CODE_ROOTS (JSON list), else the single legacy
-    MEMCONTINUUM_CODE_ROOT, resolved -- the same rule memlib.sh's
-    mc_code_roots applies."""
+    MEMCONTINUUM_CODE_ROOT, exactly as written (unresolved)."""
     roots = []
     raw = os.environ.get("MEMCONTINUUM_CODE_ROOTS", "")
     if raw:
@@ -8404,11 +8455,17 @@ def _env_code_roots() -> list:
             roots = [r for r in data if isinstance(r, str) and r]
     elif os.environ.get("MEMCONTINUUM_CODE_ROOT"):
         roots = [os.environ["MEMCONTINUUM_CODE_ROOT"]]
+    return roots
+
+
+def _env_code_roots() -> list:
+    """The wired roots, resolved -- the same rule memlib.sh's mc_code_roots
+    applies. List order and duplicates are kept (one entry per wired root)."""
     out = []
-    for r in roots:
+    for r in _env_code_roots_raw():
         try:
             out.append(str(Path(r).resolve()))
-        except OSError:
+        except (OSError, RuntimeError):
             out.append(r)
     return out
 
@@ -8505,7 +8562,7 @@ def _stale_code_roots(conn: sqlite3.Connection, project: str, wired: set | None)
         return []
     return sorted(
         r["code_root"] for r in conn.execute("SELECT code_root FROM code_meta WHERE project=?", (project,))
-        if r["code_root"] not in wired
+        if not (_resolved_root_set([r["code_root"]]) & wired)
     )
 
 
@@ -8559,13 +8616,18 @@ def _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, ext
         wired_list = _env_code_roots()
         wired = _resolved_root_set(wired_list) if wired_list else None
         stale = _stale_code_roots(conn, project, wired)
+        unsafe = _wired_roots_unsafe_for_drop(_env_code_roots_raw()) if wired_list else None
+        if stale and unsafe:
+            # The filters (heal, worker) still use the resolved set; only the
+            # destructive step is withheld, and the marker is not a lie.
+            extra.append(f"detail=stale-check-skipped:{unsafe}")
+            stale = []
         if stale and is_stop:
             # INC-0129: the wiring is the only consent for a root. Drop each
             # stale one (drop_code_root, one transaction per root), then make
             # the embedding mode truthful again.
             for root in stale:
-                with conn:
-                    drop_code_root(conn, project, root)
+                drop_code_root(conn, project, root)  # its own BEGIN IMMEDIATE .. COMMIT
             with conn:
                 _store_code_embedding_mode(conn, project, None)
             res["dropped"] = len(stale)
@@ -8765,13 +8827,13 @@ def cmd_code_embed_worker(args) -> int:
             if ro is not None:
                 ro.close()
         for root in roots:
-            if root not in wired or not Path(root).is_dir():
+            if not (_resolved_root_set([root]) & wired) or not Path(root).is_dir():
                 continue  # a recorded root the wiring does not name is stale (INC-0129)
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
                 rc = cmd_code_reindex(argparse.Namespace(
                     code_root=root, drop_root=None, db=str(db_path), project=project, lang=langs,
-                    no_embed=False, full=False, retry_not_indexed=False,
+                    no_embed=False, full=False, retry_not_indexed=False, require_recorded=True,
                 ))
             out = buf.getvalue().strip()
             _append_aux_log(

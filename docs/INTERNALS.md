@@ -2231,7 +2231,7 @@ lock/marker/loop skeleton, `_run_embed_worker_loop`.
   the caller did not name is stale and is skipped, and a `--root` that is not recorded is ignored (the
   refresh hook's `unrecorded=` covers it). Without any `--root`, in the worker form and in `--spawn`
   alike, the worker refuses with one stderr line naming the flag and exits 2; it never falls back to
-  "every recorded root" (INC-0129: a September root left in `code_meta` was reindexed and embedded
+  "every recorded root" (a retired root left in `code_meta` would be reindexed and embedded
   beside the new one, every symbol twice). That call's unchanged-file top-up already
   finds every chunk without a vector at the current fingerprint (a missing vector and a stale one
   look the same), so nothing else looks for stranded chunks. The marker is claimed FIRST, by
@@ -2348,14 +2348,14 @@ a file is not-indexed) keeps or writes `degraded missing-root=<n> not-indexed=<n
 (`outcome=skip reason=degraded`, or `failed reason=degraded` after a heal that left it so). If the
 `refreshing` marker cannot be written the heal does not start (`skip reason=marker-unwritable`).
 `SessionStart` writes `stale changed=<n>` and never reindexes.
-**Stale roots (INC-0129).** When the hook names roots (`MEMCONTINUUM_CODE_ROOTS`), a `code_meta` root
+**Stale roots.** When the hook names roots (`MEMCONTINUUM_CODE_ROOTS`), a `code_meta` root
 they do not name is stale. `Stop`, inside the refresh lock and before the report, drops each one with
-`drop_code_root` (the deletion `code-reindex --drop-root` uses; one transaction per root), then
+`drop_code_root` (the deletion `code-reindex --drop-root` uses; one `BEGIN IMMEDIATE` transaction per root, its snapshot read under the write lock), then
 recomputes `embedding_mode` from real coverage, and logs `dropped=<n>` plus
 `detail=dropped-roots:<path>;<path>`. `SessionStart` never deletes: it writes the marker
 `stale-root=<n>` (`skip reason=stale-marked`) and the next `Stop` clears it by dropping. The heal
 (`heal_code_index(wired_roots=...)`) and the embed worker skip such roots meanwhile. A hook that names
-no roots has no opinion: nothing is dropped or skipped. `code-search`, which has no wiring in hand,
+no roots has no opinion: nothing is dropped or skipped. A relative wired root (it would resolve against the hook's cwd) or one that cannot be resolved (a symlink loop) disables the drop for that run, with `detail=stale-check-skipped:relative-wired-root` or `:unresolvable-wired-root`; filtering by the resolved set still applies. Both sides are compared resolved, so a recorded alias of a wired root is never stale. The worker's text pass passes `require_recorded`: inside its write transaction it refuses a root whose `code_meta` row is gone (a Stop dropped it while the worker was loading the model) and writes nothing. `code-search`, which has no wiring in hand,
 still heals every recorded root. A code db older than the engine's
 schema (an unversioned one included) is never opened for rebuild by either event: the marker
 is `stale schema-older-than-engine` (`skip reason=stale-marked`) and the rebuild stays with
@@ -2490,7 +2490,7 @@ amends Anatomy M2a binding point 2, which had the heal follow the project's own
 leave a `full` project's new chunks unembedded. Now `embedding_mode` is
 recomputed from real coverage after every pass, so such a project is simply
 reported `partial` and the background `code-embed-worker` restores `full`
-minutes later (and, INC-0129, the heal reindexes only recorded roots the hook's wiring still names when
+minutes later (and the heal reindexes only recorded roots the hook's wiring still names when
 it is given one, `wired_roots`, so a retired root is never revived); an inline embed of a 300-chunk drift (about 13 s on the
 quantised model) would be watchdog-killed on every `Stop` with no way out.
 `code-search` prints `index healed` only when EVERY in-process

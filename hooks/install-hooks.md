@@ -444,8 +444,8 @@ Rendered from `templates/code-refresh-hook.json.tmpl` for a project that has at 
 - **Silent.** The script prints nothing on any path (a `Stop` hook's output is fed back to the
   model) and always exits 0. The one place its result goes is `hook.log`:
   `<ts> code-refresh outcome=<refreshed|skip|failed> reason=… project=P roots=N unrecorded=N
-  changed=N removed=N healed=N elapsed=Xs event=<Stop|SessionStart> session=S
-  embed=<spawned|pending|clean|off|failed|unknown> [detail=…]`.
+  changed=N removed=N healed=N dropped=N elapsed=Xs event=<Stop|SessionStart> session=S
+  embed=<spawned|clean|off|failed|unknown> [marker=write-failed] [detail=…]`.
   Skip reasons: `uninitialized` (no code db yet, or no recorded root), `current`, `degraded`
   (nothing left to repair), `locked`, `stale-marked` (SessionStart found the index behind).
 - **Embeddings are a background job (`embed=`).** On BOTH events, once the preflight has found an

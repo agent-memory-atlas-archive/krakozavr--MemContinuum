@@ -6639,12 +6639,23 @@ class TestCodeRefreshHook(HookTestBase):
             conn.close()
         return old_s
 
-    def rows_of(self, root_s):
+    def chunk_ids(self, root_s):
         conn = memidx.open_code_db(self.db)
         try:
-            ids = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE code_root=?", (root_s,))]
+            return [r[0] for r in conn.execute("SELECT id FROM chunks WHERE code_root=?", (root_s,))]
+        finally:
+            conn.close()
+
+    def rows_of(self, root_s, ids=None):
+        """Row counts for one root. `ids` are chunk ids captured BEFORE a
+        deletion: fts/embeddings are counted by those ids, so an orphan left
+        behind by a deletion that missed its shadows is still seen."""
+        conn = memidx.open_code_db(self.db)
+        try:
+            if ids is None:
+                ids = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE code_root=?", (root_s,))]
             return {
-                "chunks": len(ids),
+                "chunks": conn.execute("SELECT COUNT(*) FROM chunks WHERE code_root=?", (root_s,)).fetchone()[0],
                 "fts": sum(conn.execute("SELECT COUNT(*) FROM fts WHERE rowid=?", (i,)).fetchone()[0] for i in ids),
                 "emb": sum(conn.execute("SELECT COUNT(*) FROM embeddings WHERE chunk_id=?", (i,)).fetchone()[0] for i in ids),
                 "file_sha": conn.execute("SELECT COUNT(*) FROM file_sha WHERE code_root=?", (root_s,)).fetchone()[0],
@@ -6658,13 +6669,15 @@ class TestCodeRefreshHook(HookTestBase):
         old_s = self.stale_state()
         a_s = str(self.code_root.resolve())
         a_before = self.rows_of(a_s)
+        old_ids = self.chunk_ids(old_s)
+        self.assertTrue(old_ids)
         self.assertEqual({k: v > 0 for k, v in self.rows_of(old_s).items() if k != "mode"},
                          {"chunks": True, "fts": True, "emb": True, "file_sha": True, "meta": True})
         line, _ = self.run_hook("Stop")
         self.assertIn("dropped=1", line)
         self.assertIn(f"detail=dropped-roots:{old_s}", line)
         self.assertIn("roots=1", line)
-        gone = self.rows_of(old_s)
+        gone = self.rows_of(old_s, ids=old_ids)
         self.assertEqual({k: v for k, v in gone.items() if k != "mode"},
                          {"chunks": 0, "fts": 0, "emb": 0, "file_sha": 0, "meta": 0})
         a_after = self.rows_of(a_s)
@@ -6693,6 +6706,31 @@ class TestCodeRefreshHook(HookTestBase):
         line, _ = self.run_hook("Stop", env=env)
         self.assertIn("dropped=0", line)
         self.assertEqual(self.rows_of(old_s), before)
+
+    def test_a_relative_wired_root_disables_the_drop(self):
+        old_s = self.stale_state()
+        ids = self.chunk_ids(old_s)
+        before = self.rows_of(old_s, ids=ids)
+        a_before = self.rows_of(str(self.code_root.resolve()))
+        env = self.refresh_env(MEMCONTINUUM_CODE_ROOTS=json.dumps(["Sources"]))
+        line, _ = self.run_hook("Stop", env=env)
+        self.assertIn("dropped=0", line)
+        self.assertIn("detail=stale-check-skipped:relative-wired-root", line)
+        self.assertEqual(self.rows_of(old_s, ids=ids), before)
+        self.assertEqual(self.rows_of(str(self.code_root.resolve())), a_before)
+
+    def test_an_unresolvable_wired_root_disables_the_drop_without_crashing(self):
+        old_s = self.stale_state()
+        ids = self.chunk_ids(old_s)
+        before = self.rows_of(old_s, ids=ids)
+        loop = Path(self.td) / "loop"
+        os.symlink(loop, loop)  # a symlink loop: Path.resolve() raises
+        env = self.refresh_env(MEMCONTINUUM_CODE_ROOTS=json.dumps([str(loop)]))
+        line, _ = self.run_hook("Stop", env=env)
+        self.assertNotIn("crash", line)
+        self.assertIn("dropped=0", line)
+        self.assertIn("detail=stale-check-skipped:unresolvable-wired-root", line)
+        self.assertEqual(self.rows_of(old_s, ids=ids), before)
 
     def test_lock_held_skips_and_leaves_the_marker_untouched(self):
         self.build_code_index()

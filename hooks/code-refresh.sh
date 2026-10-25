@@ -49,7 +49,9 @@
 # dropped=N (INC-0129): recorded roots the wiring no longer names, removed on
 # Stop (the code-reindex --drop-root deletion) with a
 # `detail=dropped-roots:<path>;<path>` tail; SessionStart never drops, it
-# writes the marker `stale-root=<n>` and the first Stop clears it.
+# writes the marker `stale-root=<n>` and the first Stop clears it. A relative
+# or unresolvable wired root disables the drop for that run:
+# `detail=stale-check-skipped:relative-wired-root|unresolvable-wired-root`.
 #
 # bash 3.2 discipline: no arrays, no [[ ]], no process substitution, no
 # mapfile, no namerefs; no $(( )) on any env value (the budget is checked with

@@ -5920,6 +5920,113 @@ class TestStaleRootsNeverRevived(unittest.TestCase):
                                  "off reason=no-wired-roots")
             popen.assert_not_called()
 
+    def test_worker_pass_does_not_recreate_a_root_dropped_after_it_captured_its_roots(self):
+        # INC-0129 gate round 1 (F2): the Stop drops B while the worker is
+        # still loading the model for A; B's text pass must write nothing.
+        with tempfile.TemporaryDirectory() as td:
+            root_a, root_b, db = self._two_roots(td)
+            b_s = str(root_b.resolve())
+            real_model = _FakeEmbedModel("r1")
+            fired = []
+
+            def load():
+                if not fired:
+                    fired.append(1)  # first load = A's pass: roots are already captured
+                    c = memidx.open_code_db(db)
+                    try:
+                        memidx.drop_code_root(c, self.PROJECT, b_s)
+                    finally:
+                        c.close()
+                return real_model, memidx.embedding_fingerprint(real_model)
+
+            memidx._code_embed_marker_path(db, self.PROJECT).touch()
+            args = SimpleNamespace(project=self.PROJECT, db=str(db), spawn=False,
+                                   root=[str(root_a), str(root_b)])
+            with mock.patch.object(memidx, "load_embedding_model", side_effect=load), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(memidx.cmd_code_embed_worker(args), 0)
+            conn = memidx.open_code_db(db)
+            try:
+                for table in ("code_meta", "chunks", "file_sha"):
+                    self.assertEqual(conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE code_root=?", (b_s,)).fetchone()[0], 0, table)
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM embeddings e LEFT JOIN chunks c ON c.id=e.chunk_id "
+                    "WHERE c.id IS NULL").fetchone()[0], 0, "no orphan vector")
+            finally:
+                conn.close()
+            self.assertEqual(self._by_root(db), {str(root_a.resolve()): (2, 2)})
+            log = memidx._code_embed_log_path(db, self.PROJECT).read_text()
+            self.assertIn("is no longer recorded; skipped (dropped by the wiring)", log)
+
+    def test_require_recorded_reindex_of_an_unrecorded_root_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root_a, root_b, db = self._two_roots(td)
+            c = memidx.open_code_db(db)
+            try:
+                memidx.drop_code_root(c, self.PROJECT, str(root_b.resolve()))
+            finally:
+                c.close()
+            out = io.StringIO()
+            with _fake_model_patch(), contextlib.redirect_stdout(out):
+                rc = memidx.cmd_code_reindex(SimpleNamespace(
+                    code_root=str(root_b), drop_root=None, db=str(db), project=self.PROJECT, lang=None,
+                    no_embed=False, full=False, retry_not_indexed=False, require_recorded=True))
+            self.assertEqual(rc, 0)
+            self.assertIn("no longer recorded", out.getvalue())
+            self.assertNotIn(str(root_b.resolve()), self._by_root(db))
+
+    def test_drop_code_root_reads_its_snapshot_under_the_write_lock(self):
+        # INC-0129 gate round 1 (F3): BEGIN IMMEDIATE precedes the file_sha read,
+        # so a concurrent writer cannot slip a path in between.
+        with tempfile.TemporaryDirectory() as td:
+            root_a, root_b, db = self._two_roots(td)
+            b_s = str(root_b.resolve())
+            conn = memidx.open_code_db(db)
+            seen, blocked = [], []
+
+            def trace(stmt):
+                seen.append(stmt)
+                if stmt.startswith("SELECT path FROM file_sha") and not blocked:
+                    other = sqlite3.connect(str(db), timeout=0.05)
+                    try:
+                        other.execute("BEGIN IMMEDIATE")
+                        blocked.append(False)
+                    except sqlite3.OperationalError:
+                        blocked.append(True)
+                    finally:
+                        other.close()
+
+            conn.set_trace_callback(trace)
+            try:
+                memidx.drop_code_root(conn, self.PROJECT, b_s)
+            finally:
+                conn.set_trace_callback(None)
+            self.assertEqual(blocked, [True], "another writer must be locked out during the snapshot read")
+            first_read = next(i for i, s in enumerate(seen) if s.startswith("SELECT path FROM file_sha"))
+            self.assertTrue(any(s.startswith("BEGIN IMMEDIATE") for s in seen[:first_read]), seen[:first_read])
+            self.assertFalse(conn.in_transaction, "drop_code_root commits")
+            for table in ("chunks", "file_sha", "code_meta"):
+                self.assertEqual(conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE code_root=?", (b_s,)).fetchone()[0], 0, table)
+            conn.close()
+
+    def test_a_recorded_root_stored_through_a_symlink_alias_is_not_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            root_a, root_b, db = self._two_roots(td)
+            alias = Path(td) / "alias-of-a"
+            os.symlink(root_a, alias)
+            conn = memidx.open_code_db(db)
+            try:
+                conn.execute("INSERT INTO code_meta (project, code_root, last_indexed_at, head_sha) "
+                             "VALUES (?,?,?,?)", (self.PROJECT, str(alias), 0, None))
+                conn.commit()
+                wired = memidx._resolved_root_set([str(root_a)])
+                stale = memidx._stale_code_roots(conn, self.PROJECT, wired)
+            finally:
+                conn.close()
+            self.assertEqual(stale, [str(root_b.resolve())], "the alias of a wired root and the wired root are not stale")
+
     def test_heal_with_wired_roots_never_touches_a_drifted_unwired_root(self):
         with tempfile.TemporaryDirectory() as td:
             root_a, root_b, db = self._two_roots(td)
