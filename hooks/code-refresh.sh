@@ -52,7 +52,7 @@
 # writes the marker `stale-root=<n>` and the first Stop clears it. Two guards
 # disable the drop for that run: every wired root must be absolute and strictly
 # resolve to a directory, and at least one must be a recorded root:
-# `detail=stale-check-skipped:relative-wired-root|unresolvable-wired-root|no-wired-root-recorded`.
+# `detail=stale-check-skipped:relative-wired-root|unresolvable-wired-root|wired-root-not-a-directory|no-wired-root-recorded`.
 #
 # bash 3.2 discipline: no arrays, no [[ ]], no process substitution, no
 # mapfile, no namerefs; no $(( )) on any env value (the budget is checked with

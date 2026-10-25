@@ -8443,15 +8443,18 @@ def _resolved_root_set(roots) -> set:
 
 
 def _resolve_roots_checked(roots) -> tuple:
-    """(resolved set, unresolvable raw roots). Resolution is strict first, so a
+    """(resolved set, unresolvable raw roots, strictly resolved Paths of the
+    rest). Resolution is strict first, so a
     symlink loop or a missing path is reported on every Python: 3.12's lax
     `resolve()` raises RuntimeError on a loop, 3.13's returns it unresolved. An
     unresolvable root stays in the set in its lax-resolved form (filters use
     it) and is listed, so a caller that would act destructively can refuse."""
-    out, bad = set(), []
+    out, bad, strict = set(), [], []
     for r in roots:
         try:
-            out.add(str(Path(r).resolve(strict=True)))
+            p = Path(r).resolve(strict=True)
+            out.add(str(p))
+            strict.append(p)
             continue
         except (OSError, RuntimeError):
             pass
@@ -8460,7 +8463,7 @@ def _resolve_roots_checked(roots) -> tuple:
             out.add(str(Path(r).resolve()))
         except (OSError, RuntimeError):
             out.add(str(r))
-    return out, bad
+    return out, bad, strict
 
 
 def _wired_roots_unsafe_for_drop(wired_list) -> str | None:
@@ -8471,11 +8474,11 @@ def _wired_roots_unsafe_for_drop(wired_list) -> str | None:
     round 4)."""
     if any(not os.path.isabs(str(r)) for r in wired_list):
         return "relative-wired-root"
-    if _resolve_roots_checked(wired_list)[1]:
+    _, bad, strict = _resolve_roots_checked(wired_list)
+    if bad:
         return "unresolvable-wired-root"
-    for r in wired_list:
-        if not Path(r).resolve(strict=True).is_dir():
-            return "unresolvable-wired-root"
+    if not all(p.is_dir() for p in strict):
+        return "wired-root-not-a-directory"
     return None
 
 
@@ -8593,15 +8596,14 @@ def _refresh_code_index(args, project, db_path, marker, is_stop, res, extra) -> 
 _CODE_STATES_CURRENT = ("current", "metadata-current")
 
 
-def _stale_code_roots(conn: sqlite3.Connection, project: str, wired: set | None) -> list:
-    """Recorded `code_meta` roots the wiring does not name (sorted); none when
-    the hook names no roots at all (it has no opinion then)."""
+def _stale_code_roots(conn: sqlite3.Connection, project: str, wired: set | None) -> tuple:
+    """(recorded `code_meta` roots the wiring does not name, sorted; number of
+    recorded roots). No stale roots when the hook names no roots at all (it has
+    no opinion then)."""
+    recorded = [r["code_root"] for r in conn.execute("SELECT code_root FROM code_meta WHERE project=?", (project,))]
     if not wired:
-        return []
-    return sorted(
-        r["code_root"] for r in conn.execute("SELECT code_root FROM code_meta WHERE project=?", (project,))
-        if not (_resolved_root_set([r["code_root"]]) & wired)
-    )
+        return [], len(recorded)
+    return sorted(r for r in recorded if not (_resolved_root_set([r]) & wired)), len(recorded)
 
 
 def _kick_code_embed(db_path: Path, project: str, report: dict) -> str:
@@ -8653,12 +8655,11 @@ def _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, ext
     try:
         wired_list = _env_code_roots()
         wired = _resolved_root_set(wired_list) if wired_list else None
-        stale = _stale_code_roots(conn, project, wired)
+        stale, n_recorded = _stale_code_roots(conn, project, wired)
         unsafe = _wired_roots_unsafe_for_drop(_env_code_roots_raw()) if wired_list else None
         if stale and not unsafe:
             # Second guard: wiring and index must agree on at least one root.
-            n_recorded = conn.execute("SELECT COUNT(*) FROM code_meta WHERE project=?", (project,)).fetchone()[0]
-            if len(stale) >= n_recorded:
+            if len(stale) == n_recorded:
                 unsafe = "no-wired-root-recorded"
         if stale and unsafe:
             # The filters (heal, worker) still use the resolved set; only the

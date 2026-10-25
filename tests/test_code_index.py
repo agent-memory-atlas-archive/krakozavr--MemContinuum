@@ -6022,7 +6022,7 @@ class TestStaleRootsNeverRevived(unittest.TestCase):
                              "VALUES (?,?,?,?)", (self.PROJECT, str(alias), 0, None))
                 conn.commit()
                 wired = memidx._resolved_root_set([str(root_a)])
-                stale = memidx._stale_code_roots(conn, self.PROJECT, wired)
+                stale, _n = memidx._stale_code_roots(conn, self.PROJECT, wired)
             finally:
                 conn.close()
             self.assertEqual(stale, [str(root_b.resolve())], "the alias of a wired root and the wired root are not stale")

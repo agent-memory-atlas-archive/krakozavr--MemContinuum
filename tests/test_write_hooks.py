@@ -6727,7 +6727,8 @@ class TestCodeRefreshHook(HookTestBase):
         a_ids = self.chunk_ids(a_s)
         a_before = self.rows_of(a_s, ids=a_ids)
         self.assertTrue(a_ids)
-        env = self.refresh_env(MEMCONTINUUM_CODE_ROOTS=json.dumps([str(wired_root)]))
+        wired = wired_root if isinstance(wired_root, list) else [wired_root]
+        env = self.refresh_env(MEMCONTINUUM_CODE_ROOTS=json.dumps([str(w) for w in wired]))
         line, _ = self.run_hook("Stop", env=env)
         self.assertNotIn("crash", line)
         self.assertIn("dropped=0", line)
@@ -6747,7 +6748,19 @@ class TestCodeRefreshHook(HookTestBase):
     def test_a_wired_root_that_is_a_file_disables_the_drop(self):
         f = Path(self.td) / "plain-file"
         f.write_text("x")
-        self.assert_drop_withheld(f, "unresolvable-wired-root")
+        self.assert_drop_withheld(f, "wired-root-not-a-directory")
+
+    def test_a_missing_wired_root_beside_a_good_one_withholds_the_drop(self):
+        # wired {A, B}, B's directory gone, recorded {A, B, C}: C is stale but
+        # the wiring is untrustworthy, so nothing is dropped.
+        b = Path(self.td) / "wired-b"
+        (b / "src").mkdir(parents=True)
+        (b / "src" / "b.py").write_text("def b_fn():\n    return 0\n")
+        git_init(b)
+        self.build_code_index(root=b)
+        b.rename(Path(self.td) / "wired-b-gone")
+        line = self.assert_drop_withheld([self.code_root.resolve(), b], "unresolvable-wired-root")
+        self.assertRegex(self.marker.read_text(), r"^reason=degraded missing-root=1 not-indexed=\d+ since=\S+ roots=3\n$")
 
     def test_a_wired_root_recorded_nowhere_disables_the_drop(self):
         other = Path(self.td) / "unrecorded-root"
