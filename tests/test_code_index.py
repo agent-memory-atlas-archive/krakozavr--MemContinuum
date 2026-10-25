@@ -6048,6 +6048,114 @@ class TestStaleRootsNeverRevived(unittest.TestCase):
             self.assertEqual(hres["outcome"], "healed")
             self.assertEqual(after["changed"], 1, "only the unwired root's drift is left")
 
+    def test_heal_with_a_stale_report_never_recreates_a_root_dropped_since(self):
+        # INC-0129 re-gate round 2 (G1): code-search captures its report before
+        # the refresh lock; a Stop drop of B in between must not be undone.
+        with tempfile.TemporaryDirectory() as td:
+            root_a, root_b, db = self._two_roots(td)
+            b_s = str(root_b.resolve())
+            (root_a / "m0.py").write_text("def func_0():\n    return 'a-edit'\n")
+            (root_b / "b0.py").write_text("def old_0_renamed():\n    return 0\n")
+            conn = memidx.open_code_db(db)
+            report = memidx.code_index_report(conn, self.PROJECT)
+            self.assertEqual(report["changed"], 2)
+            memidx.drop_code_root(conn, self.PROJECT, b_s)
+            hres = {}
+            after, conn = memidx.heal_code_index(
+                conn, db, self.PROJECT, report, limit=500, caller="t", result=hres, wired_roots=None)
+            try:
+                for table in ("code_meta", "chunks", "file_sha"):
+                    self.assertEqual(conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE code_root=?", (b_s,)).fetchone()[0], 0, table)
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM embeddings e LEFT JOIN chunks c ON c.id=e.chunk_id "
+                    "WHERE c.id IS NULL").fetchone()[0], 0)
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE symbol='old_0_renamed'").fetchone()[0], 0)
+                self.assertEqual(after["changed"], 0, "A is healed")
+            finally:
+                conn.close()
+            self.assertEqual(hres["outcome"], "healed")
+
+    def _alias_key(self, root):
+        return str(root) + "/../" + root.name
+
+    def _rekey(self, db, old, new):
+        conn = memidx.open_code_db(db)
+        try:
+            for table in ("code_meta", "file_sha", "chunks"):
+                conn.execute(f"UPDATE {table} SET code_root=? WHERE project=? AND code_root=?",
+                             (new, self.PROJECT, old))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_worker_canonicalizes_a_recorded_alias_key_and_fills_its_vectors(self):
+        # INC-0129 re-gate round 2 (G2).
+        with tempfile.TemporaryDirectory() as td:
+            root_a, root_b, db = self._two_roots(td)
+            a_s = str(root_a.resolve())
+            alias = self._alias_key(root_a)
+            self._rekey(db, a_s, alias)
+            memidx._code_embed_marker_path(db, self.PROJECT).touch()
+            args = SimpleNamespace(project=self.PROJECT, db=str(db), spawn=False, root=[str(root_a)])
+            with _fake_model_patch(), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(memidx.cmd_code_embed_worker(args), 0)
+            self.assertEqual(self._by_root(db)[a_s], (2, 2))
+            conn = memidx.open_code_db(db)
+            try:
+                for table in ("code_meta", "file_sha", "chunks"):
+                    keys = {r[0] for r in conn.execute(f"SELECT DISTINCT code_root FROM {table}")}
+                    self.assertIn(a_s, keys, table)
+                    self.assertNotIn(alias, keys, table)
+            finally:
+                conn.close()
+
+    def test_guard_drops_the_alias_rows_when_the_canonical_root_is_also_recorded(self):
+        with tempfile.TemporaryDirectory() as td:
+            root_a, root_b, db = self._two_roots(td)
+            b_s = str(root_b.resolve())
+            alias = self._alias_key(root_b)
+            conn = memidx.open_code_db(db)
+            try:
+                # a second, alias-keyed copy of B's rows
+                conn.execute("INSERT INTO code_meta (project, code_root, last_indexed_at, head_sha) "
+                             "VALUES (?,?,?,?)", (self.PROJECT, alias, 0, None))
+                conn.execute("INSERT INTO file_sha (project, code_root, path, sha256, chunker_version, status) "
+                             "VALUES (?,?,?,?,?,?)", (self.PROJECT, alias, "zz.py", "x", "v", "indexed"))
+                cols = [r[1] for r in conn.execute("PRAGMA table_info(chunks)")]
+                row = conn.execute("SELECT * FROM chunks WHERE code_root=? LIMIT 1", (b_s,)).fetchone()
+                vals = {c: row[c] for c in cols if c != "id"}
+                vals["code_root"] = alias
+                vals["path"] = "zz.py"
+                conn.execute(
+                    f"INSERT INTO chunks ({','.join(vals)}) VALUES ({','.join('?' * len(vals))})",
+                    list(vals.values()))
+                alias_ids = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE code_root=?", (alias,))]
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertTrue(alias_ids)
+            out = io.StringIO()
+            with _fake_model_patch(), contextlib.redirect_stdout(out):
+                rc = memidx.cmd_code_reindex(SimpleNamespace(
+                    code_root=str(root_b), drop_root=None, db=str(db), project=self.PROJECT, lang=None,
+                    no_embed=True, full=False, retry_not_indexed=False, require_recorded=True))
+            self.assertEqual(rc, 0)
+            self.assertIn("dropped duplicate alias key", out.getvalue())
+            conn = memidx.open_code_db(db)
+            try:
+                for table in ("code_meta", "file_sha", "chunks"):
+                    keys = {r[0] for r in conn.execute(f"SELECT DISTINCT code_root FROM {table}")}
+                    self.assertNotIn(alias, keys, table)
+                    self.assertIn(b_s, keys, table)
+                for cid in alias_ids:
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM chunks WHERE id=?", (cid,)).fetchone()[0], 0)
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM embeddings WHERE chunk_id=?", (cid,)).fetchone()[0], 0)
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM fts WHERE rowid=?", (cid,)).fetchone()[0], 0)
+            finally:
+                conn.close()
+
 
 class TestEmbedWorkerFixRound1(unittest.TestCase):
     """Embeddings-on fix round 1 (TOP-0137 L2 step 5): shutdown race in the

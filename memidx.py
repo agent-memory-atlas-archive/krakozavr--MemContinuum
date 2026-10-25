@@ -6991,13 +6991,36 @@ def cmd_code_reindex(args) -> int:
         if conn.in_transaction:
             conn.rollback()
         conn.execute("BEGIN IMMEDIATE")
-        if conn.execute(
-            "SELECT 1 FROM code_meta WHERE project=? AND code_root=?", (args.project, root_s)
-        ).fetchone() is None:
+        # G2: the recorded key may be an alias of root_s (symlink, `x/../x`,
+        # an unresolved path an older run stored). The guard passes if ANY
+        # recorded key resolves to root_s, and the key is canonicalized here,
+        # before any write, so every later query by root_s finds its rows.
+        recorded = [
+            row["code_root"] for row in conn.execute(
+                "SELECT code_root FROM code_meta WHERE project=?", (args.project,)
+            ).fetchall()
+        ]
+        aliases = [k for k in recorded if k != root_s and root_s in _resolve_roots_checked([k])[0]]
+        if root_s not in recorded and not aliases:
             conn.rollback()
             conn.close()
             print(f"code-reindex: root {root_s} is no longer recorded; skipped (dropped by the wiring)")
             return 0
+        if root_s in recorded:
+            for alias in aliases:  # the canonical row wins
+                _drop_code_root_rows(conn, args.project, alias)
+                print(f"code-reindex: dropped duplicate alias key {alias} (canonical {root_s} is recorded)")
+        else:
+            alias = aliases[0]
+            for extra in aliases[1:]:
+                _drop_code_root_rows(conn, args.project, extra)
+                print(f"code-reindex: dropped duplicate alias key {extra} (canonical {root_s} kept)")
+            for table in ("code_meta", "file_sha", "chunks"):
+                conn.execute(
+                    f"UPDATE {table} SET code_root=? WHERE project=? AND code_root=?",
+                    (root_s, args.project, alias),
+                )
+            print(f"code-reindex: canonicalized recorded root key {alias} -> {root_s}")
     conn.execute(
         "INSERT INTO code_project (project, langs, embedding_mode) VALUES (?,?,'none') "
         "ON CONFLICT(project) DO UPDATE SET langs=excluded.langs",
@@ -8242,6 +8265,7 @@ def _heal_code_index_locked(conn, db_path, project, report, verify_content, call
                 rc = cmd_code_reindex(argparse.Namespace(
                     code_root=r["code_root"], drop_root=None, db=str(db_path), project=project,
                     lang=langs or None, no_embed=no_embed, full=False, retry_not_indexed=False,
+                    require_recorded=True,  # G1: a heal repairs recorded roots, never re-creates a dropped one
                 ))
             reindex_rc = max(reindex_rc, rc)  # the worst rc across every root, not just the last
             m = summary_re.search(buf.getvalue())
