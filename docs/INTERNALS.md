@@ -3091,9 +3091,12 @@ on success delete the claim -- a commit landing mid-pass raises a NEW marker
 file unnoticed) and the loop runs again rather than declaring victory over
 content it never saw. On any exception from the backfill (a locked db,
 a genuine bug), the claim is renamed back to the marker, the traceback is appended to
-`<project>.embed.log`, and the process exits 3 -- a crash is therefore
-always retriable: the next commit, or a manual `embed-worker` run, picks the
-marker back up. `check --json` and `stats --json` both report
+`<project>.embed.log`, and the process exits 3 -- a caught exception
+therefore always puts the request back. A hard kill leaves
+`<project>.embed-pending.claim.<pid>` (swept after an hour); the request is
+re-raised by the next store commit's awaiting count
+(`hooks/post-commit-reindex.sh`) or, for code, by the next `code-refresh`
+preflight. A manual `embed-worker` run with no marker does nothing. `check --json` and `stats --json` both report
 `embedding_backlog: {pending_marker, worker_lock_held,
 rows_without_fresh_vector}` (fail-open; the row count uses the same
 static-fingerprint SQL comparison `vector_index_state` does, never loading

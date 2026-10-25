@@ -2454,7 +2454,7 @@ def _sweep_aged_files(marker: Path, infix: str, min_age: float) -> int:
     look-alike), older than `min_age` (a fresh file of an overlapping run is
     never a candidate). Returns how many were removed. The one sweeper behind
     both `.new.` temps (code-refresh) and `.claim.` files (embed workers)."""
-    pat = re.compile(re.escape(marker.name) + r"\." + re.escape(infix) + r"\.[0-9]+$")
+    pat = re.compile(re.escape(marker.name) + r"\." + re.escape(infix) + r"\.[0-9]+")
     try:
         names = os.listdir(marker.parent)
     except OSError:
@@ -2462,7 +2462,7 @@ def _sweep_aged_files(marker: Path, infix: str, min_age: float) -> int:
     now = time.time()
     n = 0
     for name in names:
-        if not pat.match(name):
+        if not pat.fullmatch(name):
             continue
         path = marker.parent / name
         try:
@@ -2543,6 +2543,17 @@ def _run_embed_worker_loop(lock_path: Path, marker_path: Path, log_path: Path, l
             except OSError as exc:
                 log(f"claim-failed:{exc.errno}")
                 return 3  # marker stays; never spin
+            # Re-validate the inode we actually moved: an object swapped in at
+            # the marker path between the lstat and the rename (a directory, a
+            # symlink) now sits at the claim path. It is not ours: never run the
+            # pass, follow or remove it (the age sweep refuses non-regular files).
+            try:
+                claimed_regular = S_ISREG(os.lstat(claim_path).st_mode)
+            except OSError:
+                claimed_regular = False
+            if not claimed_regular:
+                log("claimed-not-regular: leaving the claimed object untouched")
+                return 3
             try:
                 failure = run_pass()
                 exc_text = None
@@ -2608,8 +2619,8 @@ def cmd_embed_worker(args) -> int:
     `--no-embed`/`--auto` builds). On success the claim is deleted; a commit
     that lands mid-pass creates a NEW marker, which the next round picks up
     (no sleep needed). On ANY exception from the backfill, or a failed-open
-    embedding backend: the claim is renamed back to the marker (so a later
-    commit or a manual worker run retries it), the traceback is logged to
+    embedding backend: the claim is renamed back to the marker (so the next
+    commit's awaiting count retries it; a manual worker run with no marker does nothing), the traceback is logged to
     `<project>.embed.log` (never stdout -- this process has no terminal, its
     whole point is running off the clock), and the exit is 3.
     """

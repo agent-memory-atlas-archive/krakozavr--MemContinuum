@@ -6214,8 +6214,14 @@ class TestEmbedWorkerFixRound2(unittest.TestCase):
             stale = Path(f"{marker}.claim.99999999")
             young = Path(f"{marker}.claim.12345")
             lookalikes = [Path(f"{marker}.claim.abc"), Path(f"{marker}.claimx.77"), Path(f"{marker}.claim.5.bak")]
+            nl = Path(f"{marker}.claim.123\n")  # `$` would match before a trailing newline
+            try:
+                nl.write_text("x")
+                lookalikes.append(nl)
+            except OSError:
+                pass  # the filesystem refuses a newline in a name
             stale_dir = Path(f"{marker}.claim.777")
-            for f in [stale, young, *lookalikes]:
+            for f in [stale, young, *[x for x in lookalikes if not x.exists()]]:
                 f.write_text("x")
             stale_dir.mkdir()
             for f in [stale, *lookalikes, stale_dir]:
@@ -6226,6 +6232,28 @@ class TestEmbedWorkerFixRound2(unittest.TestCase):
             self.assertTrue(all(f.exists() for f in lookalikes))
             self.assertTrue(stale_dir.is_dir(), "a directory is never swept")
             self.assertIn("swept 1 stale claim", log.read_text())
+
+    def test_an_object_swapped_in_at_the_marker_after_the_lstat_is_not_run_or_removed(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock, marker, log = self._paths(td)
+            marker.touch()
+            real_rename = os.rename
+
+            def swapping_rename(src, dst):
+                if Path(src) == marker:  # between the loop's lstat and its rename
+                    marker.unlink()
+                    marker.mkdir()
+                    (marker / "inner").write_text("x")
+                return real_rename(src, dst)
+
+            calls = []
+            with mock.patch.object(memidx.os, "rename", swapping_rename):
+                rc = memidx._run_embed_worker_loop(lock, marker, log, "t", lambda: calls.append(1))
+            self.assertEqual(rc, 3)
+            self.assertEqual(calls, [])
+            self.assertTrue(self._claim(marker).is_dir())
+            self.assertEqual((self._claim(marker) / "inner").read_text(), "x")
+            self.assertIn("claimed-not-regular", log.read_text())
 
     def test_a_symlinked_marker_is_refused_and_never_followed(self):
         with tempfile.TemporaryDirectory() as td:
