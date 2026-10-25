@@ -8080,7 +8080,7 @@ def _acquire_code_refresh_lock(db_path: Path, project: str):
 def heal_code_index(
     conn: sqlite3.Connection, db_path: Path, project: str, report: dict, *, limit: int,
     verify_content: bool = False, caller: str = "code-search", result: dict | None = None,
-    lock_held: bool = False,
+    lock_held: bool = False, wired_roots: list | None = None,
 ):
     """Anatomy M2a Task 5: `code-search`'s one-attempt preflighted heal --
     consulted right after code_index_report, before a search ever answers.
@@ -8133,7 +8133,14 @@ def heal_code_index(
     availability change. The heal takes the non-blocking refresh lock
     itself (`_acquire_code_refresh_lock`) unless `lock_held` says the caller
     already owns it; a held lock skips the heal with a one-line notice
-    (outcome `locked`) instead of racing the other writer."""
+    (outcome `locked`) instead of racing the other writer.
+
+    INC-0129 (TOP-0137 L4): `wired_roots`, when given (code-refresh passes
+    the hook's MEMCONTINUUM_CODE_ROOTS), limits the heal to recorded roots
+    that are ALSO in that set -- the wiring is the only consent for a root,
+    `code_meta` is derived, so a recorded root the wiring no longer names
+    is never revived here. None (code-search, which has no wiring in hand)
+    keeps every recorded root."""
     out = result if result is not None else {}
     out.update({"outcome": "ineligible", "rc": 0, "exc": None, "reindexed": 0, "messages": []})
 
@@ -8164,13 +8171,13 @@ def heal_code_index(
             say(f"{caller}: a code-index refresh is already running (lock held); not healing now")
             return report, conn
     try:
-        return _heal_code_index_locked(conn, db_path, project, report, verify_content, caller, out, say)
+        return _heal_code_index_locked(conn, db_path, project, report, verify_content, caller, out, say, wired_roots)
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
 
 
-def _heal_code_index_locked(conn, db_path, project, report, verify_content, caller, out, say):
+def _heal_code_index_locked(conn, db_path, project, report, verify_content, caller, out, say, wired_roots=None):
     """The body of heal_code_index once eligibility, the limit and the
     refresh lock are settled -- split out only so the lock's try/finally
     stays one visible block; see heal_code_index for the contract."""
@@ -8193,9 +8200,12 @@ def _heal_code_index_locked(conn, db_path, project, report, verify_content, call
         # trusted), and this heal must never claim "index healed" over
         # that, whatever the after-report's own state happens to say.
         reindex_rc = 0
+        wired = None if wired_roots is None else _resolved_root_set(wired_roots)
         for r in report["roots"]:
             if not r["exists"]:
                 continue
+            if wired is not None and r["code_root"] not in wired:
+                continue  # INC-0129: recorded but no longer wired -- stale, never revived
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
                 rc = cmd_code_reindex(argparse.Namespace(
@@ -8367,6 +8377,18 @@ def _sweep_code_stale_temps(marker: Path, min_age: float) -> None:
     _sweep_aged_files(marker, "new", min_age)
 
 
+def _resolved_root_set(roots) -> set:
+    """`str(Path(x).resolve())` of every root -- the form code-reindex stores
+    in code_meta, so a wired list and the recorded roots compare equal."""
+    out = set()
+    for r in roots:
+        try:
+            out.add(str(Path(r).resolve()))
+        except OSError:
+            out.add(str(r))
+    return out
+
+
 def _env_code_roots() -> list:
     """MEMCONTINUUM_CODE_ROOTS (JSON list), else the single legacy
     MEMCONTINUUM_CODE_ROOT, resolved -- the same rule memlib.sh's
@@ -8423,7 +8445,7 @@ def cmd_code_refresh(args) -> int:
     t0 = time.monotonic()
     project = args.project
     res = {"outcome": "failed", "reason": "crash", "roots": 0, "unrecorded": 0, "changed": 0,
-           "removed": 0, "healed": 0, "embed": "unknown"}
+           "removed": 0, "healed": 0, "dropped": 0, "embed": "unknown"}
     extra = []
     event, session = "unknown", "unknown"
     try:
@@ -8445,7 +8467,7 @@ def cmd_code_refresh(args) -> int:
     line = (
         f"outcome={res['outcome']} reason={res['reason']} project={project} roots={res['roots']} "
         f"unrecorded={res['unrecorded']} changed={res['changed']} removed={res['removed']} "
-        f"healed={res['healed']} elapsed={elapsed:.1f}s event={event} session={session} "
+        f"healed={res['healed']} dropped={res['dropped']} elapsed={elapsed:.1f}s event={event} session={session} "
         f"embed={res['embed']}"
     )
     for item in extra:
@@ -8476,13 +8498,28 @@ def _refresh_code_index(args, project, db_path, marker, is_stop, res, extra) -> 
 _CODE_STATES_CURRENT = ("current", "metadata-current")
 
 
+def _stale_code_roots(conn: sqlite3.Connection, project: str, wired: set | None) -> list:
+    """Recorded `code_meta` roots the wiring does not name (sorted); none when
+    the hook names no roots at all (it has no opinion then)."""
+    if not wired:
+        return []
+    return sorted(
+        r["code_root"] for r in conn.execute("SELECT code_root FROM code_meta WHERE project=?", (project,))
+        if r["code_root"] not in wired
+    )
+
+
 def _kick_code_embed(db_path: Path, project: str, report: dict) -> str:
     """The refresh hook's embed field: `clean` (nothing awaits a vector), else
     spawn_code_embed_worker's verdict (`spawned` | `off` |
-    `failed reason=<file>`)."""
+    `failed reason=<file>`). The worker gets the hook's wired roots
+    (INC-0129); a hook that names none spawns nothing: `off reason=no-wired-roots`."""
     if report.get("awaiting_embedding", 0) <= 0:
         return "clean"
-    return spawn_code_embed_worker(db_path, project)
+    roots = _env_code_roots()
+    if not roots:
+        return "off reason=no-wired-roots"
+    return spawn_code_embed_worker(db_path, project, roots)
 
 
 def _degraded_marker_reason(report: dict) -> str:
@@ -8519,10 +8556,25 @@ def _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, ext
         res.update(outcome="failed", reason="db-newer-than-engine")
         return
     try:
+        wired_list = _env_code_roots()
+        wired = _resolved_root_set(wired_list) if wired_list else None
+        stale = _stale_code_roots(conn, project, wired)
+        if stale and is_stop:
+            # INC-0129: the wiring is the only consent for a root. Drop each
+            # stale one (drop_code_root, one transaction per root), then make
+            # the embedding mode truthful again.
+            for root in stale:
+                with conn:
+                    drop_code_root(conn, project, root)
+            with conn:
+                _store_code_embedding_mode(conn, project, None)
+            res["dropped"] = len(stale)
+            extra.append("detail=dropped-roots:" + ";".join(stale))
+            stale = []
         report = code_index_report(conn, project)
         recorded = {r["code_root"] for r in report["roots"]}
         res["roots"] = len(recorded)
-        res["unrecorded"] = sum(1 for r in _env_code_roots() if r not in recorded)
+        res["unrecorded"] = sum(1 for r in wired_list if r not in recorded)
         res["changed"] = report["changed"]
         res["removed"] = report["removed"]
         if report["state"] == "uninitialized":
@@ -8532,6 +8584,12 @@ def _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, ext
         # worker, INDEPENDENT of the drift check below (a current index with
         # zero vectors must be filled too). Costs a Popen, milliseconds.
         res["embed"] = _kick_code_embed(db_path, project, report)
+        if stale:
+            # SessionStart (preflight only): never delete here; the first Stop drops.
+            if not _write_code_stale_marker(marker, f"stale-root={len(stale)}", res["roots"]):
+                extra.append("marker=write-failed")
+            res.update(outcome="skip", reason="stale-marked")
+            return
         needs_heal = report["changed"] > 0 or report["availability_changed"]
         if not needs_heal:
             if report["state"] in _CODE_STATES_CURRENT:
@@ -8561,6 +8619,7 @@ def _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, ext
         hres: dict = {}
         after, conn = heal_code_index(
             conn, db_path, project, report, limit=limit, caller="code-refresh", result=hres, lock_held=True,
+            wired_roots=wired_list or None,
         )
         res["healed"] = hres.get("reindexed", 0)
         if res["embed"] == "clean":
@@ -8640,6 +8699,18 @@ def _sweep_orphan_code_vectors(db_path: Path, project: str) -> int:
     return n
 
 
+def _embed_worker_roots(args) -> set | None:
+    """The worker's root set from `--root` (resolved), or None -- after the
+    one-line refusal -- when none was given (INC-0129: never fall back to
+    "every recorded root")."""
+    roots = getattr(args, "root", None) or []
+    if not roots:
+        print("code-embed-worker: --root DIR (repeatable) is required: the wiring names the roots, "
+              "the worker never discovers them", file=sys.stderr)
+        return None
+    return _resolved_root_set(roots)
+
+
 def cmd_code_embed_worker(args) -> int:
     """Fills the missing (and stale-fingerprint) vectors of a project's code
     index in the background; safe to run twice. Spawned detached by
@@ -8651,7 +8722,9 @@ def cmd_code_embed_worker(args) -> int:
     exit 0), marker `<project>.code-embed-pending`, log
     `<project>.code-embed.log` -- all beside the code db. Per pass it calls
     cmd_code_reindex(no_embed=False, full=False, retry_not_indexed=False) for
-    every root recorded in `code_meta` that still exists on disk; that call's
+    every root recorded in `code_meta` that is ALSO in the `--root` set the
+    caller passed (the wiring; INC-0129 -- no `--root` is refused with exit 2,
+    never "all recorded roots") and still exists on disk; that call's
     own unchanged-file top-up finds every chunk without a vector at the
     current fingerprint, so nothing here looks for stranded chunks itself.
     Exit 0 on a clean pass (or a held lock), 3 with the traceback (or a
@@ -8666,6 +8739,9 @@ def cmd_code_embed_worker(args) -> int:
     project = args.project
     if not _valid_project_name(project):
         print("code-embed-worker: embed=failed reason=bad-project", file=sys.stderr)
+        return 2
+    wired = _embed_worker_roots(args)
+    if wired is None:
         return 2
     db_path = resolve_code_db_path(args)
 
@@ -8689,8 +8765,8 @@ def cmd_code_embed_worker(args) -> int:
             if ro is not None:
                 ro.close()
         for root in roots:
-            if not Path(root).is_dir():
-                continue
+            if root not in wired or not Path(root).is_dir():
+                continue  # a recorded root the wiring does not name is stale (INC-0129)
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
                 rc = cmd_code_reindex(argparse.Namespace(
@@ -8715,18 +8791,19 @@ def cmd_code_embed_worker(args) -> int:
     )
 
 
-def spawn_code_embed_worker(db_path: Path, project: str) -> str:
+def spawn_code_embed_worker(db_path: Path, project: str, roots) -> str:
     """Raise the `<project>.code-embed-pending` marker and start a detached
     `code-embed-worker` through the shared _spawn_embed_worker (the repo's
     one Popen site). Always spawns when the marker is raised -- a worker that
     finds the lock held exits 0 at once. Returns `spawned` | `off` (spawning
     disabled; the marker is still raised) | `failed reason=<file>`.
-    Fail-open: never raises."""
+    `roots` (the wiring) reach the child as `--root DIR` each. Fail-open: never raises."""
     if not _valid_project_name(project):
         return "failed reason=bad-project"
     return _spawn_embed_worker(
         _code_embed_marker_path(db_path, project), _code_embed_log_path(db_path, project),
-        ["code-embed-worker", "--project", project, "--db", str(db_path)],
+        ["code-embed-worker", "--project", project, "--db", str(db_path),
+         *[a for r in sorted(_resolved_root_set(roots)) for a in ("--root", r)]],
     )
 
 
@@ -8735,8 +8812,11 @@ def cmd_code_embed_worker_entry(args) -> int:
     the detached worker (the form repo-init calls); without it, this process
     IS the worker."""
     if getattr(args, "spawn", False):
+        roots = _embed_worker_roots(args)
+        if roots is None:
+            return 2
         db_path = resolve_code_db_path(args)
-        state = spawn_code_embed_worker(db_path, args.project)
+        state = spawn_code_embed_worker(db_path, args.project, roots)
         print(f"code-embed-worker: {state}")
         return 1 if state.startswith("failed") else 0
     return cmd_code_embed_worker(args)
@@ -10407,6 +10487,11 @@ def main(argv=None) -> int:
         "--spawn", action="store_true",
         help="raise the pending marker and start the worker detached (honours "
              "MEMCONTINUUM_EMBED_WORKER=0), then return at once",
+    )
+    p_code_embed_worker.add_argument(
+        "--root", action="append", default=[], metavar="DIR",
+        help="a wired code root the worker may process (repeatable; required -- the wiring "
+             "is the only consent for a root, recorded roots not named here are skipped)",
     )
     p_code_embed_worker.set_defaults(func=cmd_code_embed_worker_entry)
 

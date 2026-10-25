@@ -6443,7 +6443,8 @@ class TestCodeRefreshHook(HookTestBase):
         self.assertTrue(line.endswith("embed=spawned"), line)
         calls = [json.loads(l) for l in rec.read_text().splitlines()]
         self.assertEqual(len(calls), 1, calls)
-        self.assertEqual(calls[0]["argv"][2:], ["code-embed-worker", "--project", self.project, "--db", str(self.db)])
+        self.assertEqual(calls[0]["argv"][2:], ["code-embed-worker", "--project", self.project, "--db", str(self.db),
+                                               "--root", str(self.code_root.resolve())])
         self.assertTrue(calls[0]["new_session"])
         self.assertTrue(self.embed_marker().exists())
 
@@ -6614,6 +6615,84 @@ class TestCodeRefreshHook(HookTestBase):
         self.assertIn("unrecorded=1", line)
         self.assertIn("roots=1", line)
         self.assertNotIn("o", self.chunk_symbols())
+
+    # -- INC-0129: a recorded root the wiring does not name is stale --------
+
+    def stale_state(self):
+        """A recorded A (wired) plus a recorded, still-on-disk B (not wired);
+        B's chunks carry a fake vector and the project claims mode `full`."""
+        self.build_chunky_index()
+        old = Path(self.td) / "old-root"
+        old.mkdir()
+        (old / "o.py").write_text("def old_symbol():\n    return 0\n")
+        self.build_code_index(old)
+        old_s = str(old.resolve())
+        conn = memidx.open_code_db(self.db)
+        try:
+            cid = conn.execute("SELECT id FROM chunks WHERE code_root=?", (old_s,)).fetchone()[0]
+            conn.execute(
+                "INSERT INTO embeddings (chunk_id, project, dim, vector, embed_fp) VALUES (?,?,?,?,?)",
+                (cid, self.project, 2, b"\x00" * 8, "fp"))
+            conn.execute("UPDATE code_project SET embedding_mode='full' WHERE project=?", (self.project,))
+            conn.commit()
+        finally:
+            conn.close()
+        return old_s
+
+    def rows_of(self, root_s):
+        conn = memidx.open_code_db(self.db)
+        try:
+            ids = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE code_root=?", (root_s,))]
+            return {
+                "chunks": len(ids),
+                "fts": sum(conn.execute("SELECT COUNT(*) FROM fts WHERE rowid=?", (i,)).fetchone()[0] for i in ids),
+                "emb": sum(conn.execute("SELECT COUNT(*) FROM embeddings WHERE chunk_id=?", (i,)).fetchone()[0] for i in ids),
+                "file_sha": conn.execute("SELECT COUNT(*) FROM file_sha WHERE code_root=?", (root_s,)).fetchone()[0],
+                "meta": conn.execute("SELECT COUNT(*) FROM code_meta WHERE code_root=?", (root_s,)).fetchone()[0],
+                "mode": conn.execute("SELECT embedding_mode FROM code_project").fetchone()[0],
+            }
+        finally:
+            conn.close()
+
+    def test_stop_drops_a_recorded_root_the_wiring_does_not_name(self):
+        old_s = self.stale_state()
+        a_s = str(self.code_root.resolve())
+        a_before = self.rows_of(a_s)
+        self.assertEqual({k: v > 0 for k, v in self.rows_of(old_s).items() if k != "mode"},
+                         {"chunks": True, "fts": True, "emb": True, "file_sha": True, "meta": True})
+        line, _ = self.run_hook("Stop")
+        self.assertIn("dropped=1", line)
+        self.assertIn(f"detail=dropped-roots:{old_s}", line)
+        self.assertIn("roots=1", line)
+        gone = self.rows_of(old_s)
+        self.assertEqual({k: v for k, v in gone.items() if k != "mode"},
+                         {"chunks": 0, "fts": 0, "emb": 0, "file_sha": 0, "meta": 0})
+        a_after = self.rows_of(a_s)
+        self.assertEqual(a_after["mode"], "none", "embedding_mode recomputed from real coverage")
+        self.assertEqual({k: v for k, v in a_after.items() if k != "mode"},
+                         {k: v for k, v in a_before.items() if k != "mode"}, "the wired root is untouched")
+        line, _ = self.run_hook("Stop")
+        self.assertIn("dropped=0", line)
+        self.assertNotIn("dropped-roots", line)
+
+    def test_session_start_never_drops_and_marks_stale_root(self):
+        old_s = self.stale_state()
+        before = self.rows_of(old_s)
+        line, _ = self.run_hook("SessionStart")
+        self.assertIn("dropped=0", line)
+        self.assertEqual(self.rows_of(old_s), before, "SessionStart is preflight only")
+        self.assertRegex(self.marker.read_text(), r"^reason=stale-root=1 since=\S+ roots=2\n$")
+        line, _ = self.run_hook("Stop")
+        self.assertIn("dropped=1", line)
+        self.assertFalse(self.marker.exists(), "the Stop run clears the marker by dropping")
+
+    def test_a_hook_that_names_no_roots_drops_nothing(self):
+        old_s = self.stale_state()
+        before = self.rows_of(old_s)
+        env = self.refresh_env(MEMCONTINUUM_CODE_ROOTS="[]")
+        line, _ = self.run_hook("Stop", env=env)
+        self.assertIn("dropped=0", line)
+        self.assertEqual(self.rows_of(old_s), before)
 
     def test_lock_held_skips_and_leaves_the_marker_untouched(self):
         self.build_code_index()

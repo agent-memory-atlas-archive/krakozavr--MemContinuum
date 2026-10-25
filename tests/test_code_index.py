@@ -5604,6 +5604,8 @@ class TestCodeEmbedWorker(unittest.TestCase):
         return memidx._code_embed_marker_path(db, self.PROJECT)
 
     def _args(self, db, **kw):
+        # INC-0129: the worker is handed its roots; `_index` always builds <td>/code.
+        kw.setdefault("root", [str(Path(db).parent / "code")])
         return SimpleNamespace(project=self.PROJECT, db=str(db), spawn=False, **kw)
 
     def _worker(self, db, **patches):
@@ -5791,15 +5793,16 @@ class TestCodeEmbedWorker(unittest.TestCase):
             popen = mock.Mock()
             with mock.patch.dict(os.environ, {"MEMCONTINUUM_EMBED_WORKER": "0"}), \
                  mock.patch.object(memidx.subprocess, "Popen", popen):
-                self.assertEqual(memidx.spawn_code_embed_worker(db, self.PROJECT), "off")
+                self.assertEqual(memidx.spawn_code_embed_worker(db, self.PROJECT, [root]), "off")
             self.assertTrue(self._marker(db).exists(), "off still raises the marker")
             popen.assert_not_called()
             env = {k: v for k, v in os.environ.items() if k != "MEMCONTINUUM_EMBED_WORKER"}
             with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(memidx.subprocess, "Popen", popen):
-                self.assertEqual(memidx.spawn_code_embed_worker(db, self.PROJECT), "spawned")
+                self.assertEqual(memidx.spawn_code_embed_worker(db, self.PROJECT, [root]), "spawned")
                 argv = popen.call_args.args[0]
                 self.assertEqual(argv[1:], [str(Path(memidx.__file__).resolve()), "code-embed-worker",
-                                             "--project", self.PROJECT, "--db", str(db)])
+                                             "--project", self.PROJECT, "--db", str(db),
+                                             "--root", str(root.resolve())])
                 self.assertTrue(popen.call_args.kwargs["start_new_session"])
                 self.assertIs(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
                 self.assertTrue(popen.call_args.kwargs["close_fds"])
@@ -5809,10 +5812,134 @@ class TestCodeEmbedWorker(unittest.TestCase):
                 fd = os.open(str(memidx._code_embed_lock_path(db, self.PROJECT)), os.O_CREAT | os.O_RDWR, 0o644)
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    self.assertEqual(memidx.spawn_code_embed_worker(db, self.PROJECT), "spawned")
+                    self.assertEqual(memidx.spawn_code_embed_worker(db, self.PROJECT, [root]), "spawned")
                 finally:
                     os.close(fd)
                 popen.assert_called_once()
+
+
+class TestStaleRootsNeverRevived(unittest.TestCase):
+    """INC-0129 (TOP-0137 L4): the wiring is the only consent for a root.
+    The worker and the heal never process a recorded root the caller did not
+    name; `code-embed-worker` without `--root` refuses."""
+
+    PROJECT = memidx.DEFAULT_PROJECT
+
+    def _two_roots(self, td):
+        root_a, db = TestCodeEmbedWorker._index(self, td, n=2)
+        root_b = Path(td) / "old-root"; root_b.mkdir()
+        for i in range(2):
+            (root_b / f"b{i}.py").write_text(f"def old_{i}():\n    return {i}\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            code_reindex(root_b, db, lang="python")
+        return root_a, root_b, db
+
+    def _by_root(self, db):
+        conn = memidx.open_code_db(db)
+        try:
+            return {r[0]: (r[1], r[2]) for r in conn.execute(
+                "SELECT c.code_root, COUNT(*), COUNT(e.chunk_id) FROM chunks c "
+                "LEFT JOIN embeddings e ON e.chunk_id=c.id GROUP BY c.code_root")}
+        finally:
+            conn.close()
+
+    def test_worker_ignores_a_recorded_root_the_caller_did_not_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            root_a, root_b, db = self._two_roots(td)
+            (root_b / "b0.py").write_text("def old_0_renamed():\n    return 0\n")  # drift B would reindex
+            memidx._code_embed_marker_path(db, self.PROJECT).touch()
+            args = SimpleNamespace(project=self.PROJECT, db=str(db), spawn=False, root=[str(root_a)])
+            with _fake_model_patch(), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(memidx.cmd_code_embed_worker(args), 0)
+            by_root = self._by_root(db)
+            self.assertEqual(by_root[str(root_a.resolve())], (2, 2))
+            self.assertEqual(by_root[str(root_b.resolve())][1], 0, "B's chunks must keep awaiting a vector")
+            conn = memidx.open_code_db(db)
+            try:
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE symbol='old_0_renamed'").fetchone()[0], 0,
+                    "B must not be reindexed")
+            finally:
+                conn.close()
+            log = memidx._code_embed_log_path(db, self.PROJECT).read_text()
+            self.assertIn(f"code-embed-worker pass {root_a.resolve()} ", log)
+            self.assertNotIn(str(root_b.resolve()), log)
+
+    def test_worker_without_root_refuses_with_exit_2_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root_a, db = TestCodeEmbedWorker._index(self, td)
+            marker = memidx._code_embed_marker_path(db, self.PROJECT)
+            marker.touch()
+            err = io.StringIO()
+            args = SimpleNamespace(project=self.PROJECT, db=str(db), spawn=False, root=[])
+            with _fake_model_patch(), contextlib.redirect_stderr(err):
+                self.assertEqual(memidx.cmd_code_embed_worker(args), 2)
+            self.assertIn("--root", err.getvalue())
+            self.assertEqual(len(err.getvalue().strip().splitlines()), 1)
+            self.assertFalse(memidx._code_embed_log_path(db, self.PROJECT).exists())
+            self.assertTrue(marker.exists(), "a refused run leaves the marker alone")
+            self.assertEqual(self._by_root(db)[str(root_a.resolve())][1], 0)
+
+    def test_argparse_form_refuses_without_root_and_spawn_form_too(self):
+        with tempfile.TemporaryDirectory() as td:
+            root_a, db = TestCodeEmbedWorker._index(self, td)
+            popen = mock.Mock()
+            for extra in ([], ["--spawn"]):
+                with mock.patch.object(memidx.subprocess, "Popen", popen), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(memidx.main(
+                        ["code-embed-worker", "--project", self.PROJECT, "--db", str(db), *extra]), 2, extra)
+            popen.assert_not_called()
+
+    def test_spawn_form_passes_every_root_to_the_single_popen_site(self):
+        with tempfile.TemporaryDirectory() as td:
+            root_a, root_b, db = self._two_roots(td)
+            popen = mock.Mock()
+            env = {k: v for k, v in os.environ.items() if k != "MEMCONTINUUM_EMBED_WORKER"}
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(memidx.subprocess, "Popen", popen), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(memidx.main(
+                    ["code-embed-worker", "--project", self.PROJECT, "--db", str(db), "--spawn",
+                     "--root", str(root_a), "--root", str(root_b)]), 0)
+            popen.assert_called_once()
+            argv = popen.call_args.args[0]
+            self.assertEqual(argv[2:5], ["code-embed-worker", "--project", self.PROJECT])
+            self.assertEqual(argv[argv.index("--root"):],
+                             ["--root", str(root_b.resolve()), "--root", str(root_a.resolve())]
+                             if str(root_b.resolve()) < str(root_a.resolve())
+                             else ["--root", str(root_a.resolve()), "--root", str(root_b.resolve())])
+
+    def test_kick_spawns_nothing_when_the_hook_names_no_roots(self):
+        with tempfile.TemporaryDirectory() as td:
+            root_a, db = TestCodeEmbedWorker._index(self, td)
+            popen = mock.Mock()
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("MEMCONTINUUM_CODE_ROOTS", "MEMCONTINUUM_CODE_ROOT", "MEMCONTINUUM_EMBED_WORKER")}
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(memidx.subprocess, "Popen", popen):
+                self.assertEqual(memidx._kick_code_embed(db, self.PROJECT, {"awaiting_embedding": 3}),
+                                 "off reason=no-wired-roots")
+            popen.assert_not_called()
+
+    def test_heal_with_wired_roots_never_touches_a_drifted_unwired_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            root_a, root_b, db = self._two_roots(td)
+            (root_a / "m0.py").write_text("def func_0():\n    return 'a-edit'\n")
+            (root_b / "b0.py").write_text("def old_0_renamed():\n    return 0\n")
+            conn = memidx.open_code_db(db)
+            report = memidx.code_index_report(conn, self.PROJECT)
+            self.assertEqual(report["changed"], 2)
+            hres = {}
+            after, conn = memidx.heal_code_index(
+                conn, db, self.PROJECT, report, limit=500, caller="t", result=hres,
+                wired_roots=[str(root_a)])
+            try:
+                symbols = {r[0] for r in conn.execute("SELECT symbol FROM chunks")}
+            finally:
+                conn.close()
+            self.assertNotIn("old_0_renamed", symbols, "the unwired root must not be reindexed")
+            self.assertIn("old_0", symbols)
+            self.assertEqual(hres["outcome"], "healed")
+            self.assertEqual(after["changed"], 1, "only the unwired root's drift is left")
 
 
 class TestEmbedWorkerFixRound1(unittest.TestCase):
@@ -5933,7 +6060,7 @@ class TestEmbedWorkerFixRound1(unittest.TestCase):
             marker.touch()
             with _fake_model_patch(), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(memidx.cmd_code_embed_worker(
-                    SimpleNamespace(project=self.PROJECT, db=str(db), spawn=False)), 0)
+                    SimpleNamespace(project=self.PROJECT, db=str(db), spawn=False, root=[str(root)])), 0)
             conn = sqlite3.connect(str(db))
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM embeddings WHERE chunk_id=999999").fetchone()[0], 0)
             conn.close()
@@ -5986,7 +6113,7 @@ class TestEmbedWorkerFixRound1(unittest.TestCase):
     def _spawners(self, td):
         db = Path(td) / "p.sqlite"
         return [
-            ("code", db, lambda: memidx.spawn_code_embed_worker(db, "p"),
+            ("code", db, lambda: memidx.spawn_code_embed_worker(db, "p", [td]),
              memidx._code_embed_marker_path(db, "p"), memidx._code_embed_log_path(db, "p")),
             ("store", db, lambda: memidx.spawn_embed_worker(db, "p", td),
              memidx._embed_marker_path(db, "p"), memidx._embed_log_path(db, "p")),
@@ -6044,7 +6171,7 @@ class TestEmbedWorkerFixRound1(unittest.TestCase):
             target.write_text("keep")
             cases = [
                 (memidx._code_embed_lock_path(db, self.PROJECT), memidx._code_embed_marker_path(db, self.PROJECT),
-                 lambda: memidx.cmd_code_embed_worker(SimpleNamespace(project=self.PROJECT, db=str(db), spawn=False))),
+                 lambda: memidx.cmd_code_embed_worker(SimpleNamespace(project=self.PROJECT, db=str(db), spawn=False, root=[str(root)]))),
                 (memidx._embed_lock_path(db, self.PROJECT), memidx._embed_marker_path(db, self.PROJECT),
                  lambda: memidx.cmd_embed_worker(SimpleNamespace(project=self.PROJECT, db=str(db), root=str(store_root)))),
             ]
@@ -6372,7 +6499,7 @@ class TestEmbedWorkerFixRound2(unittest.TestCase):
                 return 0
 
             with mock.patch.object(memidx, "cmd_code_reindex", fake_reindex):
-                rc = memidx.cmd_code_embed_worker(SimpleNamespace(project=self.PROJECT, db=str(db), spawn=False))
+                rc = memidx.cmd_code_embed_worker(SimpleNamespace(project=self.PROJECT, db=str(db), spawn=False, root=[str(root)]))
             self.assertEqual((rc, len(calls)), (0, 2))
             self.assertFalse(marker.exists())
 
@@ -6443,12 +6570,12 @@ class TestEmbedWorkerFixRound2(unittest.TestCase):
             for bad in ["", ".", "..", "a/b", "../x", "a\nb", "a\x00b", "a\\b"]:
                 with mock.patch.object(memidx.subprocess, "Popen", popen):
                     self.assertEqual(memidx.spawn_embed_worker(db, bad, td), "failed reason=bad-project", repr(bad))
-                    self.assertEqual(memidx.spawn_code_embed_worker(db, bad), "failed reason=bad-project", repr(bad))
+                    self.assertEqual(memidx.spawn_code_embed_worker(db, bad, [td]), "failed reason=bad-project", repr(bad))
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
                     self.assertEqual(memidx.cmd_embed_worker(SimpleNamespace(project=bad, db=str(db), root=td)), 2)
                     self.assertEqual(memidx.cmd_code_embed_worker(
-                        SimpleNamespace(project=bad, db=str(db), spawn=False)), 2)
+                        SimpleNamespace(project=bad, db=str(db), spawn=False, root=[td])), 2)
                 self.assertIn("bad-project", err.getvalue())
             popen.assert_not_called()
             self.assertFalse((Path(td) / "home").exists(), "nothing may be created for a refused name")

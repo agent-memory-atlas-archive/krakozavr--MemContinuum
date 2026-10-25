@@ -3599,7 +3599,11 @@ class TestCodeCensusAndConsentDialogue(unittest.TestCase):
             self.assertIn("--no-embed", calls[reindex[0]])
             self.assertEqual(len(spawn), 1, calls)
             self.assertGreater(spawn[0], reindex[0])
-            self.assertTrue(calls[spawn[0]].endswith("code-embed-worker --project widgetco --spawn"), calls[spawn[0]])
+            # INC-0129: the worker is handed the wiring, one --root per indexed --code-root
+            self.assertTrue(
+                calls[spawn[0]].endswith(f"code-embed-worker --project widgetco --spawn --root {Path(code_root).resolve()}"),
+                calls[spawn[0]])
+            self.assertRegex(proc.stdout, r"code-embed-worker: PYTHONPATH=.* --spawn --root \S+")
             self.assertIn("Code embeddings: not started (code-embed-worker: off)", proc.stdout)
             # EMBED_WORKER=0 still raises the marker for the hook / a later run
             marker = Path(home) / ".memcontinuum" / "widgetco.code-embed-pending"
