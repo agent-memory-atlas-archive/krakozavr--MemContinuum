@@ -5,7 +5,7 @@
 # file: memidx.py code-refresh runs code_index_report (five stat signals, sha
 # on drift, the git HEAD trigger -- it sees an edit by any tool or shell and
 # every commit) and, on Stop only, heal_code_index (the same in-process
-# incremental call code-search makes, text pass, no embeddings). SessionStart
+# incremental call code-search makes, text pass, never embeds). SessionStart
 # preflights only: that event blocks the session, so a stale report there
 # writes the <project>.code-stale marker and the first Stop refreshes. The
 # marker, the flock that excludes a concurrent refresh or code-search heal,
@@ -31,7 +31,16 @@
 #
 # hook.log: <ts> code-refresh outcome=<refreshed|skip|failed> reason=...
 #   project=P roots=N unrecorded=N changed=N removed=N healed=N elapsed=Xs
-#   event=E session=S [marker=write-failed] [detail=...]
+#   event=E session=S embed=<spawned|pending|clean|off|failed|unknown>
+#   [marker=write-failed] [detail=...]
+# embed= is the background embedding worker's state (TOP-0137 L2 step 5):
+# on BOTH events, whenever the index has chunks awaiting a vector,
+# memidx.py raises <project>.code-embed-pending and starts a detached
+# `code-embed-worker` (python subprocess.Popen in a new session -- never
+# bash & or setsid; milliseconds, independent of the drift check):
+# spawned = started now, pending = a worker already holds the lock,
+# clean = nothing awaits, off = MEMCONTINUUM_EMBED_WORKER=0, failed =
+# marker or spawn error, unknown = the run ended before it was evaluated.
 #
 # bash 3.2 discipline: no arrays, no [[ ]], no process substitution, no
 # mapfile, no namerefs; no $(( )) on any env value (the budget is checked with

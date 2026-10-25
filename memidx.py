@@ -2327,6 +2327,73 @@ def _embed_log_path(db_path: Path, project: str) -> Path:
     return Path(db_path).parent / f"{project}.embed.log"
 
 
+def _run_embed_worker_loop(lock_path: Path, marker_path: Path, log_path: Path, label: str, run_pass) -> int:
+    """The lock/marker/loop skeleton shared by `embed-worker` (the store) and
+    `code-embed-worker` (the code index) -- TOP-0137 L2 step 5 extracted it
+    from cmd_embed_worker so the two cannot drift.
+
+    Lock: `fcntl.flock(LOCK_EX | LOCK_NB)` on `lock_path`; `BlockingIOError`
+    means another worker owns the marker -> exit 0 at once. Loop: while the
+    marker exists, note its `mtime_ns`, call `run_pass()` (returns None on a
+    clean pass, or a message when it failed open without raising), then, if
+    the marker's mtime_ns is unchanged, unlink it and stop; if a producer
+    retouched it mid-pass, go round again. An exception or a failure message
+    leaves the marker, appends the traceback/message to `log_path` under a
+    `--- <ts> <label> ---` header and returns 3."""
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # Another worker already owns the marker -- nothing to do here.
+        os.close(lock_fd)
+        return 0
+
+    def log(body: str) -> None:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now(timezone.utc).isoformat()
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(f"--- {ts} {label} ---\n{body}\n")
+        except Exception:
+            pass
+
+    try:
+        while marker_path.exists():
+            try:
+                m0 = marker_path.stat().st_mtime_ns
+            except OSError:
+                # Vanished between exists() and stat() -- another process
+                # (a worker run by hand, concurrently) already cleared it.
+                break
+            try:
+                failure = run_pass()
+            except Exception as exc:
+                log("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+                return 3
+            if failure:
+                log(failure)
+                return 3
+            try:
+                still = marker_path.stat().st_mtime_ns
+            except OSError:
+                still = None
+            if still == m0:
+                try:
+                    marker_path.unlink()
+                except OSError:
+                    pass
+                break
+            # else: retouched mid-pass (a commit landed while this one
+            # ran) -- loop again, no sleep needed.
+        return 0
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lock_fd)
+
+
 def cmd_embed_worker(args) -> int:
     """Design R8 (audit MC-P2-02, TOP-0123 L7): backfills embeddings for a
     store in the background; coalesces commits; safe to run twice. Spawned
@@ -2354,87 +2421,39 @@ def cmd_embed_worker(args) -> int:
     """
     global _last_reindex_embedding_backend_failed
     db_path = resolve_db_path(args)
-    lock_path = _embed_lock_path(db_path, args.project)
-    marker_path = _embed_marker_path(db_path, args.project)
-    log_path = _embed_log_path(db_path, args.project)
 
-    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        # Another worker already owns the marker -- nothing to do here.
-        os.close(lock_fd)
-        return 0
-    try:
-        while marker_path.exists():
-            try:
-                m0 = marker_path.stat().st_mtime_ns
-            except OSError:
-                # Vanished between exists() and stat() -- another process
-                # (a worker run by hand, concurrently) already cleared it.
-                break
-            reindex_ns = argparse.Namespace(
-                root=args.root, project=args.project, db=args.db,
-                full=False, no_embed=False, auto=False,
+    def run_pass():
+        global _last_reindex_embedding_backend_failed
+        reindex_ns = argparse.Namespace(
+            root=args.root, project=args.project, db=args.db,
+            full=False, no_embed=False, auto=False,
+        )
+        # Reset explicitly BEFORE the call, not just relying on
+        # cmd_reindex's own reset at its top: a test (or any other
+        # caller) that mocks cmd_reindex out entirely never runs that
+        # reset, and this module-level flag would otherwise leak a
+        # stale True from an EARLIER, unrelated cmd_reindex call in the
+        # same process across into this pass's own verdict.
+        _last_reindex_embedding_backend_failed = False
+        cmd_reindex(reindex_ns)
+        if reindex_embedding_backend_failed():
+            # MOD-1 (task-6-review.md): cmd_reindex fails OPEN on a
+            # broken embedding backend (Ruling 80/R4/R7's own contract)
+            # and returns 0 -- no exception reaches here, but the marker
+            # must not be dropped as if this pass had actually embedded
+            # something. Treated exactly like an exception: leave the
+            # marker, log why, exit 3 (the next commit or a manual worker
+            # run retries it).
+            return (
+                "embedding backend failed (reindex reported no exception but could "
+                "not embed); marker left in place for retry"
             )
-            # Reset explicitly BEFORE the call, not just relying on
-            # cmd_reindex's own reset at its top: a test (or any other
-            # caller) that mocks cmd_reindex out entirely never runs that
-            # reset, and this module-level flag would otherwise leak a
-            # stale True from an EARLIER, unrelated cmd_reindex call in the
-            # same process across into this pass's own verdict.
-            _last_reindex_embedding_backend_failed = False
-            try:
-                cmd_reindex(reindex_ns)
-            except Exception as exc:
-                try:
-                    db_path.parent.mkdir(parents=True, exist_ok=True)
-                    ts = datetime.now(timezone.utc).isoformat()
-                    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                    with log_path.open("a", encoding="utf-8") as fh:
-                        fh.write(f"--- {ts} embed-worker ---\n{tb}\n")
-                except Exception:
-                    pass
-                return 3
-            if reindex_embedding_backend_failed():
-                # MOD-1 (task-6-review.md): cmd_reindex fails OPEN on a
-                # broken embedding backend (Ruling 80/R4/R7's own contract)
-                # and returns 0 -- no exception reaches here, but the marker
-                # must not be dropped as if this pass had actually embedded
-                # something. Treated exactly like the exception arm above:
-                # leave the marker, log why, exit 3 (the next commit or a
-                # manual worker run retries it).
-                try:
-                    db_path.parent.mkdir(parents=True, exist_ok=True)
-                    ts = datetime.now(timezone.utc).isoformat()
-                    with log_path.open("a", encoding="utf-8") as fh:
-                        fh.write(
-                            f"--- {ts} embed-worker ---\n"
-                            "embedding backend failed (reindex reported no exception but could "
-                            "not embed); marker left in place for retry\n"
-                        )
-                except Exception:
-                    pass
-                return 3
-            try:
-                still = marker_path.stat().st_mtime_ns
-            except OSError:
-                still = None
-            if still == m0:
-                try:
-                    marker_path.unlink()
-                except OSError:
-                    pass
-                break
-            # else: retouched mid-pass (a commit landed while this one
-            # ran) -- loop again, no sleep needed.
-        return 0
-    finally:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(lock_fd)
+        return None
+
+    return _run_embed_worker_loop(
+        _embed_lock_path(db_path, args.project), _embed_marker_path(db_path, args.project),
+        _embed_log_path(db_path, args.project), "embed-worker", run_pass,
+    )
 
 
 def embedding_backlog(db_path: Path, project: str) -> dict:
@@ -6469,7 +6488,72 @@ def _record_index_failure(conn, project, code_root, rel, f, *, sha, cv, status, 
     return True
 
 
+# TOP-0137 L2 step 5: the code-side twin of _last_reindex_embedding_backend_failed.
+# cmd_code_reindex fails OPEN on a broken embedding backend (a stderr line, rc
+# 0), so `code-embed-worker` -- which must not drop its marker over a pass that
+# embedded nothing -- reads this explicit signal, reset at the top of every call.
+_last_code_embedding_backend_failed = False
+
+
+def code_embedding_backend_failed() -> bool:
+    """Whether the MOST RECENT cmd_code_reindex call hit a fail-open
+    embedding-backend failure (see _last_code_embedding_backend_failed)."""
+    return _last_code_embedding_backend_failed
+
+
+# Chunks embedded and committed per batch: a killed worker keeps its progress
+# and a first run over thousands of chunks never holds one multi-minute write
+# transaction.
+CODE_EMBED_BATCH = 128
+
+
+def _code_embedding_coverage(conn: sqlite3.Connection, project: str, current_fp: str | None = None) -> tuple[int, int]:
+    """`(total, fresh)` for a project's chunks, PROJECT-wide (every root):
+    how many chunks exist and how many carry a vector at the CURRENT
+    fingerprint. With a loaded model's `current_fp` the comparison is exact;
+    without one (a --no-embed pass, a report) it compares the STATIC
+    fingerprint prefix (model, dim, pipeline, ... up to `;revision=`) in SQL
+    -- no model load, and a vector from another model or pipeline never reads
+    as coverage. The one definition behind the embedding_mode recompute, the
+    summary's awaiting count and code_index_report's awaiting_embedding."""
+    total = conn.execute("SELECT COUNT(*) AS n FROM chunks WHERE project=?", (project,)).fetchone()["n"]
+    if current_fp is not None:
+        fresh = conn.execute(
+            "SELECT COUNT(*) AS n FROM chunks c JOIN embeddings e ON e.chunk_id = c.id "
+            "WHERE c.project=? AND e.embed_fp=?",
+            (project, current_fp),
+        ).fetchone()["n"]
+    else:
+        prefix = _fingerprint_static_prefix(embedding_fingerprint(model=None))
+        fresh = conn.execute(
+            "SELECT COUNT(*) AS n FROM chunks c JOIN embeddings e ON e.chunk_id = c.id "
+            "WHERE c.project=? AND e.embed_fp IS NOT NULL AND substr(e.embed_fp,1,?)=?",
+            (project, len(prefix), prefix),
+        ).fetchone()["n"]
+    return total, fresh
+
+
+def _code_embedding_mode(total: int, fresh: int) -> str:
+    """none = no chunk has a current vector (or there are no chunks), full =
+    every chunk has one, partial otherwise."""
+    if total == 0 or fresh == 0:
+        return "none"
+    return "full" if fresh == total else "partial"
+
+
+def _store_code_embedding_mode(conn: sqlite3.Connection, project: str, current_fp: str | None) -> tuple[str, int, int]:
+    """Recompute project-wide coverage, write `code_project.embedding_mode`
+    and return `(mode, total, fresh)` -- called after every embedded batch
+    (so a killed pass leaves an honest mode) and at the end of every pass."""
+    total, fresh = _code_embedding_coverage(conn, project, current_fp)
+    mode = _code_embedding_mode(total, fresh)
+    conn.execute("UPDATE code_project SET embedding_mode=? WHERE project=?", (mode, project))
+    return mode, total, fresh
+
+
 def cmd_code_reindex(args) -> int:
+    global _last_code_embedding_backend_failed
+    _last_code_embedding_backend_failed = False
     db_path = resolve_code_db_path(args)
 
     if getattr(args, "drop_root", None):
@@ -6613,6 +6697,7 @@ def cmd_code_reindex(args) -> int:
                 file=sys.stderr,
             )
             args.no_embed = True
+            _last_code_embedding_backend_failed = True
         else:
             model, current_fp = loaded
 
@@ -6920,34 +7005,66 @@ def cmd_code_reindex(args) -> int:
     reembeds = 0
     if pending_texts:
         # Ruling 80: same fail-open shape as cmd_reindex -- on a backend
-        # failure, no new embedding rows are written this pass (`reembeds`
-        # stays 0), the chunk rows themselves are untouched, and the real-
-        # coverage embedding_mode recompute further down naturally reports
-        # the now-incomplete coverage without any extra forcing here.
+        # failure, no further embedding rows are written this pass, the
+        # chunk rows themselves are untouched, and the real-coverage
+        # embedding_mode recompute further down naturally reports the
+        # now-incomplete coverage without any extra forcing here.
         # Design R4: `model` was already loaded above (before the per-file
         # loop) -- reused here, one load for the whole run, not two.
-        vecs, embed_err = try_compute_embeddings(compute_embeddings, pending_texts, model)
-        if embed_err is not None:
-            print(
-                f"code-reindex: embeddings unavailable ({embed_err}); continuing without embeddings",
-                file=sys.stderr,
-            )
-        elif len(vecs) != len(pending_texts):
-            # Design R4 item 5 (audit MC-P1-06): batch-length check BEFORE
-            # any zip -- nothing is written on a short/long return.
-            print(
-                f"code-reindex: embeddings unavailable (backend returned {len(vecs)} vectors for "
-                f"{len(pending_texts)} texts); continuing without embeddings",
-                file=sys.stderr,
-            )
-        else:
-            for cid, v in zip(pending_ids, vecs):
+        # TOP-0137 L2 step 5: embedded and COMMITTED in batches of
+        # CODE_EMBED_BATCH, so a killed pass keeps every finished batch (the
+        # next pass's unchanged-file top-up finds only the rest). The first
+        # commit also publishes the file/chunk writes made so far, which is
+        # safe: a chunk without a vector is exactly an "awaiting" chunk.
+        for off in range(0, len(pending_texts), CODE_EMBED_BATCH):
+            batch_texts = pending_texts[off:off + CODE_EMBED_BATCH]
+            batch_ids = pending_ids[off:off + CODE_EMBED_BATCH]
+            vecs, embed_err = try_compute_embeddings(compute_embeddings, batch_texts, model)
+            if embed_err is not None:
+                print(
+                    f"code-reindex: embeddings unavailable ({embed_err}); continuing without embeddings",
+                    file=sys.stderr,
+                )
+                _last_code_embedding_backend_failed = True
+                break
+            if len(vecs) != len(batch_texts):
+                # Design R4 item 5 (audit MC-P1-06): batch-length check BEFORE
+                # any zip -- nothing is written on a short/long return.
+                print(
+                    f"code-reindex: embeddings unavailable (backend returned {len(vecs)} vectors for "
+                    f"{len(batch_texts)} texts); continuing without embeddings",
+                    file=sys.stderr,
+                )
+                _last_code_embedding_backend_failed = True
+                break
+            # A concurrent writer (a heal) may have replaced a file's chunks
+            # while this batch was being computed; ids are AUTOINCREMENT, so
+            # an id that no longer exists is simply dropped, never reused.
+            alive = {
+                r["id"] for r in conn.execute(
+                    f"SELECT id FROM chunks WHERE id IN ({','.join('?' * len(batch_ids))})", batch_ids
+                )
+            }
+            written = 0
+            for cid, v in zip(batch_ids, vecs):
+                if cid not in alive:
+                    continue
                 packed = pack_vector(v)
                 conn.execute(
                     "INSERT OR REPLACE INTO embeddings (chunk_id, project, dim, vector, embed_fp) VALUES (?,?,?,?,?)",
                     (cid, args.project, len(unpack_vector(packed)), packed, current_fp),
                 )
-            reembeds = len(vecs)
+                written += 1
+            reembeds += written
+            if written and current_fp is not None:
+                # Design R4: the fingerprint lands in the SAME transaction as
+                # the vectors it attests to.
+                conn.execute(
+                    "UPDATE code_project SET embedding_fingerprint=? WHERE project=?",
+                    (current_fp, args.project),
+                )
+            _store_code_embedding_mode(conn, args.project, current_fp)
+            conn.commit()
 
     removed = set(existing.keys()) - seen
     for rel in removed:
@@ -6967,37 +7084,28 @@ def cmd_code_reindex(args) -> int:
         (args.project, root_s, time.time(), _git_head_sha(root)),
     )
 
-    # Anatomy M2a binding point 2: embedding_mode never lies. A --no-embed
-    # run that adds or changes chunks on a `full` project downgrades the
-    # project to `none` in the SAME transaction (the invariant tested is
-    # actual coverage: every chunk of a `full` project has an embedding
-    # row); a --no-embed run that changes nothing leaves whatever mode was
-    # stored intact.
-    #
-    # Fix-wave item 1: a run WITHOUT --no-embed must not set `full` just
-    # because it embedded everything it walked -- it only ever sees the
-    # root(s) it was given, and another root's chunks may still lack
-    # vectors (from an earlier --no-embed run there, or one never run at
-    # all). So after the embedding writes above, derive the mode from
-    # actual PROJECT-wide coverage: `full` iff no chunk of the project (any
-    # root) lacks an embeddings row.
-    mutated = (added_files + changed_files) > 0
+    # Anatomy M2a binding point 2, in its TOP-0137 L2 step 5 form:
+    # embedding_mode never lies. It is recomputed from REAL project-wide
+    # coverage at the end of EVERY pass, embedded or not: full = every chunk
+    # has a vector at the current fingerprint, none = no chunk has one,
+    # partial = some. (A --no-embed pass that adds chunks to a `full` project
+    # therefore reports `partial`, not `none`, and the background worker's
+    # next pass restores `full`.) A chunk elsewhere in the project -- another
+    # root, a stale-model vector -- counts as awaiting, so `full` is never
+    # claimed over it.
     mode_now = conn.execute(
         "SELECT embedding_mode FROM code_project WHERE project=?", (args.project,)
     ).fetchone()["embedding_mode"]
-    downgraded = False
-    stranded_elsewhere = 0
+    new_mode, total_chunks, fresh_chunks = _store_code_embedding_mode(conn, args.project, current_fp)
+    awaiting = max(total_chunks - fresh_chunks, 0)
+    downgraded = mode_now == "full" and new_mode != "full"
     if args.no_embed:
-        if mutated and mode_now == "full":
-            conn.execute(
-                "UPDATE code_project SET embedding_mode='none' WHERE project=?", (args.project,)
-            )
-            downgraded = True
         # Design R4 item 9 (audit MC-P1-06): a --no-embed run reports a
         # standing fingerprint mismatch (STATIC comparison only -- no
         # model load) but never repairs it; only when the project already
         # has embedding rows (a project that has never been embedded has
-        # no stored fingerprint for an unremarkable reason).
+        # no stored fingerprint for an unremarkable reason). The stale
+        # chunks are counted in `awaiting` above.
         stored_fp_row = conn.execute(
             "SELECT embedding_fingerprint FROM code_project WHERE project=?", (args.project,)
         ).fetchone()
@@ -7010,28 +7118,6 @@ def cmd_code_reindex(args) -> int:
                 "code-reindex: stored embeddings were made by a different model; "
                 "run without --no-embed to re-embed",
                 file=sys.stderr,
-            )
-    else:
-        # Design R4: same `AND e.embed_fp = ?` addition -- an old-
-        # fingerprint chunk in another root counts as stranded, so `full`
-        # is never claimed while any chunk project-wide still carries a
-        # foreign-model vector.
-        stranded_elsewhere = conn.execute(
-            "SELECT COUNT(*) AS n FROM chunks c LEFT JOIN embeddings e ON e.chunk_id = c.id AND e.embed_fp = ? "
-            "WHERE c.project=? AND e.chunk_id IS NULL",
-            (current_fp, args.project),
-        ).fetchone()["n"]
-        conn.execute(
-            "UPDATE code_project SET embedding_mode=? WHERE project=?",
-            ("none" if stranded_elsewhere else "full", args.project),
-        )
-        # Design R4 (audit MC-P1-06): the new fingerprint lands in the SAME
-        # transaction as the vectors of a run that embedded anything --
-        # never written on a run that wrote no vector at all.
-        if reembeds > 0 and current_fp is not None:
-            conn.execute(
-                "UPDATE code_project SET embedding_fingerprint=? WHERE project=?",
-                (current_fp, args.project),
             )
 
     conn.commit()
@@ -7050,16 +7136,15 @@ def cmd_code_reindex(args) -> int:
         # before this task.
         summary += f", {integrity_failures} integrity failure(s)"
     summary += f", {elapsed:.3f}s"
+    # TOP-0137 L2 step 5: the LAST token, same grammar as the store's
+    # "N record(s) awaiting embedding" (printed unconditionally, 0 included).
+    summary += f", {awaiting} chunk(s) awaiting embedding"
     print(summary)
     if downgraded:
         print(
             f"code-reindex: embeddings are now incomplete for {args.project}; embedding mode set "
-            "to none (run without --no-embed to restore)"
-        )
-    if stranded_elsewhere:
-        print(
-            f"code-reindex: {stranded_elsewhere} chunk(s) in other roots have no embedding; "
-            "embedding mode stays none (run code-reindex without --no-embed on every root)"
+            f"to {new_mode} ({awaiting} chunk(s) awaiting embedding; the background embed worker "
+            "restores it, or run code-reindex without --no-embed)"
         )
     if skipped_unknown:
         # Task 5 census (spec S4, INC-0103/0104 lesson): a walked file whose
@@ -7633,6 +7718,7 @@ def code_index_report(conn: sqlite3.Connection, project: str, *, verify_content:
     if not metas:
         return {
             "state": "uninitialized", "langs": None, "embedding_mode": "none",
+            "awaiting_embedding": 0, "chunk_total": 0,
             "availability_changed": False, "roots": [], "changed": 0, "removed": 0, "failed": 0, "not_indexed": 0,
         }
     langs = resolve_project_langs(conn, project)
@@ -7666,8 +7752,12 @@ def code_index_report(conn: sqlite3.Connection, project: str, *, verify_content:
         state = "current"
     else:
         state = "metadata-current"
+    # TOP-0137 L2 step 5: chunks without a vector at the current (static)
+    # fingerprint -- what the background code-embed-worker still has to fill.
+    chunk_total, chunk_fresh = _code_embedding_coverage(conn, project)
     return {
         "state": state, "langs": langs, "embedding_mode": (proj["embedding_mode"] if proj else "none"),
+        "awaiting_embedding": max(chunk_total - chunk_fresh, 0), "chunk_total": chunk_total,
         "availability_changed": availability_changed, "roots": roots, "changed": changed,
         "removed": removed, "failed": failed, "not_indexed": not_indexed,
     }
@@ -7719,9 +7809,15 @@ def heal_code_index(
     with `retry_not_indexed=False` (binding point 1: an unrelated edit must
     never retry a known-broken backend) and `--full` never set (a heal
     repairs drift, it does not rewrite the project's language set).
-    `no_embed` follows the project's OWN embedding_mode (binding point 2):
-    `full` embeds, anything else passes --no-embed, so a heal can never be
-    the thing that silently adds unembedded chunks to a `full` project.
+    The heal is TEXT-ONLY, always (`no_embed=True`). This AMENDS Anatomy
+    M2a binding point 2 ("no_embed follows the project's own
+    embedding_mode"; TOP-0137 L2 step 5): that rule existed so a heal could
+    never silently add unembedded chunks to a `full` project. Now
+    embedding_mode is recomputed from real coverage after every pass, so
+    such a project is simply reported `partial` and the background
+    code-embed-worker restores `full` minutes later -- whereas an inline
+    embed of a 300-chunk drift (~13 s) would be watchdog-killed on every
+    Stop with no way out.
 
     Returns (report, conn) -- conn is always a LIVE, valid connection on
     return, never the one this function may have closed along the way;
@@ -7796,7 +7892,7 @@ def _heal_code_index_locked(conn, db_path, project, report, verify_content, call
     refresh lock are settled -- split out only so the lock's try/finally
     stays one visible block; see heal_code_index for the contract."""
     langs = ",".join(report["langs"] or [])
-    no_embed = report["embedding_mode"] != "full"
+    no_embed = True  # text-only heal, always -- see heal_code_index's docstring
     # Task 5 decision: matches the actual per-run summary line printed at
     # the end of cmd_code_reindex (see the `code-reindex: {N} files
     # scanned, ... added, ... changed, ... unchanged, ... removed, ...
@@ -8060,7 +8156,7 @@ def cmd_code_refresh(args) -> int:
     t0 = time.monotonic()
     project = args.project
     res = {"outcome": "failed", "reason": "crash", "roots": 0, "unrecorded": 0, "changed": 0,
-           "removed": 0, "healed": 0}
+           "removed": 0, "healed": 0, "embed": "unknown"}
     extra = []
     event, session = "unknown", "unknown"
     try:
@@ -8082,7 +8178,8 @@ def cmd_code_refresh(args) -> int:
     line = (
         f"outcome={res['outcome']} reason={res['reason']} project={project} roots={res['roots']} "
         f"unrecorded={res['unrecorded']} changed={res['changed']} removed={res['removed']} "
-        f"healed={res['healed']} elapsed={elapsed:.1f}s event={event} session={session}"
+        f"healed={res['healed']} elapsed={elapsed:.1f}s event={event} session={session} "
+        f"embed={res['embed']}"
     )
     for item in extra:
         line += " " + " ".join(str(item).split())[:300]
@@ -8110,6 +8207,15 @@ def _refresh_code_index(args, project, db_path, marker, is_stop, res, extra) -> 
 
 
 _CODE_STATES_CURRENT = ("current", "metadata-current")
+
+
+def _kick_code_embed(db_path: Path, project: str, report: dict) -> str:
+    """The refresh hook's embed field: `clean` (nothing awaits a vector), else
+    spawn_code_embed_worker's verdict (`spawned` | `pending` | `off` |
+    `failed`)."""
+    if report.get("awaiting_embedding", 0) <= 0:
+        return "clean"
+    return spawn_code_embed_worker(db_path, project)
 
 
 def _degraded_marker_reason(report: dict) -> str:
@@ -8155,6 +8261,10 @@ def _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, ext
         if report["state"] == "uninitialized":
             res.update(outcome="skip", reason="uninitialized")
             return
+        # TOP-0137 L2 step 5: chunks without a vector get the background
+        # worker, INDEPENDENT of the drift check below (a current index with
+        # zero vectors must be filled too). Costs a Popen, milliseconds.
+        res["embed"] = _kick_code_embed(db_path, project, report)
         needs_heal = report["changed"] > 0 or report["availability_changed"]
         if not needs_heal:
             if report["state"] in _CODE_STATES_CURRENT:
@@ -8186,6 +8296,9 @@ def _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, ext
             conn, db_path, project, report, limit=limit, caller="code-refresh", result=hres, lock_held=True,
         )
         res["healed"] = hres.get("reindexed", 0)
+        if res["embed"] == "clean":
+            # The heal is text-only: whatever it added now awaits a vector.
+            res["embed"] = _kick_code_embed(db_path, project, after)
         if hres["messages"]:
             extra.append("detail=" + "; ".join(hres["messages"]))
         outcome = hres["outcome"]
@@ -8215,6 +8328,161 @@ def _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, ext
             conn.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+# ---------------------------------------------------------------------------
+# code-embed-worker: the code index's background embedding pass (TOP-0137 L2
+# step 5) -- the code twin of embed-worker, same lock/marker/loop skeleton
+# (_run_embed_worker_loop).
+# ---------------------------------------------------------------------------
+
+
+def _code_embed_marker_path(db_path: Path, project: str) -> Path:
+    return Path(db_path).parent / f"{project}.code-embed-pending"
+
+
+def _code_embed_lock_path(db_path: Path, project: str) -> Path:
+    return Path(db_path).parent / f"{project}.code-embed.lock"
+
+
+def _code_embed_log_path(db_path: Path, project: str) -> Path:
+    return Path(db_path).parent / f"{project}.code-embed.log"
+
+
+def cmd_code_embed_worker(args) -> int:
+    """Fills the missing (and stale-fingerprint) vectors of a project's code
+    index in the background; safe to run twice. Spawned detached by
+    `code-embed-worker --spawn` (repo-init, after its first --no-embed
+    code-reindex) and by the code-refresh hook (whenever the index has chunks
+    awaiting embedding); `code-search` never spawns it.
+
+    Lock `<db dir>/<project>.code-embed.lock` (flock, non-blocking: held ->
+    exit 0), marker `<project>.code-embed-pending`, log
+    `<project>.code-embed.log` -- all beside the code db. Per pass it calls
+    cmd_code_reindex(no_embed=False, full=False, retry_not_indexed=False) for
+    every root recorded in `code_meta` that still exists on disk; that call's
+    own unchanged-file top-up finds every chunk without a vector at the
+    current fingerprint, so nothing here looks for stranded chunks itself.
+    Exit 0 on a clean pass (or a held lock), 3 with the traceback (or a
+    failed-open embedding backend) in the log and the marker left in place.
+
+    It does NOT take the code-refresh lock: with batched commits the worker
+    holds the write lock only for the initial stat walk and for each short
+    batch write, and a concurrent heal that replaced chunks mid-batch is
+    handled by the batch write dropping vectors for chunk ids that no longer
+    exist."""
+    db_path = resolve_code_db_path(args)
+    project = args.project
+
+    def run_pass():
+        ro = None
+        try:
+            ro = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            ro.row_factory = sqlite3.Row
+            schema = code_schema_version(ro)
+            if schema != CODE_SCHEMA_VERSION:
+                # open_code_db would DROP and rebuild an older db (and refuses
+                # a newer one): neither is this worker's call.
+                return f"code db schema {schema} != engine schema {CODE_SCHEMA_VERSION}; run code-reindex"
+            roots = [r["code_root"] for r in ro.execute(
+                "SELECT code_root FROM code_meta WHERE project=? ORDER BY code_root", (project,))]
+            row = ro.execute("SELECT langs FROM code_project WHERE project=?", (project,)).fetchone()
+            langs = row["langs"] if row and row["langs"] else None
+        except sqlite3.DatabaseError as exc:
+            return f"code db unreadable ({type(exc).__name__}: {exc})"
+        finally:
+            if ro is not None:
+                ro.close()
+        for root in roots:
+            if not Path(root).is_dir():
+                continue
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                rc = cmd_code_reindex(argparse.Namespace(
+                    code_root=root, drop_root=None, db=str(db_path), project=project, lang=langs,
+                    no_embed=False, full=False, retry_not_indexed=False,
+                ))
+            out = buf.getvalue().strip()
+            try:
+                with _code_embed_log_path(db_path, project).open("a", encoding="utf-8") as fh:
+                    fh.write(f"--- {datetime.now(timezone.utc).isoformat()} code-embed-worker pass {root} rc={rc} ---\n{out}\n")
+            except OSError:
+                pass
+            if rc in (1, 2):
+                return f"code-reindex of {root} failed (rc={rc}); marker left in place for retry"
+            if code_embedding_backend_failed():
+                return "embedding backend failed (code-reindex reported no exception but could not embed); marker left in place for retry"
+        return None
+
+    return _run_embed_worker_loop(
+        _code_embed_lock_path(db_path, project), _code_embed_marker_path(db_path, project),
+        _code_embed_log_path(db_path, project), "code-embed-worker", run_pass,
+    )
+
+
+def spawn_code_embed_worker(db_path: Path, project: str) -> str:
+    """Raise the `<project>.code-embed-pending` marker (create it, or bump its
+    mtime so a RUNNING worker loops again) and, unless one already holds the
+    lock or MEMCONTINUUM_EMBED_WORKER=0, start a detached `code-embed-worker`
+    -- the same python `subprocess.Popen(start_new_session=True, stdin
+    DEVNULL, stdout/stderr -> the worker log, close_fds)` shape as
+    hooks/post-commit-reindex.sh uses for the store (never bash `&`/`setsid`:
+    the watchdog kills its guarded child's whole process group, and the
+    worker must outlive it). Costs milliseconds. Returns `spawned` | `pending`
+    (a worker is already running and will see the marker) | `off` (spawning
+    disabled; the marker is still raised) | `failed` (marker or spawn
+    error). Fail-open: never raises."""
+    marker = _code_embed_marker_path(db_path, project)
+    try:
+        fd = os.open(str(marker), os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        try:
+            os.utime(fd)
+        finally:
+            os.close(fd)
+    except (OSError, NotImplementedError):
+        return "failed"
+    if os.environ.get("MEMCONTINUUM_EMBED_WORKER", "1") == "0":
+        return "off"
+    lock = _code_embed_lock_path(db_path, project)
+    try:
+        lfd = os.open(str(lock), os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    except OSError:
+        return "failed"
+    try:
+        try:
+            fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "pending"
+        fcntl.flock(lfd, fcntl.LOCK_UN)
+    except OSError:
+        return "failed"
+    finally:
+        os.close(lfd)
+    try:
+        log = open(_code_embed_log_path(db_path, project), "ab")
+        try:
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "code-embed-worker",
+                 "--project", project, "--db", str(db_path)],
+                start_new_session=True, stdin=subprocess.DEVNULL, stdout=log, stderr=log, close_fds=True,
+            )
+        finally:
+            log.close()
+    except OSError:
+        return "failed"
+    return "spawned"
+
+
+def cmd_code_embed_worker_entry(args) -> int:
+    """`code-embed-worker` entry: --spawn only raises the marker and starts
+    the detached worker (the form repo-init calls); without it, this process
+    IS the worker."""
+    if getattr(args, "spawn", False):
+        db_path = resolve_code_db_path(args)
+        state = spawn_code_embed_worker(db_path, args.project)
+        print(f"code-embed-worker: {state}")
+        return 0 if state != "failed" else 1
+    return cmd_code_embed_worker(args)
 
 
 def cmd_code_search(args) -> int:
@@ -8386,6 +8654,16 @@ def cmd_code_search(args) -> int:
             "results may be incomplete",
             file=sys.stderr,
         )
+    # TOP-0137 L2 step 5: vectors still being filled in the background. The
+    # search above ranked over the vectors present (an FTS-only chunk still
+    # ranks through the FTS channel); this only says so. code-search never
+    # spawns the worker -- the refresh hook and repo-init do.
+    if args.mode in ("vector", "hybrid") and not embed_state and report["awaiting_embedding"] > 0:
+        print(
+            f"code-search: {report['awaiting_embedding']} of {report['chunk_total']} chunks have no "
+            "vector; the background embed worker fills them",
+            file=sys.stderr,
+        )
 
     results = results[: args.limit]
 
@@ -8480,6 +8758,7 @@ def cmd_code_search(args) -> int:
             "failed": report["failed"],
             "not_indexed": report["not_indexed"],
             "embedding_mode": report["embedding_mode"],
+            "awaiting_embedding": report["awaiting_embedding"],
             # Design R4 (audit MC-P1-06): the stored fingerprint, always
             # present (None on a project never embedded) -- independent of
             # mode, so a caller can see it without a mismatch happening.
@@ -9849,6 +10128,19 @@ def main(argv=None) -> int:
     )
     add_common_args(p_embed_worker, need_root=True)
     p_embed_worker.set_defaults(func=cmd_embed_worker)
+
+    p_code_embed_worker = sub.add_parser(
+        "code-embed-worker",
+        help="fill the missing embeddings of a project's code index in the background; "
+             "safe to run twice; --spawn raises the marker and starts it detached",
+    )
+    add_common_args(p_code_embed_worker)
+    p_code_embed_worker.add_argument(
+        "--spawn", action="store_true",
+        help="raise the pending marker and start the worker detached (honours "
+             "MEMCONTINUUM_EMBED_WORKER=0), then return at once",
+    )
+    p_code_embed_worker.set_defaults(func=cmd_code_embed_worker_entry)
 
     p_search = sub.add_parser("search")
     add_common_args(p_search, optional_root=True)

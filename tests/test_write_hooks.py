@@ -6326,7 +6326,11 @@ class TestCodeRefreshHook(HookTestBase):
         self.assertEqual(rc, 0)
 
     def refresh_env(self, **overrides):
-        merged = {"MEMCONTINUUM_CODE_ROOTS": json.dumps([str(self.code_root)])}
+        # TOP-0137 L2 step 5: the hook spawns a detached code-embed-worker
+        # whenever chunks await a vector; off by default here so no test
+        # loads a real model by accident (the embed tests override it).
+        merged = {"MEMCONTINUUM_CODE_ROOTS": json.dumps([str(self.code_root)]),
+                  "MEMCONTINUUM_EMBED_WORKER": "0"}
         merged.update(overrides)
         return self.base_env(**merged)
 
@@ -6401,6 +6405,123 @@ class TestCodeRefreshHook(HookTestBase):
         self.assertIn("outcome=skip reason=uninitialized", line)
         self.assertFalse(self.db.exists(), "the hook must never create a code db")
         self.assertFalse(self.marker.exists())
+
+    # -- TOP-0137 L2 step 5: the embed worker spawn -------------------------
+
+    def record_popen_python(self):
+        """A MEMCONTINUUM_PYTHON wrapper whose code-refresh run records the
+        argv of every subprocess.Popen instead of starting it (so no worker,
+        and no model, ever runs); returns (python, record_file)."""
+        rec = Path(self.td) / "popen-record.jsonl"
+        py = self.patched_python(
+            "import json\n"
+            "_real_popen = memidx.subprocess.Popen\n"
+            "class _P:\n"
+            "    def __new__(cls, argv, **kw):\n"
+            "        if 'code-embed-worker' not in list(argv):\n"
+            "            return _real_popen(argv, **kw)\n"
+            f"        open({str(rec)!r}, 'a').write(json.dumps({{'argv': argv, 'new_session': kw.get('start_new_session')}}) + '\\n')\n"
+            "        return object.__new__(cls)\n"
+            "memidx.subprocess.Popen = _P\n"
+        )
+        return py, rec
+
+    def embed_marker(self):
+        return self.home / f"{self.project}.code-embed-pending"
+
+    def build_chunky_index(self):
+        """The fixture repo's files are comment-only (zero chunks, nothing to
+        embed): give one real functions, then index."""
+        _write(self.code_root / "src" / "mapped.py", "def alpha():\n    return 1\n\n\ndef beta():\n    return 2\n")
+        self.build_code_index()
+
+    def test_stop_spawns_the_embed_worker_for_a_current_index_with_no_vectors(self):
+        self.build_chunky_index()
+        py, rec = self.record_popen_python()
+        line, _ = self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_PYTHON=py, MEMCONTINUUM_EMBED_WORKER="1"))
+        self.assertIn("outcome=skip reason=current", line)
+        self.assertTrue(line.endswith("embed=spawned"), line)
+        calls = [json.loads(l) for l in rec.read_text().splitlines()]
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(calls[0]["argv"][2:], ["code-embed-worker", "--project", self.project, "--db", str(self.db)])
+        self.assertTrue(calls[0]["new_session"])
+        self.assertTrue(self.embed_marker().exists())
+
+    def test_session_start_spawns_it_too(self):
+        self.build_chunky_index()
+        py, rec = self.record_popen_python()
+        line, _ = self.run_hook("SessionStart", env=self.refresh_env(MEMCONTINUUM_PYTHON=py, MEMCONTINUUM_EMBED_WORKER="1"))
+        self.assertIn("event=SessionStart", line)
+        self.assertTrue(line.endswith("embed=spawned"), line)
+        self.assertEqual(len(rec.read_text().splitlines()), 1)
+
+    def test_embed_worker_off_raises_the_marker_but_spawns_nothing(self):
+        self.build_chunky_index()
+        py, rec = self.record_popen_python()
+        line, _ = self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_PYTHON=py, MEMCONTINUUM_EMBED_WORKER="0"))
+        self.assertTrue(line.endswith("embed=off"), line)
+        self.assertFalse(rec.exists(), "MEMCONTINUUM_EMBED_WORKER=0 must not spawn")
+        self.assertTrue(self.embed_marker().exists())
+
+    def test_no_second_spawn_while_the_worker_lock_is_held(self):
+        self.build_chunky_index()
+        py, rec = self.record_popen_python()
+        fd = os.open(str(self.home / f"{self.project}.code-embed.lock"), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            line, _ = self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_PYTHON=py, MEMCONTINUUM_EMBED_WORKER="1"))
+        finally:
+            os.close(fd)
+        self.assertTrue(line.endswith("embed=pending"), line)
+        self.assertFalse(rec.exists())
+
+    def test_nothing_awaiting_is_clean_and_spawns_nothing(self):
+        self.build_chunky_index()
+        fp = memidx.embedding_fingerprint(model=None).replace("revision=unknown", "revision=r1")
+        conn = memidx.open_code_db(self.db)
+        for (cid,) in conn.execute("SELECT id FROM chunks").fetchall():
+            conn.execute("INSERT INTO embeddings (chunk_id, project, dim, vector, embed_fp) VALUES (?,?,?,?,?)",
+                         (cid, self.project, 4, memidx.pack_vector([0.1, 0.2, 0.3, 0.4]), fp))
+        conn.commit(); conn.close()
+        py, rec = self.record_popen_python()
+        line, _ = self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_PYTHON=py, MEMCONTINUUM_EMBED_WORKER="1"))
+        self.assertTrue(line.endswith("embed=clean"), line)
+        self.assertFalse(rec.exists())
+        self.assertFalse(self.embed_marker().exists())
+
+    def test_a_heal_that_adds_chunks_spawns_after_the_heal_on_stop(self):
+        self.build_chunky_index()
+        fp = memidx.embedding_fingerprint(model=None).replace("revision=unknown", "revision=r1")
+        conn = memidx.open_code_db(self.db)
+        for (cid,) in conn.execute("SELECT id FROM chunks").fetchall():
+            conn.execute("INSERT INTO embeddings (chunk_id, project, dim, vector, embed_fp) VALUES (?,?,?,?,?)",
+                         (cid, self.project, 4, memidx.pack_vector([0.1, 0.2, 0.3, 0.4]), fp))
+        conn.commit(); conn.close()
+        (self.code_root / "src" / "mapped.py").write_text("def brand_new_symbol():\n    return 1\n")
+        py, rec = self.record_popen_python()
+        line, _ = self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_PYTHON=py, MEMCONTINUUM_EMBED_WORKER="1"))
+        self.assertIn("outcome=refreshed reason=healed", line)
+        self.assertIn(" embed=spawned", line)
+        self.assertEqual(len(rec.read_text().splitlines()), 1)
+
+    @unittest.skipUnless(os.environ.get("MEMCONTINUUM_TEST_EMBED_CACHE"),
+                         "set $MEMCONTINUUM_TEST_EMBED_CACHE to a fastembed cache dir to run the real worker")
+    def test_the_spawned_worker_really_fills_the_index(self):
+        self.build_chunky_index()
+        cache = os.environ["MEMCONTINUUM_TEST_EMBED_CACHE"]
+        line, _ = self.run_hook("Stop", env=self.refresh_env(
+            MEMCONTINUUM_EMBED_WORKER="1", FASTEMBED_CACHE_PATH=cache))
+        self.assertTrue(line.endswith("embed=spawned"), line)
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline and self.embed_marker().exists():
+            time.sleep(0.5)
+        self.assertFalse(self.embed_marker().exists(), "the worker never finished")
+        conn = memidx.open_code_db(self.db)
+        try:
+            report = memidx.code_index_report(conn, self.project)
+        finally:
+            conn.close()
+        self.assertEqual((report["embedding_mode"], report["awaiting_embedding"]), ("full", 0))
 
     def test_current_index_skips(self):
         self.build_code_index()

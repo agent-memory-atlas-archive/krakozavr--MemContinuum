@@ -840,8 +840,9 @@ class TestMultiRootReindex(unittest.TestCase):
             with contextlib.redirect_stdout(buf):
                 code_reindex(b, db, lang="python", no_embed=True)           # adds chunks without vectors
             mode, chunks, embedded = self._coverage(db)
-            self.assertEqual(mode, "none"); self.assertEqual(chunks, 2); self.assertEqual(embedded, 1)
-            self.assertIn("embedding mode set to none", buf.getvalue())
+            self.assertEqual(mode, "partial"); self.assertEqual(chunks, 2); self.assertEqual(embedded, 1)
+            self.assertIn("embedding mode set to partial", buf.getvalue())
+            self.assertIn("1 chunk(s) awaiting embedding", buf.getvalue())
             code_reindex(b, db, lang="python", no_embed=False)              # restores coverage
             self.assertEqual(self._coverage(db), ("full", 2, 2))
 
@@ -874,30 +875,27 @@ class TestMultiRootReindex(unittest.TestCase):
 
             buf1 = io.StringIO()
             with contextlib.redirect_stdout(buf1):
-                code_reindex(b, db, lang="python", no_embed=True)       # B: no-embed -> downgrades to none
-            self.assertEqual(self._coverage(db), ("none", 2, 1))
-            self.assertIn("embedding mode set to none", buf1.getvalue())
+                code_reindex(b, db, lang="python", no_embed=True)       # B: no-embed -> downgrades to partial
+            self.assertEqual(self._coverage(db), ("partial", 2, 1))
+            self.assertIn("embedding mode set to partial", buf1.getvalue())
 
             buf2 = io.StringIO()
             with contextlib.redirect_stdout(buf2):
                 code_reindex(a, db, lang="python", no_embed=False)      # A again, embedded, NO edits
             mode, chunks, embedded = self._coverage(db)
-            self.assertEqual((mode, chunks, embedded), ("none", 2, 1))  # still none: B's chunk is still bare
-            self.assertIn(
-                "chunk(s) in other roots have no embedding; embedding mode stays none",
-                buf2.getvalue(),
-            )
+            self.assertEqual((mode, chunks, embedded), ("partial", 2, 1))  # still partial: B's chunk is still bare
+            self.assertTrue(buf2.getvalue().rstrip().endswith("1 chunk(s) awaiting embedding"), buf2.getvalue())
 
             buf3 = io.StringIO()
             with contextlib.redirect_stdout(buf3):
                 code_reindex(b, db, lang="python", no_embed=False)      # B embedded too -> now genuinely full
             self.assertEqual(self._coverage(db), ("full", 2, 2))
-            self.assertNotIn("chunk(s) in other roots", buf3.getvalue())
+            self.assertTrue(buf3.getvalue().rstrip().endswith("0 chunk(s) awaiting embedding"), buf3.getvalue())
 
     def test_no_embed_root_then_embedded_root_then_no_embed_original_stays_full(self):
         """The other order from finding 1: root A --no-embed, root B
         embedded -> project-wide coverage is still incomplete (A's chunk
-        has no vector) so mode reads none + the cross-root line; embedding
+        has no vector) so mode reads partial + counts it as awaiting; embedding
         A afterwards makes coverage complete -> full."""
         with tempfile.TemporaryDirectory() as td:
             a, b, db = self._mk(td)
@@ -906,8 +904,8 @@ class TestMultiRootReindex(unittest.TestCase):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 code_reindex(b, db, lang="python", no_embed=False)      # B embedded, A still bare
-            self.assertEqual(self._coverage(db), ("none", 2, 1))
-            self.assertIn("chunk(s) in other roots have no embedding", buf.getvalue())
+            self.assertEqual(self._coverage(db), ("partial", 2, 1))
+            self.assertTrue(buf.getvalue().rstrip().endswith("1 chunk(s) awaiting embedding"), buf.getvalue())
             code_reindex(a, db, lang="python", no_embed=False)          # A embedded -> now full
             self.assertEqual(self._coverage(db), ("full", 2, 2))
 
@@ -3421,7 +3419,7 @@ class TestHealOnSearch(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT count(*) FROM chunks WHERE code_root=?", (str(b.resolve()),)).fetchone()[0], 1)
             self.assertEqual(memidx.code_index_report(conn, memidx.DEFAULT_PROJECT)["state"], "degraded")   # never current while b is missing
 
-    def test_heal_follows_embedding_mode(self):
+    def test_heal_of_an_unembedded_project_adds_no_vectors(self):
         with tempfile.TemporaryDirectory() as td:
             root, db = self._stale_tree(td)                       # mode none
             self._run(db, "new_name")
@@ -5549,6 +5547,253 @@ class TestHealSharedWithCodeRefresh(unittest.TestCase):
             self.assertIn("a code-index refresh is already running", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
             self.assertNotIn("heal failed", r.stderr)
+
+
+class _FakeEmbedModel:
+    """A stand-in for a fastembed TextEmbedding: deterministic 384-dim one-hot
+    vectors, a revision (via `model._model_dir`, what embedding_fingerprint
+    reads) and no model download."""
+
+    def __init__(self, rev="r1"):
+        self.model = SimpleNamespace(_model_dir=f"/fake-cache/{rev}")
+
+    @staticmethod
+    def _vec(text):
+        v = [0.0] * memidx.EMBED_DIM
+        v[int(hashlib.sha256(text.encode()).hexdigest(), 16) % memidx.EMBED_DIM] = 1.0
+        return v
+
+    def embed(self, texts):
+        return [self._vec(t) for t in texts]
+
+    def query_embed(self, texts):
+        return [self._vec(t) for t in texts]
+
+
+def _fake_model_patch(rev="r1"):
+    model = _FakeEmbedModel(rev)
+    return mock.patch.object(
+        memidx, "load_embedding_model", side_effect=lambda: (model, memidx.embedding_fingerprint(model))
+    )
+
+
+class TestCodeEmbedWorker(unittest.TestCase):
+    """TOP-0137 L2 step 5: the code index's background embedding lifecycle --
+    code-embed-worker (lock + marker + log, batched commits), the three
+    embedding modes recomputed from real coverage, the text-only heal and
+    partial-coverage search. Temp db dirs only; the model is a fake."""
+
+    PROJECT = memidx.DEFAULT_PROJECT
+
+    def _index(self, td, n=3, embed=False):
+        root = Path(td) / "code"; root.mkdir()
+        for i in range(n):
+            (root / f"m{i}.py").write_text(f"def func_{i}():\n    return {i}\n")
+        db = Path(td) / "idx-code.sqlite"
+        if embed:
+            with _fake_model_patch(), contextlib.redirect_stdout(io.StringIO()):
+                code_reindex(root, db, lang="python", no_embed=False)
+        else:
+            with contextlib.redirect_stdout(io.StringIO()):
+                code_reindex(root, db, lang="python")
+        return root, db
+
+    def _marker(self, db):
+        return memidx._code_embed_marker_path(db, self.PROJECT)
+
+    def _args(self, db, **kw):
+        return SimpleNamespace(project=self.PROJECT, db=str(db), spawn=False, **kw)
+
+    def _worker(self, db, **patches):
+        self._marker(db).touch()
+        with _fake_model_patch(), contextlib.redirect_stdout(io.StringIO()):
+            return memidx.cmd_code_embed_worker(self._args(db))
+
+    def _state(self, db):
+        conn = memidx.open_code_db(db)
+        try:
+            report = memidx.code_index_report(conn, self.PROJECT)
+            chunks = conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
+            vecs = conn.execute("SELECT count(*) FROM chunks c JOIN embeddings e ON e.chunk_id=c.id").fetchone()[0]
+            mode = conn.execute("SELECT embedding_mode FROM code_project").fetchone()[0]
+        finally:
+            conn.close()
+        return mode, chunks, vecs, report["awaiting_embedding"]
+
+    def test_worker_fills_a_bare_index_and_sets_full(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._index(td)
+            self.assertEqual(self._state(db), ("none", 3, 0, 3))
+            self.assertEqual(self._worker(db), 0)
+            self.assertEqual(self._state(db), ("full", 3, 3, 0))
+            self.assertFalse(self._marker(db).exists(), "a clean pass removes the marker")
+            log = memidx._code_embed_log_path(db, self.PROJECT).read_text()
+            self.assertIn("code-embed-worker pass", log)
+            self.assertTrue(log.rstrip().splitlines()[-1].endswith("0 chunk(s) awaiting embedding"), log)
+
+    def test_worker_exits_0_at_once_when_the_lock_is_held(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._index(td)
+            self._marker(db).touch()
+            fd = os.open(str(memidx._code_embed_lock_path(db, self.PROJECT)), os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with _fake_model_patch():
+                    rc = memidx.cmd_code_embed_worker(self._args(db))
+            finally:
+                os.close(fd)
+            self.assertEqual(rc, 0)
+            self.assertTrue(self._marker(db).exists(), "the running worker owns the marker")
+            self.assertEqual(self._state(db)[2], 0, "a worker that lost the lock embeds nothing")
+
+    def test_a_pass_killed_after_the_first_batch_keeps_its_vectors_and_the_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._index(td, n=5)
+            calls = []
+
+            def die_on_second(texts, model=None):
+                calls.append(len(texts))
+                if len(calls) == 2:
+                    raise KeyboardInterrupt  # not an Exception: nothing fails open around it
+                return _FakeEmbedModel().embed(texts)
+
+            self._marker(db).touch()
+            with _fake_model_patch(), mock.patch.object(memidx, "CODE_EMBED_BATCH", 2), \
+                 mock.patch.object(memidx, "compute_embeddings", side_effect=die_on_second), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(KeyboardInterrupt):
+                    memidx.cmd_code_embed_worker(self._args(db))
+            self.assertEqual(calls, [2, 2])
+            mode, chunks, vecs, awaiting = self._state(db)
+            self.assertEqual((mode, chunks, vecs, awaiting), ("partial", 5, 2, 3))
+            self.assertTrue(self._marker(db).exists(), "a killed pass leaves the marker for a retry")
+            # the lock was released (the interpreter would hold it otherwise)
+            self.assertEqual(self._worker(db), 0)
+            self.assertEqual(self._state(db), ("full", 5, 5, 0))
+
+    def test_a_failed_open_backend_leaves_the_marker_and_exits_3(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._index(td)
+            self._marker(db).touch()
+            with mock.patch.object(memidx, "load_embedding_model", side_effect=RuntimeError("no fastembed")), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                rc = memidx.cmd_code_embed_worker(self._args(db))
+            self.assertEqual(rc, 3)
+            self.assertTrue(self._marker(db).exists())
+            self.assertIn("embedding backend failed", memidx._code_embed_log_path(db, self.PROJECT).read_text())
+
+    def test_no_embed_mutation_on_a_full_project_is_partial_with_the_count_then_worker_restores_full(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._index(td, embed=True)
+            self.assertEqual(self._state(db), ("full", 3, 3, 0))
+            (root / "extra.py").write_text("def extra_one():\n    return 1\n\n\ndef extra_two():\n    return 2\n")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code_reindex(root, db, lang="python", no_embed=True)
+            self.assertEqual(self._state(db), ("partial", 5, 3, 2))
+            out = buf.getvalue()
+            self.assertTrue(out.splitlines()[0].endswith("2 chunk(s) awaiting embedding"), out)
+            self.assertIn("embedding mode set to partial", out)
+            self.assertEqual(self._worker(db), 0)
+            self.assertEqual(self._state(db), ("full", 5, 5, 0))
+
+    def test_a_stale_fingerprint_counts_as_awaiting_and_the_worker_reembeds_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._index(td, embed=True)
+            conn = memidx.open_code_db(db)
+            conn.execute("UPDATE embeddings SET embed_fp='model=BAAI/bge-small-en-v1.5;dim=384;pipeline=1;"
+                         "prefix=none;norm=l2;fastembed=0.8.0;revision=old'")
+            conn.commit(); conn.close()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                code_reindex(root, db, lang="python", no_embed=True)
+            self.assertTrue(buf.getvalue().splitlines()[0].endswith("3 chunk(s) awaiting embedding"), buf.getvalue())
+            self.assertEqual(self._state(db), ("none", 3, 3, 3))
+            self.assertEqual(self._worker(db), 0)
+            self.assertEqual(self._state(db), ("full", 3, 3, 0))
+            conn = memidx.open_code_db(db)
+            fps = {r[0] for r in conn.execute("SELECT embed_fp FROM embeddings")}
+            conn.close()
+            self.assertEqual(len(fps), 1)
+            self.assertIn("revision=r1", fps.pop())
+
+    def test_heal_never_embeds_a_full_project_is_partial_until_the_worker_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._index(td, embed=True)
+            (root / "m0.py").write_text("def func_0_renamed():\n    return 0\n")
+            os.utime(root / "m0.py", (time.time() + 3600,) * 2)
+            conn = memidx.open_code_db(db)
+            report = memidx.code_index_report(conn, self.PROJECT)
+            self.assertEqual(report["embedding_mode"], "full")
+            out = {}
+            with mock.patch.object(memidx, "compute_embeddings", side_effect=AssertionError("heal embedded")), \
+                 mock.patch.object(memidx, "load_embedding_model", side_effect=AssertionError("heal loaded a model")):
+                after, conn = memidx.heal_code_index(conn, db, self.PROJECT, report, limit=500, result=out)
+            conn.close()
+            self.assertEqual(out["outcome"], "healed")
+            self.assertEqual(after["embedding_mode"], "partial")
+            self.assertEqual(after["awaiting_embedding"], 1)
+            self.assertEqual(self._worker(db), 0)
+            self.assertEqual(self._state(db), ("full", 3, 3, 0))
+
+    def _search(self, db, query, mode="hybrid"):
+        out, err = io.StringIO(), io.StringIO()
+        args = SimpleNamespace(
+            db=str(db), project=self.PROJECT, query=query, mode=mode, limit=10, json=True, decision_db=None,
+            no_heal=True, heal_limit=500, verify_content=False,
+        )
+        with _fake_model_patch(), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = memidx.cmd_code_search(args)
+        self.assertEqual(rc, 0, err.getvalue())
+        return json.loads(out.getvalue()), err.getvalue()
+
+    def test_hybrid_search_on_a_partial_index_still_returns_fts_only_chunks(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._index(td, embed=True)
+            (root / "fresh.py").write_text("def zebra_unique():\n    return 9\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code_reindex(root, db, lang="python", no_embed=True)
+            for mode in ("hybrid", "vector"):
+                data, err = self._search(db, "zebra_unique", mode=mode)
+                self.assertEqual(data["embedding_mode"], "partial")
+                self.assertEqual(data["awaiting_embedding"], 1)
+                self.assertIn("1 of 4 chunks have no vector; the background embed worker fills them", err)
+            data, err = self._search(db, "zebra_unique", mode="hybrid")
+            self.assertEqual(data["results"][0]["qualified_name"], "zebra_unique", data["results"])
+            # nothing awaiting -> no notice
+            self.assertEqual(self._worker(db), 0)
+            data, err = self._search(db, "zebra_unique")
+            self.assertEqual((data["embedding_mode"], data["awaiting_embedding"]), ("full", 0))
+            self.assertNotIn("have no vector", err)
+
+    def test_spawn_states(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._index(td)
+            popen = mock.Mock()
+            with mock.patch.dict(os.environ, {"MEMCONTINUUM_EMBED_WORKER": "0"}), \
+                 mock.patch.object(memidx.subprocess, "Popen", popen):
+                self.assertEqual(memidx.spawn_code_embed_worker(db, self.PROJECT), "off")
+            self.assertTrue(self._marker(db).exists(), "off still raises the marker")
+            popen.assert_not_called()
+            env = {k: v for k, v in os.environ.items() if k != "MEMCONTINUUM_EMBED_WORKER"}
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(memidx.subprocess, "Popen", popen):
+                self.assertEqual(memidx.spawn_code_embed_worker(db, self.PROJECT), "spawned")
+                argv = popen.call_args.args[0]
+                self.assertEqual(argv[1:], [str(Path(memidx.__file__).resolve()), "code-embed-worker",
+                                             "--project", self.PROJECT, "--db", str(db)])
+                self.assertTrue(popen.call_args.kwargs["start_new_session"])
+                self.assertIs(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+                self.assertTrue(popen.call_args.kwargs["close_fds"])
+                popen.reset_mock()
+                fd = os.open(str(memidx._code_embed_lock_path(db, self.PROJECT)), os.O_CREAT | os.O_RDWR, 0o644)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.assertEqual(memidx.spawn_code_embed_worker(db, self.PROJECT), "pending")
+                finally:
+                    os.close(fd)
+                popen.assert_not_called()
 
 
 if __name__ == "__main__":
