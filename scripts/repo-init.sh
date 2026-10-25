@@ -1715,6 +1715,22 @@ if [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ] && [ -n "$CHOSEN_LANGS" ]; then
             [ "$rc" -ne 0 ] && CODE_REINDEX_RC=$rc
         fi
     done
+    # TOP-0137 L2 step 5: the first code-reindex above is --no-embed so the
+    # install stays fast; the vectors are filled by a detached
+    # code-embed-worker (memidx.py spawns it: python subprocess.Popen in a new
+    # session, MEMCONTINUUM_EMBED_WORKER=0 disables it). Spawned once for the
+    # project, after every root is indexed, and only when they all succeeded.
+    CODE_EMBED_CMD=("$PYTHON_BIN" "$MEMIDX" code-embed-worker --project "$PROJECT" --spawn)
+    step "code-embed-worker: PYTHONPATH= ${CODE_EMBED_CMD[*]}"
+    if [ "$DRY_RUN" -eq 0 ] && [ "$CODE_REINDEX_RC" -eq 0 ]; then
+        embed_out="$(PYTHONPATH= "${CODE_EMBED_CMD[@]}" 2>&1)" || true
+        case "$embed_out" in
+            *": spawned")
+                echo "Code embeddings: filling in the background (${embed_out}); code-search is text-only until the vectors land" ;;
+            *)
+                echo "Code embeddings: not started (${embed_out:-no answer}); code-search is text-only, the code-refresh hook starts the worker later" ;;
+        esac
+    fi
 elif [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ]; then
     step "code-reindex: skipped (language-less wiring, no languages chosen)"
 fi

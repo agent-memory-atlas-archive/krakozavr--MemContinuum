@@ -52,6 +52,10 @@ def clean_env(home, extra=None):
             del env[k]
     env.pop("PYTHONPATH", None)
     env["HOME"] = home
+    # repo-init (every setUp here) would otherwise spawn a detached
+    # code-embed-worker into the temp HOME, whose lock/log/marker activity
+    # races the "plain run writes nothing under HOME" snapshot.
+    env["MEMCONTINUUM_EMBED_WORKER"] = "0"
     if VENV_PYTHON:
         env["MEMCONTINUUM_PYTHON"] = VENV_PYTHON
     if extra:

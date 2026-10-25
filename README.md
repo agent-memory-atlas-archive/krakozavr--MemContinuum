@@ -217,7 +217,7 @@ wrong. Pick its one home.
   Python snippets stay on the standard library plus `PyYAML`, so they are
   content with the older Python macOS ships. A `sqlite3` with FTS5, which
   Python's own `sqlite3` module provides — nothing to install separately.
-- ~100 MB of disk for the embedding model, downloaded once the first time
+- ~150 MB of disk for the embedding model, downloaded once the first time
   something actually needs to embed. `--no-embed` and `--mode fts` never trigger
   that download; neither does committing to the store -- the store's
   `post-commit` hook runs a bounded, content-only pass and never touches the
@@ -254,7 +254,7 @@ bash memcontinuum-setup.sh [--venv DIR] [--python PATH] [--claude-dir DIR]
 `--venv DIR` creates the venv (default `<checkout>/.venv`), or `--python PATH`
 uses an existing one that already has `requirements.txt` installed.
 `--claude-dir DIR` says where the user-level pieces go (default `~/.claude`).
-`--no-model-warm` skips the one-time ~100 MB model download — it is on by
+`--no-model-warm` skips the one-time ~150 MB model download — it is on by
 default because, left lazy, that download lands inside somebody's first reindex,
 where it looks like a hang. `--dry-run` prints the plan and writes nothing.
 
@@ -424,7 +424,7 @@ the two.
 
 **The commands a person actually types.** The store's own `README.md` lists
 most of these with your paths already filled in — not the code-index or
-maintenance commands (`code-search`, `code-reindex`, `embed-worker`, `stats`,
+maintenance commands (`code-search`, `code-reindex`, `embed-worker`, `code-embed-worker`, `stats`,
 `backend-preflight`):
 
 ```bash
@@ -438,6 +438,7 @@ memidx.py drift --code-root DIR --project NAME                                  
 memidx.py reindex --root STORE --project NAME                                    # after editing the store by hand
 memidx.py embed-worker --root STORE --project NAME --db DB                       # run the background embed backfill by hand
 memidx.py code-reindex --code-root DIR --project NAME                            # after the code moved on
+memidx.py code-embed-worker --project NAME                                       # fill the code index's vectors by hand (normally a background job)
 memidx.py stats --project NAME [--days 7] [--store DIR]                          # is retrieval actually firing?
 memidx.py backend-preflight [--json]                                             # which backends import here, and do their versions match the pins?
 memlint.py STORE --code-root DIR                                                 # validate records

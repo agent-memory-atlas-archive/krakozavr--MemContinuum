@@ -76,6 +76,9 @@ def run_install(args, home, timeout=60, python=VENV_PYTHON, extra_env=None, cwd=
         if k.startswith("MEMCONTINUUM_"):
             del env[k]
     env["HOME"] = home
+    # TOP-0137 L2 step 5: repo-init spawns a detached code-embed-worker after
+    # its first code-reindex; no test in this file wants a real model loaded.
+    env["MEMCONTINUUM_EMBED_WORKER"] = "0"
     if python is not None:
         env["MEMCONTINUUM_PYTHON"] = python
     if extra_env:
@@ -114,6 +117,9 @@ def run_install_at(install_sh, args, home, path_prepend=None, timeout=60, python
         if k.startswith("MEMCONTINUUM_"):
             del env[k]
     env["HOME"] = home
+    # TOP-0137 L2 step 5: repo-init spawns a detached code-embed-worker after
+    # its first code-reindex; no test in this file wants a real model loaded.
+    env["MEMCONTINUUM_EMBED_WORKER"] = "0"
     if python is not None:
         env["MEMCONTINUUM_PYTHON"] = python
     if path_prepend:
@@ -3558,6 +3564,46 @@ class TestCodeCensusAndConsentDialogue(unittest.TestCase):
             conn.close()
             self.assertIsNotNone(row, "no code_project row for project widgetco")
             self.assertEqual(row[0], "python")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_a2_first_code_reindex_stays_no_embed_and_then_spawns_the_embed_worker(self):
+        """TOP-0137 L2 step 5: the install stays fast (--no-embed) and one
+        `code-embed-worker --spawn` call -- the python Popen helper in memidx,
+        which MEMCONTINUUM_EMBED_WORKER=0 (set by run_install_at) turns off --
+        follows the last root's code-reindex."""
+        home = sandbox_home()
+        try:
+            store = str(Path(home) / "store")
+            code_root = make_python_and_cs_corpus(Path(home) / "code")
+            claude_dir = Path(home) / ".claude"
+            record = Path(home) / "python-argv.log"
+            wrapper = Path(home) / "recording-python"
+            wrapper.write_text(
+                "#!/usr/bin/env bash\n"
+                f'printf "%s\\n" "$*" >> "{record}"\n'
+                f'exec "{VENV_PYTHON}" "$@"\n'
+            )
+            wrapper.chmod(0o755)
+            proc = run_install_at(
+                INSTALL_SH,
+                ["--project", "widgetco", "--store", store, "--code-root", str(code_root),
+                 "--claude-dir", str(claude_dir), "--langs", "python", "--non-interactive"],
+                home, python=str(wrapper),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            calls = [l for l in record.read_text().splitlines() if " code-" in l]
+            reindex = [i for i, l in enumerate(calls) if " code-reindex " in l]
+            spawn = [i for i, l in enumerate(calls) if " code-embed-worker " in l]
+            self.assertEqual(len(reindex), 1, calls)
+            self.assertIn("--no-embed", calls[reindex[0]])
+            self.assertEqual(len(spawn), 1, calls)
+            self.assertGreater(spawn[0], reindex[0])
+            self.assertTrue(calls[spawn[0]].endswith("code-embed-worker --project widgetco --spawn"), calls[spawn[0]])
+            self.assertIn("Code embeddings: not started (code-embed-worker: off)", proc.stdout)
+            # EMBED_WORKER=0 still raises the marker for the hook / a later run
+            marker = Path(home) / ".memcontinuum" / "widgetco.code-embed-pending"
+            self.assertTrue(marker.exists())
         finally:
             shutil.rmtree(home, ignore_errors=True)
 

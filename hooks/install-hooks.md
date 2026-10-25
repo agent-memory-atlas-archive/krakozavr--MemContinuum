@@ -438,15 +438,27 @@ Rendered from `templates/code-refresh-hook.json.tmpl` for a project that has at 
 
 | Event | What it does | Budget |
 |---|---|---|
-| `Stop` | the existing preflight (`code_index_report`: stat signals, sha on drift, git HEAD trigger), then the same incremental text heal `code-search` makes (`heal_code_index`, no embeddings) | `MEMCONTINUUM_CODE_REFRESH_BUDGET`, default 8 s |
+| `Stop` | the existing preflight (`code_index_report`: stat signals, sha on drift, git HEAD trigger), then the same incremental text heal `code-search` makes (`heal_code_index`, text-only, never embeds) | `MEMCONTINUUM_CODE_REFRESH_BUDGET`, default 8 s |
 | `SessionStart` | preflight only, never a reindex; a stale report writes the marker | 2 s |
 
 - **Silent.** The script prints nothing on any path (a `Stop` hook's output is fed back to the
   model) and always exits 0. The one place its result goes is `hook.log`:
   `<ts> code-refresh outcome=<refreshed|skip|failed> reason=… project=P roots=N unrecorded=N
-  changed=N removed=N healed=N elapsed=Xs event=<Stop|SessionStart> session=S [detail=…]`.
+  changed=N removed=N healed=N elapsed=Xs event=<Stop|SessionStart> session=S
+  embed=<spawned|pending|clean|off|failed|unknown> [detail=…]`.
   Skip reasons: `uninitialized` (no code db yet, or no recorded root), `current`, `degraded`
   (nothing left to repair), `locked`, `stale-marked` (SessionStart found the index behind).
+- **Embeddings are a background job (`embed=`).** On BOTH events, once the preflight has found an
+  initialised index, the hook looks at `awaiting_embedding` (chunks without a vector at the current
+  model fingerprint) and, when it is above 0, raises `$MEMCONTINUUM_HOME/<project>.code-embed-pending`
+  and starts a detached `memidx.py code-embed-worker` (python `subprocess.Popen` in a new session,
+  stdio to `<project>.code-embed.log`; milliseconds, no change to the hook's budget), independent of
+  whether the index is current. `embed=spawned` started one, `pending` means a worker already holds
+  `<project>.code-embed.lock`, `clean` nothing awaits a vector, `off` is `MEMCONTINUUM_EMBED_WORKER=0`
+  (the marker is still raised), `failed` a marker or spawn error, `unknown` a run that ended earlier.
+  On `Stop` it looks again after the heal, which adds unembedded chunks. The worker fills them in
+  batches of 128; `code-search` ranks over the vectors present meanwhile and says how many are missing.
+  This is also how an index created before this release, with no vectors, fills itself.
 - **First index stays explicit.** A root with no recorded index is counted (`unrecorded=`) and
   left alone: `memidx.py code-reindex --lang …` is still how a root is first indexed.
 - **Marker.** `$MEMCONTINUUM_HOME/<project>.code-stale` holds `reason=<r> since=<iso> roots=<n>`.
