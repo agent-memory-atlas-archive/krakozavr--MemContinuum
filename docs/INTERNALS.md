@@ -499,7 +499,7 @@ that shape: nothing was compared). `memidx.py stats` reports these under a
 every other hook kind — these lines carry no `outcome=` field of their own
 and are never folded into `user_prompts`.
 `code-refresh.sh` writes
-`code-refresh outcome=<refreshed|skip|failed> reason=… project=… roots=… unrecorded=… changed=… removed=… healed=… elapsed=…s event=<Stop|SessionStart> session=… embed=<spawned|clean|off|failed reason=<marker|log|spawn>|unknown>`
+`code-refresh outcome=<refreshed|skip|failed> reason=… project=… roots=… unrecorded=… changed=… removed=… healed=… dropped=… elapsed=…s event=<Stop|SessionStart> session=… embed=<spawned|clean|off [reason=no-wired-roots]|failed reason=<marker|log|spawn>|unknown>`
 (plus `marker=write-failed` and `detail=…` when they apply); the line is produced by
 `memidx.py code-refresh` and logged by the hook, and `memidx.py stats` files it under `other`.
 `memcontinuum-detect.sh` writes nothing at all unless
@@ -2223,10 +2223,16 @@ the store has (`embed-worker`, see [Decision index provenance and embedding
 lifecycle](#decision-index-provenance-and-embedding-lifecycle)); both workers share one
 lock/marker/loop skeleton, `_run_embed_worker_loop`.
 
-- **`memidx.py code-embed-worker --project P [--db DB]`** takes a non-blocking `flock` on
+- **`memidx.py code-embed-worker --project P --root DIR [--root DIR ...] [--db DB]`** takes a non-blocking `flock` on
   `<db dir>/<project>.code-embed.lock` (held: exit 0), loops while `<project>.code-embed-pending`
   exists, and per pass calls `cmd_code_reindex(no_embed=False, full=False, retry_not_indexed=False)`
-  for every root in `code_meta` that exists on disk. That call's unchanged-file top-up already
+  for every root in `code_meta` that is ALSO named by a `--root` (resolved paths compared) and exists
+  on disk. The wiring is the only consent for a root and `code_meta` is derived state: a recorded root
+  the caller did not name is stale and is skipped, and a `--root` that is not recorded is ignored (the
+  refresh hook's `unrecorded=` covers it). Without any `--root`, in the worker form and in `--spawn`
+  alike, the worker refuses with one stderr line naming the flag and exits 2; it never falls back to
+  "every recorded root" (INC-0129: a September root left in `code_meta` was reindexed and embedded
+  beside the new one, every symbol twice). That call's unchanged-file top-up already
   finds every chunk without a vector at the current fingerprint (a missing vector and a stale one
   look the same), so nothing else looks for stranded chunks. The marker is claimed FIRST, by
   renaming it to the per-run name `<marker>.claim.<pid>` (after an `lstat` that refuses a symlink
@@ -2283,8 +2289,9 @@ lock/marker/loop skeleton, `_run_embed_worker_loop`.
   `spawned`, `off` (`MEMCONTINUUM_EMBED_WORKER=0`: the marker is still raised) or `failed
   reason=<marker|log|spawn|bad-project>` (`bad-project`: the name is empty, `.`, `..`, or holds a
   `/` or a control character; the workers exit 2 on it). Callers: `scripts/repo-init.sh` runs
-  `code-embed-worker --project P --spawn` once after its last `--no-embed` code-reindex, and
-  `code-refresh` calls it on BOTH events whenever `awaiting_embedding > 0`, after the preflight and
+  `code-embed-worker --project P --spawn --root DIR...` (every `--code-root` it indexed) once after its
+  last `--no-embed` code-reindex, and `code-refresh` calls it, handing over the hook's wired roots
+  (`--root` each; a hook naming none spawns nothing and logs `embed=off reason=no-wired-roots`), on BOTH events whenever `awaiting_embedding > 0`, after the preflight and
   independent of the drift check (a current index with zero vectors is filled too); on `Stop` it
   looks again after the heal, which adds unembedded chunks. This is how an existing index with no
   vectors fills itself on the first `SessionStart` or `Stop` after the upgrade. The hook budget is
@@ -2340,7 +2347,16 @@ when the report is `current`/`metadata-current`. A `degraded` report (a recorded
 a file is not-indexed) keeps or writes `degraded missing-root=<n> not-indexed=<n>`
 (`outcome=skip reason=degraded`, or `failed reason=degraded` after a heal that left it so). If the
 `refreshing` marker cannot be written the heal does not start (`skip reason=marker-unwritable`).
-`SessionStart` writes `stale changed=<n>` and never reindexes. A code db older than the engine's
+`SessionStart` writes `stale changed=<n>` and never reindexes.
+**Stale roots (INC-0129).** When the hook names roots (`MEMCONTINUUM_CODE_ROOTS`), a `code_meta` root
+they do not name is stale. `Stop`, inside the refresh lock and before the report, drops each one with
+`drop_code_root` (the deletion `code-reindex --drop-root` uses; one transaction per root), then
+recomputes `embedding_mode` from real coverage, and logs `dropped=<n>` plus
+`detail=dropped-roots:<path>;<path>`. `SessionStart` never deletes: it writes the marker
+`stale-root=<n>` (`skip reason=stale-marked`) and the next `Stop` clears it by dropping. The heal
+(`heal_code_index(wired_roots=...)`) and the embed worker skip such roots meanwhile. A hook that names
+no roots has no opinion: nothing is dropped or skipped. `code-search`, which has no wiring in hand,
+still heals every recorded root. A code db older than the engine's
 schema (an unversioned one included) is never opened for rebuild by either event: the marker
 is `stale schema-older-than-engine` (`skip reason=stale-marked`) and the rebuild stays with
 `code-reindex`. `sessionstart-remind.sh` shows the marker as one line next to the re-lint marker.
@@ -2474,7 +2490,8 @@ amends Anatomy M2a binding point 2, which had the heal follow the project's own
 leave a `full` project's new chunks unembedded. Now `embedding_mode` is
 recomputed from real coverage after every pass, so such a project is simply
 reported `partial` and the background `code-embed-worker` restores `full`
-minutes later; an inline embed of a 300-chunk drift (about 13 s on the
+minutes later (and, INC-0129, the heal reindexes only recorded roots the hook's wiring still names when
+it is given one, `wired_roots`, so a retired root is never revived); an inline embed of a 300-chunk drift (about 13 s on the
 quantised model) would be watchdog-killed on every `Stop` with no way out.
 `code-search` prints `index healed` only when EVERY in-process
 `code-reindex` call it ran exited 0 AND the state after healing reads

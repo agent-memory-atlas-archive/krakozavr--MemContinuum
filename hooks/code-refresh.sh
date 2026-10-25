@@ -30,7 +30,7 @@
 #                     (default 500).
 #
 # hook.log: <ts> code-refresh outcome=<refreshed|skip|failed> reason=...
-#   project=P roots=N unrecorded=N changed=N removed=N healed=N elapsed=Xs
+#   project=P roots=N unrecorded=N changed=N removed=N healed=N dropped=N elapsed=Xs
 #   event=E session=S embed=<spawned|clean|off|failed|unknown>
 #   [marker=write-failed] [detail=...]
 # embed= is the background embedding worker's state (TOP-0137 L2 step 5):
@@ -41,8 +41,15 @@
 # spawned = marker raised and a worker started (a worker that finds the
 # lock held exits 0 itself, so there is no separate "pending" state),
 # clean = nothing awaits, off = MEMCONTINUUM_EMBED_WORKER=0 (marker still
-# raised), failed = marker, log or spawn refused, unknown = the run ended
-# before it was evaluated.
+# raised; `off reason=no-wired-roots` = the hook names no code roots, so no
+# worker is started), failed = marker, log or spawn refused, unknown = the run
+# ended before it was evaluated. The worker is handed the wired roots
+# (`--root`) and never processes a recorded root they do not name.
+#
+# dropped=N (INC-0129): recorded roots the wiring no longer names, removed on
+# Stop (the code-reindex --drop-root deletion) with a
+# `detail=dropped-roots:<path>;<path>` tail; SessionStart never drops, it
+# writes the marker `stale-root=<n>` and the first Stop clears it.
 #
 # bash 3.2 discipline: no arrays, no [[ ]], no process substitution, no
 # mapfile, no namerefs; no $(( )) on any env value (the budget is checked with
