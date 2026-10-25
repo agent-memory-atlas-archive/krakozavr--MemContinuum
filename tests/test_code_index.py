@@ -6111,35 +6111,120 @@ class TestStaleRootsNeverRevived(unittest.TestCase):
             finally:
                 conn.close()
 
-    def test_guard_drops_the_alias_rows_when_the_canonical_root_is_also_recorded(self):
+    def _chunk_state(self, conn, root_key):
+        """{path: {chunk_id: vector bytes or None}} for one root key, plus fts presence."""
+        out = {}
+        for r in conn.execute(
+                "SELECT c.path, c.id, e.vector FROM chunks c LEFT JOIN embeddings e ON e.chunk_id=c.id "
+                "WHERE c.code_root=?", (root_key,)):
+            out.setdefault(r[0], {})[r[1]] = None if r[2] is None else bytes(r[2])
+        return out
+
+    def test_alias_only_root_cleans_removed_files_and_keeps_unchanged_vectors(self):
+        # INC-0129 confirmation gate round 3 (H1): `existing` must be loaded
+        # AFTER the alias key is canonicalized.
         with tempfile.TemporaryDirectory() as td:
-            root_a, root_b, db = self._two_roots(td)
-            b_s = str(root_b.resolve())
-            alias = self._alias_key(root_b)
+            root = Path(td) / "code"; root.mkdir()
+            for n in ("keep", "gone", "edit"):
+                (root / f"{n}.py").write_text(f"def f_{n}():\n    return '{n}'\n")
+            db = Path(td) / "idx-code.sqlite"
+            with _fake_model_patch(), contextlib.redirect_stdout(io.StringIO()):
+                code_reindex(root, db, lang="python", no_embed=False)
+            canon = str(root.resolve())
+            alias = self._alias_key(root)
+            self._rekey(db, canon, alias)
             conn = memidx.open_code_db(db)
             try:
-                # a second, alias-keyed copy of B's rows
-                conn.execute("INSERT INTO code_meta (project, code_root, last_indexed_at, head_sha) "
-                             "VALUES (?,?,?,?)", (self.PROJECT, alias, 0, None))
-                conn.execute("INSERT INTO file_sha (project, code_root, path, sha256, chunker_version, status) "
-                             "VALUES (?,?,?,?,?,?)", (self.PROJECT, alias, "zz.py", "x", "v", "indexed"))
-                cols = [r[1] for r in conn.execute("PRAGMA table_info(chunks)")]
-                row = conn.execute("SELECT * FROM chunks WHERE code_root=? LIMIT 1", (b_s,)).fetchone()
-                vals = {c: row[c] for c in cols if c != "id"}
-                vals["code_root"] = alias
-                vals["path"] = "zz.py"
-                conn.execute(
-                    f"INSERT INTO chunks ({','.join(vals)}) VALUES ({','.join('?' * len(vals))})",
-                    list(vals.values()))
-                alias_ids = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE code_root=?", (alias,))]
-                conn.commit()
+                before = self._chunk_state(conn, alias)
+                self.assertEqual(set(before), {"keep.py", "gone.py", "edit.py"})
+                for path, chunks in before.items():
+                    self.assertTrue(chunks and all(v is not None for v in chunks.values()), path)
+                gone_ids = list(before["gone.py"])
+                self.assertTrue(all(conn.execute("SELECT COUNT(*) FROM fts WHERE rowid=?", (i,)).fetchone()[0]
+                                    for i in gone_ids))
             finally:
                 conn.close()
-            self.assertTrue(alias_ids)
+            (root / "gone.py").unlink()
+            (root / "edit.py").write_text("def f_edit_v2():\n    return 'edited'\n")
+            memidx._code_embed_marker_path(db, self.PROJECT).touch()
+            args = SimpleNamespace(project=self.PROJECT, db=str(db), spawn=False, root=[canon])
+            with _fake_model_patch(), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(memidx.cmd_code_embed_worker(args), 0)
+            conn = memidx.open_code_db(db)
+            try:
+                after = self._chunk_state(conn, canon)
+                self.assertEqual(set(after), {"keep.py", "edit.py"})
+                self.assertEqual(after["keep.py"], before["keep.py"], "unchanged file: same chunk ids and vectors")
+                self.assertNotEqual(set(after["edit.py"]), set(before["edit.py"]), "modified file re-chunked")
+                self.assertTrue(all(v is not None for v in after["edit.py"].values()), "modified file re-embedded")
+                for i in gone_ids:
+                    for sql in ("SELECT COUNT(*) FROM chunks WHERE id=?",
+                                "SELECT COUNT(*) FROM fts WHERE rowid=?",
+                                "SELECT COUNT(*) FROM embeddings WHERE chunk_id=?"):
+                        self.assertEqual(conn.execute(sql, (i,)).fetchone()[0], 0, sql)
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM file_sha WHERE path='gone.py'").fetchone()[0], 0)
+                for table in ("code_meta", "file_sha", "chunks"):
+                    keys = {r[0] for r in conn.execute(f"SELECT DISTINCT code_root FROM {table}")}
+                    self.assertEqual(keys, {canon}, table)
+            finally:
+                conn.close()
+
+    def test_guard_drops_the_alias_rows_when_the_canonical_root_is_also_recorded(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "code"; root.mkdir()
+            (root / "shared.py").write_text("def shared():\n    return 1\n")
+            (root / "only_canon.py").write_text("def only_canon():\n    return 2\n")
+            db = Path(td) / "idx-code.sqlite"
+            with _fake_model_patch(), contextlib.redirect_stdout(io.StringIO()):
+                code_reindex(root, db, lang="python", no_embed=False)
+            canon = str(root.resolve())
+            alias = self._alias_key(root)
+            conn = memidx.open_code_db(db)
+            try:
+                canon_before = self._chunk_state(conn, canon)
+                self.assertEqual(set(canon_before), {"shared.py", "only_canon.py"})
+                # real alias-keyed shadow rows: a path ALSO under the canonical key
+                # and a path that is not, each with chunk + fts + vector rows
+                conn.execute("INSERT INTO code_meta (project, code_root, last_indexed_at, head_sha) "
+                             "VALUES (?,?,?,?)", (self.PROJECT, alias, 0, None))
+                cols = [r[1] for r in conn.execute("PRAGMA table_info(chunks)")]
+                ecols = [r[1] for r in conn.execute("PRAGMA table_info(embeddings)")]
+                fcols = [r[1] for r in conn.execute("PRAGMA table_info(fts)")]
+                alias_ids = []
+                for src_path, new_path in (("shared.py", "shared.py"), ("only_canon.py", "alias_only.py")):
+                    conn.execute("INSERT INTO file_sha (project, code_root, path, sha256, chunker_version, status) "
+                                 "VALUES (?,?,?,?,?,?)", (self.PROJECT, alias, new_path, "x", "v", "indexed"))
+                    row = conn.execute("SELECT * FROM chunks WHERE code_root=? AND path=? LIMIT 1",
+                                       (canon, src_path)).fetchone()
+                    vals = {c: row[c] for c in cols if c != "id"}
+                    vals["code_root"] = alias
+                    vals["path"] = new_path
+                    cur = conn.execute(
+                        f"INSERT INTO chunks ({','.join(vals)}) VALUES ({','.join('?' * len(vals))})",
+                        list(vals.values()))
+                    cid = cur.lastrowid
+                    alias_ids.append(cid)
+                    frow = conn.execute("SELECT * FROM fts WHERE rowid=?", (row["id"],)).fetchone()
+                    fv = {c: frow[c] for c in fcols}
+                    conn.execute(f"INSERT INTO fts (rowid,{','.join(fv)}) VALUES (?,{','.join('?' * len(fv))})",
+                                 [cid, *fv.values()])
+                    erow = conn.execute("SELECT * FROM embeddings WHERE chunk_id=?", (row["id"],)).fetchone()
+                    ev = {c: erow[c] for c in ecols if c != "chunk_id"}
+                    conn.execute(f"INSERT INTO embeddings (chunk_id,{','.join(ev)}) VALUES (?,{','.join('?' * len(ev))})",
+                                 [cid, *ev.values()])
+                conn.commit()
+                for cid in alias_ids:
+                    for sql in ("SELECT COUNT(*) FROM chunks WHERE id=?",
+                                "SELECT COUNT(*) FROM fts WHERE rowid=?",
+                                "SELECT COUNT(*) FROM embeddings WHERE chunk_id=?"):
+                        self.assertEqual(conn.execute(sql, (cid,)).fetchone()[0], 1, sql)
+            finally:
+                conn.close()
             out = io.StringIO()
             with _fake_model_patch(), contextlib.redirect_stdout(out):
                 rc = memidx.cmd_code_reindex(SimpleNamespace(
-                    code_root=str(root_b), drop_root=None, db=str(db), project=self.PROJECT, lang=None,
+                    code_root=str(root), drop_root=None, db=str(db), project=self.PROJECT, lang=None,
                     no_embed=True, full=False, retry_not_indexed=False, require_recorded=True))
             self.assertEqual(rc, 0)
             self.assertIn("dropped duplicate alias key", out.getvalue())
@@ -6147,12 +6232,15 @@ class TestStaleRootsNeverRevived(unittest.TestCase):
             try:
                 for table in ("code_meta", "file_sha", "chunks"):
                     keys = {r[0] for r in conn.execute(f"SELECT DISTINCT code_root FROM {table}")}
-                    self.assertNotIn(alias, keys, table)
-                    self.assertIn(b_s, keys, table)
+                    self.assertEqual(keys, {canon}, table)
                 for cid in alias_ids:
                     self.assertEqual(conn.execute("SELECT COUNT(*) FROM chunks WHERE id=?", (cid,)).fetchone()[0], 0)
                     self.assertEqual(conn.execute("SELECT COUNT(*) FROM embeddings WHERE chunk_id=?", (cid,)).fetchone()[0], 0)
                     self.assertEqual(conn.execute("SELECT COUNT(*) FROM fts WHERE rowid=?", (cid,)).fetchone()[0], 0)
+                self.assertEqual(self._chunk_state(conn, canon), canon_before)
+                for ids in canon_before.values():
+                    for cid in ids:
+                        self.assertEqual(conn.execute("SELECT COUNT(*) FROM fts WHERE rowid=?", (cid,)).fetchone()[0], 1)
             finally:
                 conn.close()
 

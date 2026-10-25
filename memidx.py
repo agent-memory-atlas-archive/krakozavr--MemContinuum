@@ -6940,15 +6940,6 @@ def cmd_code_reindex(args) -> int:
         conn.close()
         return 1
 
-    existing = {
-        row["path"]: (row["sha256"], row["chunker_version"], row["status"], row["attempt_key"])
-        for row in conn.execute(
-            "SELECT path, sha256, chunker_version, status, attempt_key FROM file_sha "
-            "WHERE project=? AND code_root=?",
-            (args.project, root_s),
-        )
-    }
-
     # Anatomy M2a binding point 1: the backend availability fingerprint at
     # THIS run -- computed once (not per file) so a not-indexed row's
     # retry check and the fingerprint it stamps on a fresh not-indexed row
@@ -7021,6 +7012,18 @@ def cmd_code_reindex(args) -> int:
                     (root_s, args.project, alias),
                 )
             print(f"code-reindex: canonicalized recorded root key {alias} -> {root_s}")
+    # INC-0129 (confirmation gate round 3, H1): the snapshot is loaded HERE, after
+    # the recorded-root guard has canonicalized an alias key, so an alias-only
+    # root sees its migrated rows (removed-file cleanup, unchanged-file skip).
+    # Nothing between the model load and this point reads or writes file_sha.
+    existing = {
+        row["path"]: (row["sha256"], row["chunker_version"], row["status"], row["attempt_key"])
+        for row in conn.execute(
+            "SELECT path, sha256, chunker_version, status, attempt_key FROM file_sha "
+            "WHERE project=? AND code_root=?",
+            (args.project, root_s),
+        )
+    }
     conn.execute(
         "INSERT INTO code_project (project, langs, embedding_mode) VALUES (?,?,'none') "
         "ON CONFLICT(project) DO UPDATE SET langs=excluded.langs",
