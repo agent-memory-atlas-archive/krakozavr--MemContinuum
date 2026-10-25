@@ -3051,7 +3051,63 @@ def _score_rows_by_cosine(rows, qvec, id_key: str, *, stats: dict | None = None)
     caught, skipped, and counted into `stats['dimension_mismatch_rows']`
     when `stats` is given, rather than raised -- the SQL `dim=?` gate at
     each call site already makes this a defensive path, not the common
-    one. Returns `(id, score)` pairs, best score first."""
+    one. Returns `(id, score)` pairs, best score first.
+
+    Vectorised with numpy when it imports (one matrix product instead of
+    a per-row Python loop -- 0.33 s -> milliseconds on a 3,300-chunk code
+    index); without numpy it falls back to `_score_rows_by_cosine_loop`,
+    the original per-row loop. Both are contract-identical: same pairs,
+    same order, same `dimension_mismatch_rows` count."""
+    rows = list(rows)
+    try:
+        import numpy as np
+    except ImportError:
+        return _score_rows_by_cosine_loop(rows, qvec, id_key, stats=stats)
+    dim = len(qvec)
+    # Float64 throughout, like cosine()'s Python-float arithmetic: a float32
+    # dot product could overflow where the loop's does not.
+    q = np.asarray(qvec, dtype=np.float64)
+    ids = []
+    vecs = []
+    dim_mismatch = 0
+    for r in rows:
+        blob = r["vector"]
+        if len(blob) != dim * 4:
+            dim_mismatch += 1  # cosine()'s VectorDimensionMismatch / bad-length blob
+            continue
+        ids.append(r[id_key])
+        vecs.append(np.frombuffer(blob, dtype=np.float32))
+    scored = []
+    if vecs:
+        if not np.isfinite(q).all():
+            # cosine() raises ValueError for every row against a non-finite query.
+            dim_mismatch += len(vecs)
+        else:
+            m = np.vstack(vecs).astype(np.float64)
+            finite = np.isfinite(m).all(axis=1)
+            dots = m @ q
+            na = np.sqrt((m * m).sum(axis=1))
+            nb = float(np.sqrt((q * q).sum()))
+            zero = (na == 0) | (nb == 0)
+            with np.errstate(all="ignore"):
+                sims = dots / (na * nb)
+            sims = np.where(zero, 0.0, sims)
+            dim_mismatch += int((~finite).sum())
+            # .tolist() yields plain Python floats, never numpy scalars
+            # (cosine()'s docstring: --json cannot serialise float32).
+            for i, ok, sc in zip(range(len(ids)), finite.tolist(), sims.tolist()):
+                if ok:
+                    scored.append((ids[i], sc))
+    if stats is not None and dim_mismatch:
+        stats["dimension_mismatch_rows"] = stats.get("dimension_mismatch_rows", 0) + dim_mismatch
+    scored.sort(key=lambda t: t[1], reverse=True)
+    return scored
+
+
+def _score_rows_by_cosine_loop(rows, qvec, id_key: str, *, stats: dict | None = None) -> list[tuple]:
+    """The per-row pure-Python scoring loop: the numpy-less fallback of
+    `_score_rows_by_cosine`, and the reference its equivalence test checks
+    the vectorised path against."""
     scored = []
     dim_mismatch = 0
     for r in rows:

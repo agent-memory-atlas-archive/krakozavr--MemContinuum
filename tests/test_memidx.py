@@ -6385,5 +6385,74 @@ class TestReindexRefusesAGenerationAheadIndex(unittest.TestCase):
             self.assertEqual(future_only, "KEEP", "a column only the newer generation populates must survive")
 
 
+class TestScoreRowsByCosineNumpy(unittest.TestCase):
+    """The numpy scoring path must match the per-row fallback loop exactly."""
+
+    DIM = 16
+
+    @staticmethod
+    def _rows(blobs):
+        return [{"id": f"r{i}", "vector": b} for i, b in enumerate(blobs)]
+
+    def _blobs(self):
+        import random
+        import struct
+        rnd = random.Random(7)
+        blobs = [memidx.pack_vector([rnd.uniform(-1, 1) for _ in range(self.DIM)]) for _ in range(200)]
+        blobs.append(memidx.pack_vector([0.0] * self.DIM))                       # zero vector
+        blobs.append(memidx.pack_vector([1.0] * (self.DIM - 3)))                 # dimension mismatch
+        blobs.append(b"\x00\x01\x02")                                           # not a float multiple
+        nan = [0.5] * self.DIM
+        nan[4] = float("nan")
+        blobs.append(struct.pack(f"{self.DIM}f", *nan))                          # NaN component
+        blobs.append(memidx.pack_vector([0.25] * self.DIM))                      # duplicates -> ties
+        blobs.append(memidx.pack_vector([0.25] * self.DIM))
+        return blobs
+
+    def test_numpy_path_matches_fallback_loop(self):
+        import random
+        rnd = random.Random(11)
+        q = [rnd.uniform(-1, 1) for _ in range(self.DIM)]
+        rows = self._rows(self._blobs())
+        s_np, s_loop = {}, {}
+        got = memidx._score_rows_by_cosine(rows, q, "id", stats=s_np)
+        want = memidx._score_rows_by_cosine_loop(rows, q, "id", stats=s_loop)
+        self.assertEqual([i for i, _ in got], [i for i, _ in want])
+        for (_, a), (_, b) in zip(got, want):
+            self.assertAlmostEqual(a, b, delta=1e-6)
+            self.assertIs(type(a), float)
+        self.assertEqual(s_np, s_loop)
+        self.assertEqual(s_np["dimension_mismatch_rows"], 3)
+        self.assertIn(0.0, [sc for _, sc in got])
+
+    def test_zero_query_scores_zero_like_loop(self):
+        rows = self._rows(self._blobs())
+        q = [0.0] * self.DIM
+        self.assertEqual(memidx._score_rows_by_cosine(rows, q, "id"),
+                         memidx._score_rows_by_cosine_loop(rows, q, "id"))
+
+    def test_non_finite_query_counts_every_row_like_loop(self):
+        rows = self._rows(self._blobs())
+        q = [float("nan")] + [0.1] * (self.DIM - 1)
+        s_np, s_loop = {}, {}
+        self.assertEqual(memidx._score_rows_by_cosine(rows, q, "id", stats=s_np), [])
+        memidx._score_rows_by_cosine_loop(rows, q, "id", stats=s_loop)
+        self.assertEqual(s_np, s_loop)
+
+    def test_numpy_path_is_actually_taken(self):
+        import numpy as np
+        rows = self._rows(self._blobs())
+        with mock.patch.object(np, "frombuffer", wraps=np.frombuffer) as fb:
+            memidx._score_rows_by_cosine(rows, [0.1] * self.DIM, "id")
+        self.assertGreaterEqual(fb.call_count, 200)
+
+    def test_without_numpy_falls_back_to_loop(self):
+        rows = self._rows(self._blobs())
+        q = [0.1] * self.DIM
+        with mock.patch.dict(sys.modules, {"numpy": None}):
+            got = memidx._score_rows_by_cosine(rows, q, "id")
+        self.assertEqual(got, memidx._score_rows_by_cosine_loop(rows, q, "id"))
+
+
 if __name__ == "__main__":
     unittest.main()
