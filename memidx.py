@@ -69,7 +69,17 @@ DEFAULT_PROJECT = "default"
 # index files; defaults to ~/.memcontinuum. A per-call --db always wins over both
 # (see resolve_db_path, which reads the environment variable fresh on every
 # call so tests can override it per-case).
-EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+# TOP-0137 L2 step 5: the model is the SAME BAAI/bge-small-en-v1.5 (CLS
+# pooling, L2-normalised, 384 dims) but loaded from its plain fp32 ONNX
+# (`onnx/model.onnx` in the HF repo) instead of the quantised build that
+# fastembed's default name resolves to (qdrant/bge-small-en-v1.5-onnx-q),
+# whose MatMul does not parallelise (~0.3-0.4 s per text vs ~40 ms). Vectors
+# agree to cosine >= 0.9999 (tests: TestEmbedModelParity), so stored vectors
+# stay semantically valid; the fingerprint still changes -- it names the
+# pipeline, and the revision is the fp32 snapshot's.
+EMBED_MODEL_HF_SOURCE = "BAAI/bge-small-en-v1.5"
+EMBED_MODEL_FILE = "onnx/model.onnx"
+EMBED_MODEL_NAME = "memcontinuum/bge-small-en-v1.5-fp32"
 EMBED_DIM = 384
 # Design R4 (audit MC-P1-06, TOP-0123 L4): bump EMBED_PIPELINE_VERSION when
 # embed_text_for/_link_embed_items/code_embed_text_for/EMBED_BODY_CHARS
@@ -2499,25 +2509,45 @@ def load_embedding_model():
     thread the returned `model` through explicitly (`compute_embeddings`/
     `compute_query_embedding`'s own `model=` parameter) -- caching lives at
     the call-site/one-invocation level, never at process level."""
-    from fastembed import TextEmbedding
-
-    model = TextEmbedding(model_name=EMBED_MODEL_NAME)
+    model = _text_embedding()
     return model, embedding_fingerprint(model)
+
+
+def _text_embedding(cache_dir: str | None = None):
+    """TOP-0137 L2 step 5: the ONE construction site for a `TextEmbedding`.
+    Registers the fp32 custom model (EMBED_MODEL_NAME) with fastembed once
+    per process -- `add_custom_model` raises ValueError when the name is
+    already registered, which is the idempotence guard -- then builds it.
+    `cache_dir=None` leaves fastembed's own resolution (FASTEMBED_CACHE_PATH,
+    else the system temp dir's fastembed_cache); tests pass their own."""
+    from fastembed import TextEmbedding
+    from fastembed.common.model_description import ModelSource, PoolingType
+
+    try:
+        TextEmbedding.add_custom_model(
+            model=EMBED_MODEL_NAME,
+            pooling=PoolingType.CLS,
+            normalization=True,
+            sources=ModelSource(hf=EMBED_MODEL_HF_SOURCE),
+            dim=EMBED_DIM,
+            model_file=EMBED_MODEL_FILE,
+        )
+    except ValueError:
+        pass  # already registered in this process
+    if cache_dir is None:
+        return TextEmbedding(model_name=EMBED_MODEL_NAME)
+    return TextEmbedding(model_name=EMBED_MODEL_NAME, cache_dir=str(cache_dir))
 
 
 def compute_embeddings(texts: list[str], model=None):
     if model is None:
-        from fastembed import TextEmbedding
-
-        model = TextEmbedding(model_name=EMBED_MODEL_NAME)
+        model = _text_embedding()
     return list(model.embed(texts))
 
 
 def compute_query_embedding(text: str, model=None):
     if model is None:
-        from fastembed import TextEmbedding
-
-        model = TextEmbedding(model_name=EMBED_MODEL_NAME)
+        model = _text_embedding()
     return list(model.query_embed([text]))[0]
 
 

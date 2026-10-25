@@ -46,7 +46,7 @@
 # The menu takes 1, 2 or 3 and nothing else: any other answer is asked again,
 # three times, and then the run aborts having written nothing.
 #
-# Why the model warm is on by default: fastembed downloads ~100 MB the first
+# Why the model warm is on by default: fastembed downloads ~150 MB the first
 # time anything needs to embed. Left lazy, that download happens inside
 # somebody's first reindex -- or worse, inside a hook -- looking like a hang.
 # Better to pay it here, visibly, once.
@@ -391,14 +391,13 @@ say "2. embedding model"
 if [ "$MODEL_WARM" -eq 0 ]; then
     plan "skipped (--no-model-warm) -- the first reindex will download it instead"
 else
-    plan "download+cache the embedding model now (~100 MB, once)"
+    plan "download+cache the embedding model now (~150 MB, once)"
     if [ "$DRY_RUN" -eq 0 ]; then
         env PYTHONPATH= "$PYTHON_BIN" -c '
 import sys
 sys.path.insert(0, sys.argv[1])
 import memidx
-from fastembed import TextEmbedding
-list(TextEmbedding(model_name=memidx.EMBED_MODEL_NAME).embed(["warm"]))
+list(memidx._text_embedding().embed(["warm"]))
 print("  model ready:", memidx.EMBED_MODEL_NAME)
 ' "$SCRIPT_DIR" || die "model warm failed -- rerun with --no-model-warm to skip"
     fi

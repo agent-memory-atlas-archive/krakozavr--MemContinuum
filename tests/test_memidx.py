@@ -5693,6 +5693,136 @@ class TestEmbedWorker(unittest.TestCase):
         self.assertFalse(backlog2["worker_lock_held"])
 
 
+# TOP-0137 L2 step 5: the opt-in model tests load the REAL fastembed models,
+# so they run only when the caller names a cache directory for them
+# (MEMCONTINUUM_TEST_EMBED_CACHE) -- never fastembed's default
+# /tmp/fastembed_cache.
+_EMBED_CACHE_ENV = os.environ.get("MEMCONTINUUM_TEST_EMBED_CACHE", "")
+
+
+@unittest.skipUnless(
+    _EMBED_CACHE_ENV and os.environ.get("MEMCONTINUUM_PYTHON", ""),
+    "set $MEMCONTINUUM_TEST_EMBED_CACHE to a fastembed cache dir (and run under the venv) "
+    "to load the real embedding models",
+)
+class TestEmbedModelParity(unittest.TestCase):
+    """The fp32 ONNX registered under EMBED_MODEL_NAME must give the same
+    vectors as the model fastembed resolves BAAI/bge-small-en-v1.5 to by
+    default (the quantised qdrant build) -- the evidence that vectors stored
+    by the old path stay semantically valid after the model path change."""
+
+    TEXTS = [
+        "def parse_config(path): read the yaml file and return a dict",
+        "class IndexWorker: runs the background embedding pass over the code index",
+        "func fetchUser(id: Int) async throws -> User",
+        "the widget cache invalidates on write",
+        "SELECT chunk_id, vector FROM embeddings WHERE project = ?",
+        "Hybrid search fuses full-text and vector rankings with reciprocal rank fusion.",
+        "fn main() { println!(\"hello\"); }",
+        "owner ruling: embeddings are computed in a detached worker, never inline",
+    ]
+
+    @staticmethod
+    def _cos(a, b):
+        import math
+        dot = sum(x * y for x, y in zip(a, b))
+        return dot / (math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)))
+
+    def test_fp32_custom_model_matches_the_default_quantised_one(self):
+        from fastembed import TextEmbedding
+        old = TextEmbedding(model_name=memidx.EMBED_MODEL_HF_SOURCE, cache_dir=_EMBED_CACHE_ENV)
+        new = memidx._text_embedding(cache_dir=_EMBED_CACHE_ENV)
+        for fn in ("embed", "query_embed"):
+            a = list(getattr(old, fn)(self.TEXTS))
+            b = list(getattr(new, fn)(self.TEXTS))
+            self.assertEqual(len(a), len(b))
+            for text, va, vb in zip(self.TEXTS, a, b):
+                self.assertEqual(len(vb), memidx.EMBED_DIM)
+                self.assertGreaterEqual(self._cos(va, vb), 0.9999, f"{fn}: {text!r}")
+
+    def test_registration_is_idempotent_and_fingerprint_names_the_pipeline(self):
+        m1 = memidx._text_embedding(cache_dir=_EMBED_CACHE_ENV)
+        m2 = memidx._text_embedding(cache_dir=_EMBED_CACHE_ENV)
+        fp = memidx.embedding_fingerprint(model=m1)
+        self.assertIn(f"model={memidx.EMBED_MODEL_NAME};", fp)
+        self.assertNotIn("revision=unknown", fp)
+        self.assertEqual(fp, memidx.embedding_fingerprint(model=m2))
+
+
+class TestSingleEmbeddingConstructionSite(unittest.TestCase):
+    """The custom-model registration lives in memidx._text_embedding(); a
+    second `TextEmbedding(model_name=...)` anywhere else (the setup script's
+    model warm once had one) would ask fastembed for a name it never
+    registered, or silently load the other model."""
+
+    def test_only_text_embedding_constructs_a_model(self):
+        offenders = []
+        for path in sorted(TOOLS_DIR.rglob("*")):
+            rel = path.relative_to(TOOLS_DIR)
+            if (path.suffix not in (".py", ".sh") or rel.parts[0] in ("tests", "docs", ".worktrees", ".git", "bench")
+                    or ".venv" in rel.parts):
+                continue
+            for n, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+                if "TextEmbedding(" in line and not line.lstrip().startswith("#") and "`TextEmbedding(" not in line:
+                    offenders.append(f"{rel}:{n}: {line.strip()}")
+        self.assertEqual(
+            [o for o in offenders if not o.startswith("memidx.py:")], [],
+            "construct models only through memidx._text_embedding()",
+        )
+        in_memidx = [o for o in offenders if o.startswith("memidx.py:")]
+        self.assertEqual(len(in_memidx), 2, in_memidx)  # the two branches of _text_embedding
+
+
+class TestStoreMismatchedFingerprintIsAwaiting(unittest.TestCase):
+    """A store whose vectors carry a different model's fingerprint: a
+    --no-embed pass counts every such record as awaiting embedding (so the
+    post-commit hook raises the marker and spawns embed-worker), and the
+    worker's embedding pass re-embeds them to zero."""
+
+    OLD_FP = "model=BAAI/bge-small-en-v1.5;dim=384;pipeline=1;prefix=none;norm=l2;fastembed=0.8.0;revision=oldrev"
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp(prefix="memcontinuum-fpawait-")
+        self.addCleanup(shutil.rmtree, self.td, ignore_errors=True)
+        self.project = "fp-test"
+        self.root = Path(self.td) / "root"
+        (self.root / "topics").mkdir(parents=True)
+        (self.root / "topics" / "t.md").write_text(
+            "---\nid: T-1\ntitle: T\nstatus: active\n---\nthe widget cache invalidates on write\n"
+        )
+        self.db = Path(self.td) / f"{self.project}.sqlite"
+
+    @staticmethod
+    def _fake_embed(texts, model=None):
+        return [[0.01] * memidx.EMBED_DIM for _ in texts]
+
+    def _reindex_out(self, no_embed, fp=None):
+        buf = io.StringIO()
+        patches = [mock.patch.object(memidx, "compute_embeddings", side_effect=self._fake_embed)]
+        if fp is not None:
+            patches.append(mock.patch.object(memidx, "load_embedding_model", side_effect=lambda: (object(), fp)))
+        with contextlib.ExitStack() as st:
+            for p in patches:
+                st.enter_context(p)
+            st.enter_context(contextlib.redirect_stdout(buf))
+            rc = reindex(self.root, self.db, project=self.project, no_embed=no_embed)
+        self.assertEqual(rc, 0)
+        return buf.getvalue()
+
+    def test_old_fingerprint_vectors_are_awaiting_then_worker_reembeds(self):
+        out = self._reindex_out(no_embed=False, fp=self.OLD_FP)
+        self.assertTrue(out.strip().endswith("0 record(s) awaiting embedding"), out)
+        out = self._reindex_out(no_embed=True)
+        self.assertTrue(out.strip().endswith("1 record(s) awaiting embedding"), out)
+        current = memidx.embedding_fingerprint(model=None).replace("revision=unknown", "revision=newrev")
+        out = self._reindex_out(no_embed=False, fp=current)
+        self.assertTrue(out.strip().endswith("0 record(s) awaiting embedding"), out)
+        conn = sqlite3.connect(str(self.db))
+        fps = [r[0] for r in conn.execute("SELECT embed_fp FROM embeddings")]
+        conn.close()
+        self.assertEqual(fps, [current])
+
+
 def _standing_topic(tid: str, link_id: str, standing: list, status: str = "active",
                      authority: str = "owner-ratified", text: str = "the ruling text",
                      rationale: str = "") -> str:
