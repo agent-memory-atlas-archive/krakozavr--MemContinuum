@@ -217,7 +217,7 @@ wrong. Pick its one home.
   Python snippets stay on the standard library plus `PyYAML`, so they are
   content with the older Python macOS ships. A `sqlite3` with FTS5, which
   Python's own `sqlite3` module provides — nothing to install separately.
-- ~100 MB of disk for the embedding model, downloaded once the first time
+- ~150 MB of disk for the embedding model, downloaded once the first time
   something actually needs to embed. `--no-embed` and `--mode fts` never trigger
   that download; neither does committing to the store -- the store's
   `post-commit` hook runs a bounded, content-only pass and never touches the
@@ -254,7 +254,7 @@ bash memcontinuum-setup.sh [--venv DIR] [--python PATH] [--claude-dir DIR]
 `--venv DIR` creates the venv (default `<checkout>/.venv`), or `--python PATH`
 uses an existing one that already has `requirements.txt` installed.
 `--claude-dir DIR` says where the user-level pieces go (default `~/.claude`).
-`--no-model-warm` skips the one-time ~100 MB model download — it is on by
+`--no-model-warm` skips the one-time ~150 MB model download — it is on by
 default because, left lazy, that download lands inside somebody's first reindex,
 where it looks like a hang. `--dry-run` prints the plan and writes nothing.
 

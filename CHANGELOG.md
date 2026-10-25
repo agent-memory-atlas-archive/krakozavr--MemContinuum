@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+- Code embeddings now get built, in the background. Until now every code index
+  had zero vectors: the first `code-reindex` at install is `--no-embed` to keep
+  the install fast, and nothing ever filled them in afterwards, so `code-search`
+  was text-only in every mode. A new `code-embed-worker` (detached, one at a time,
+  same marker/lock/log pattern as the store's `embed-worker`) now does it. The
+  installer starts it after the first index, and `code-refresh.sh` starts it on
+  `Stop` and `SessionStart` whenever chunks lack a vector, so an existing index
+  fills itself the first time you open or finish a session after upgrading;
+  `embed=spawned|pending|clean|off` in the `code-refresh` `hook.log` line says
+  which. Vectors are committed in batches of 128, so a killed worker keeps its
+  progress. `embedding_mode` is now `none`, `partial` or `full`, recomputed from
+  what is really embedded after every pass; the `code-reindex` summary ends with
+  `N chunk(s) awaiting embedding`, and `code-search` says how many chunks have no
+  vector yet (and still finds them by text). The Stop-time refresh stays
+  text-only, so a refresh of a fully embedded index reads `partial` until the
+  worker catches up; set `MEMCONTINUUM_EMBED_WORKER=0` to disable the worker.
+- Embedding is about 8 times faster on CPU. The engine now loads the plain
+  float32 ONNX file of the same model (`BAAI/bge-small-en-v1.5`) instead of
+  the quantised build fastembed picks by default, whose main matrix multiply
+  does not use more than one core: roughly 40 ms instead of 0.3-0.4 s per
+  chunk, so a 3,300-chunk index takes about 2.5 minutes instead of 22. The
+  vectors are the same (cosine 1.0000 against the old ones on real chunks), but
+  the index records a new model fingerprint, so after upgrading the background
+  workers re-embed existing vectors once (store records and code chunks both
+  count as awaiting embedding until then). The first embed downloads about
+  133 MB of model files; CI's model cache key moved to `v2`.
+
 - Every store commit can now write a verified `git bundle` backup of the
   store: set `memcontinuum-setup.sh --backup-dir DIR [--backup-keep N]` and
   the post-commit hook keeps the newest N bundles per store in `DIR/<project>/`

@@ -50,7 +50,7 @@ wired one level up, into `~/.claude/settings.json`, by `memcontinuum-setup.sh`.
 | `sessionstart-remind.sh` | `SessionStart` | on `startup`/`resume`/`clear`, initializes session state (captures the code/store roots' git HEAD, prunes state older than 24h; `clear` resets the session's counters and pending nudges but carries the edit ledger over, `resume` keeps everything), then attempts the standing-decisions digest (see [standing decisions](#standing-decisions)); on `source: compact`, injects what `precompact-persist.sh` left pending, with the digest appended after it |
 | `userprompt-remind.sh` | `UserPromptSubmit` | never reads the diff; never reads the prompt text UNLESS the opted-in prompt-query channel is ON for this project (see "Prompt-derived queries" below), in which case it may derive search terms from the prompt, in process, and discard it; fires the coverage, commit, look-back, or prompt-query nudge |
 | `sessionend-stamp.sh` | `SessionEnd` | stamps session end into state |
-| `code-refresh.sh` | `Stop` and `SessionStart` (projects with a code root) | keeps the code index fresh: runs the existing preflight (`code_index_report`), and on `Stop` the same incremental text heal `code-search` makes (`heal_code_index`, no embeddings; see [code-index freshness](#code-index-freshness)). `SessionStart` preflights only and writes the `<project>.code-stale` marker. Silent on every path; one `hook.log` line per run |
+| `code-refresh.sh` | `Stop` and `SessionStart` (projects with a code root) | keeps the code index fresh: runs the existing preflight (`code_index_report`), and on `Stop` the same incremental text heal `code-search` makes (`heal_code_index`, never embeds; see [code-index freshness](#code-index-freshness)). On both events it starts the detached `code-embed-worker` when chunks await a vector (see [code embeddings](#code-embeddings-the-background-worker)). `SessionStart` preflights only and writes the `<project>.code-stale` marker. Silent on every path; one `hook.log` line per run |
 | `post-commit-reindex.sh` | store's git `post-commit` | a bounded content-only reindex after every commit; spawns a background embed-worker when vectors are left behind |
 | `pre-commit-append-only.sh` | store's git `pre-commit` | runs `memlint.py --against-ref HEAD --staged`; BLOCKS the commit on an append-only violation (a recorded link's body edited, or a link removed, deleted, or renamed — its three lifecycle fields may each move forward once); fails open (lets the commit through) on an unborn HEAD, a missing python, its own cwd not being the store, or any engine failure |
 | `memcontinuum-detect.sh` | `SessionStart`, user level | classifies an un-initialized repo and emits its ask into the assistant's context once; no python, no watchdog, no logging by default |
@@ -499,7 +499,7 @@ that shape: nothing was compared). `memidx.py stats` reports these under a
 every other hook kind — these lines carry no `outcome=` field of their own
 and are never folded into `user_prompts`.
 `code-refresh.sh` writes
-`code-refresh outcome=<refreshed|skip|failed> reason=… project=… roots=… unrecorded=… changed=… removed=… healed=… elapsed=…s event=<Stop|SessionStart> session=…`
+`code-refresh outcome=<refreshed|skip|failed> reason=… project=… roots=… unrecorded=… changed=… removed=… healed=… elapsed=…s event=<Stop|SessionStart> session=… embed=<spawned|pending|clean|off|failed|unknown>`
 (plus `marker=write-failed` and `detail=…` when they apply); the line is produced by
 `memidx.py code-refresh` and logged by the hook, and `memidx.py stats` files it under `other`.
 `memcontinuum-detect.sh` writes nothing at all unless
@@ -1896,8 +1896,8 @@ fresh `code_project` row this rebuild inserts always starts at `none`,
 since an older schema tracked no such concept to carry forward — so the
 first `code-search` after a rebuild reads the project as `stale` (never
 `uninitialized`, since its roots and languages did survive) and, if it
-heals, heals without embeddings until a `code-reindex` without
-`--no-embed` runs. When the stored version is NEWER than this engine's
+heals, heals without embeddings until the background `code-embed-worker`
+(or a `code-reindex` without `--no-embed`) fills the vectors. When the stored version is NEWER than this engine's
 own, `open_code_db` refuses the db outright (`CodeIndexTooNew`, a
 `sqlite3.DatabaseError`) rather than silently using or rebuilding it —
 `code-search`/`why` fail open around that refusal (a message, no crash,
@@ -2214,13 +2214,77 @@ initial code-reindex in `repo-init.sh` hard-fails the install on a non-zero
 exit (exit 13, distinct from the decision-store reindex's exit 7): per-file
 handling already fails open, so a non-zero exit there is structural.
 
+### Code embeddings: the background worker
+
+The code index used to get vectors only from a hand-run `code-reindex` without `--no-embed`; the
+first `code-reindex` repo-init runs is `--no-embed` (the install stays fast), and every heal is
+text-only, so a live code index had zero vectors forever. The code side now has the same lifecycle
+the store has (`embed-worker`, see [Decision index provenance and embedding
+lifecycle](#decision-index-provenance-and-embedding-lifecycle)); both workers share one
+lock/marker/loop skeleton, `_run_embed_worker_loop`.
+
+- **`memidx.py code-embed-worker --project P [--db DB]`** takes a non-blocking `flock` on
+  `<db dir>/<project>.code-embed.lock` (held: exit 0), loops while `<project>.code-embed-pending`
+  exists, and per pass calls `cmd_code_reindex(no_embed=False, full=False, retry_not_indexed=False)`
+  for every root in `code_meta` that exists on disk. That call's unchanged-file top-up already
+  finds every chunk without a vector at the current fingerprint (a missing vector and a stale one
+  look the same), so nothing else looks for stranded chunks. The marker is removed only when its
+  mtime is what was noted before the pass. An exception, a failed-open embedding backend
+  (`code_embedding_backend_failed()`) or a code-reindex rc of 1 or 2 leaves the marker, appends the
+  traceback or reason to `<project>.code-embed.log` and exits 3; each pass also logs its summary
+  line there. It does not take the code-refresh lock: with batching it holds the write lock only
+  for the initial stat walk and each short batch write, and a batch drops vectors for chunk ids a
+  concurrent heal already replaced (ids are `AUTOINCREMENT`, never reused).
+- **Batching.** The embedding step of `cmd_code_reindex` embeds `CODE_EMBED_BATCH` (128) chunks at
+  a time and commits after each batch (vectors, the fingerprint, and `embedding_mode`), so a killed
+  worker keeps its progress and a first run over thousands of chunks never holds one multi-minute
+  transaction. The model is loaded once per pass.
+- **Three modes.** `code_project.embedding_mode` is recomputed from real project-wide coverage at
+  the end of every `cmd_code_reindex` pass, embedded or not (`_code_embedding_coverage`): `full` =
+  every chunk has a vector at the current fingerprint, `none` = none does, `partial` otherwise. A
+  `--no-embed` pass that adds chunks to a `full` project therefore reads `partial`, and the worker
+  restores `full`. A pass with a loaded model compares the exact fingerprint; one without compares
+  the static prefix (model, dim, pipeline, … up to `;revision=`), so a vector made by another
+  model or pipeline never counts. The summary line ends with `, N chunk(s) awaiting embedding`
+  (the store's grammar), `code_index_report` carries `awaiting_embedding` and `chunk_total`, and
+  `code-search --json` exposes `embedding_mode` and `awaiting_embedding`. `code-search` in vector
+  or hybrid mode prints one stderr line when chunks lack a vector (`N of M chunks have no vector;
+  the background embed worker fills them`) and ranks over the vectors present: `code_hits_vector`
+  only reads rows at the current fingerprint, so an FTS-only chunk still ranks through the FTS
+  channel of the fusion. `code-search` never spawns the worker.
+- **Spawn sites.** `spawn_code_embed_worker` raises the marker (create or bump its mtime, so a
+  running worker loops again) and starts the worker with a detached python `subprocess.Popen`
+  (`start_new_session=True`, stdin `DEVNULL`, stdout and stderr to the worker log, `close_fds`) —
+  the snippet `post-commit-reindex.sh` uses, never bash `&` or `setsid`. It returns `spawned`,
+  `pending` (the lock is held, a worker is already running), `off` (`MEMCONTINUUM_EMBED_WORKER=0`:
+  the marker is still raised) or `failed`. Callers: `scripts/repo-init.sh` runs
+  `code-embed-worker --project P --spawn` once after its last `--no-embed` code-reindex, and
+  `code-refresh` calls it on BOTH events whenever `awaiting_embedding > 0`, after the preflight and
+  independent of the drift check (a current index with zero vectors is filled too); on `Stop` it
+  looks again after the heal, which adds unembedded chunks. This is how an existing index with no
+  vectors fills itself on the first `SessionStart` or `Stop` after the upgrade. The hook budget is
+  untouched: a spawn costs milliseconds.
+- **The model path.** `memidx._text_embedding()` is the one `TextEmbedding` construction site. It
+  registers `memcontinuum/bge-small-en-v1.5-fp32` once per process (CLS pooling, normalised, 384
+  dimensions, `onnx/model.onnx` from the HF repo `BAAI/bge-small-en-v1.5`) instead of fastembed's
+  default name, which resolves to the quantised `qdrant/bge-small-en-v1.5-onnx-q` build whose
+  MatMul (89 % of its profile) does not parallelise: 0.3-0.4 s per text at 1 or 24 threads on a
+  24-thread Ryzen 9900X. The fp32 file gives cosine 1.0000 against it on real chunk texts and runs
+  at 37-44 ms per text with 8 or more threads (about 8 times faster; 2.5 minutes instead of 22 for a
+  3,300-chunk index; a worker pass over a 320-chunk temp index took 23 s). Stored vectors stay
+  semantically valid (the parity test, `TestEmbedModelParity`, asserts cosine ≥ 0.9999), but the
+  fingerprint names the pipeline, so it changes and every old vector is re-embedded once by the
+  workers: `reindex --no-embed` counts those store records, and `code-reindex --no-embed` those
+  chunks, as awaiting embedding. `requirements.lock` is unchanged (same fastembed, same
+  onnxruntime); CI caches the new snapshot under `fastembed-model-v2-…`.
+
 ### Code-index freshness
 
 `hooks/code-refresh.sh` (`Stop` and `SessionStart`) keeps an existing code index current. It owns
 no staleness logic: `memidx.py code-refresh` calls the preflight every reader already uses,
 `code_index_report` (five stat signals, sha-256 on drift, the git HEAD trigger), and, on `Stop`
 only, `heal_code_index` with `caller="code-refresh"` and `lock_held=True`. The heal is the same
-incremental text pass `code-search` makes (`no_embed` follows `embedding_mode`,
+incremental text pass `code-search` makes (`no_embed=True` always,
 `retry_not_indexed=False`, `full=False`, rc checked); embeddings are not part of it. A deleted
 file counts toward `changed` (`_root_report` adds `removed` into it), so a deletion alone makes
 the heal eligible and purges the file's rows.
@@ -2372,11 +2436,15 @@ caller to run `code-reindex` instead. Within the cap, every recorded root
 that still exists on disk is reindexed once, in-process, with the
 retry-not-indexed rule above turned off (so an unrelated edit never retries a
 known-broken backend) and `--full` never set (a heal repairs drift, it does not rewrite
-the project's language set); it reindexes with embeddings only when the
-project's own `embedding_mode` is already `full`, otherwise with
-`--no-embed` — a heal can never be what silently leaves a `full` project's
-new chunks unembedded, but it also never upgrades a `none` project to `full`
-on its own. `code-search` prints `index healed` only when EVERY in-process
+the project's language set); it is always text-only (`--no-embed`). This
+amends Anatomy M2a binding point 2, which had the heal follow the project's own
+`embedding_mode` (embed only when `full`) so that a heal could never silently
+leave a `full` project's new chunks unembedded. Now `embedding_mode` is
+recomputed from real coverage after every pass, so such a project is simply
+reported `partial` and the background `code-embed-worker` restores `full`
+minutes later; an inline embed of a 300-chunk drift (about 13 s on the
+quantised model) would be watchdog-killed on every `Stop` with no way out.
+`code-search` prints `index healed` only when EVERY in-process
 `code-reindex` call it ran exited 0 AND the state after healing reads
 `current` or `metadata-current` (both mean `changed == 0` — the only
 difference is whether this call proved it with a full hash) — a non-zero
@@ -2391,7 +2459,8 @@ indexed.
 alphabetically (`indexed_at` here is that root's `last_indexed_at`, renamed
 at this top level only); `code_roots`, the full per-root report list (each
 entry carries its own `last_indexed_at`/`head_sha`/`git_delta`/`verified`,
-not renamed); `changed`, `failed`, `not_indexed`, `embedding_mode`; and
+not renamed); `changed`, `failed`, `not_indexed`, `embedding_mode`,
+`awaiting_embedding` (chunks with no vector at the current fingerprint); and
 `results`. `--verify-content` hashes every indexed file before answering, so
 the reported state is content-proven (`current`) rather than the
 metadata-only default (`metadata-current`) — there is no automatic
