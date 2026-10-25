@@ -499,7 +499,7 @@ that shape: nothing was compared). `memidx.py stats` reports these under a
 every other hook kind — these lines carry no `outcome=` field of their own
 and are never folded into `user_prompts`.
 `code-refresh.sh` writes
-`code-refresh outcome=<refreshed|skip|failed> reason=… project=… roots=… unrecorded=… changed=… removed=… healed=… elapsed=…s event=<Stop|SessionStart> session=… embed=<spawned|pending|clean|off|failed|unknown>`
+`code-refresh outcome=<refreshed|skip|failed> reason=… project=… roots=… unrecorded=… changed=… removed=… healed=… elapsed=…s event=<Stop|SessionStart> session=… embed=<spawned|clean|off|failed reason=<marker|log|spawn>|unknown>`
 (plus `marker=write-failed` and `detail=…` when they apply); the line is produced by
 `memidx.py code-refresh` and logged by the hook, and `memidx.py stats` files it under `other`.
 `memcontinuum-detect.sh` writes nothing at all unless
@@ -2228,13 +2228,22 @@ lock/marker/loop skeleton, `_run_embed_worker_loop`.
   exists, and per pass calls `cmd_code_reindex(no_embed=False, full=False, retry_not_indexed=False)`
   for every root in `code_meta` that exists on disk. That call's unchanged-file top-up already
   finds every chunk without a vector at the current fingerprint (a missing vector and a stale one
-  look the same), so nothing else looks for stranded chunks. The marker is removed only when its
-  mtime is what was noted before the pass. An exception, a failed-open embedding backend
+  look the same), so nothing else looks for stranded chunks. The marker is claimed by renaming it
+  aside once the pass is done: a touch before the rename shows in the claimed file's mtime (the
+  marker is raised again), a touch after it makes a fresh marker, and after the lock is released
+  the marker is checked once more (taking the lock again if it reappeared), so no request is
+  deleted unseen. An exception, a failed-open embedding backend
   (`code_embedding_backend_failed()`) or a code-reindex rc of 1 or 2 leaves the marker, appends the
   traceback or reason to `<project>.code-embed.log` and exits 3; each pass also logs its summary
-  line there. It does not take the code-refresh lock: with batching it holds the write lock only
-  for the initial stat walk and each short batch write, and a batch drops vectors for chunk ids a
-  concurrent heal already replaced (ids are `AUTOINCREMENT`, never reused).
+  line there. It does not take the code-refresh lock: the model loads before any write, the text
+  pass commits before the first embed call, and each batch is its own short `BEGIN IMMEDIATE`
+  whose `INSERT … SELECT … WHERE EXISTS (chunk)` is atomic with the existence check, so a
+  concurrent heal cannot leave an orphan vector (ids are `AUTOINCREMENT`, never reused). A final
+  sweep of every worker pass deletes any orphan that still got through and logs the count, and
+  `code_hits_vector` inner-joins `chunks` so an orphan can never take a result slot. The worker's
+  log, marker and lock are opened through one helper (`_open_aux_file`: `O_NOFOLLOW`,
+  `O_NONBLOCK`, `fstat` must be a regular file); a symlink or FIFO is refused (`embed=failed
+  reason=log|marker|lock`; the worker exits 3 with the reason on stderr).
 - **Batching.** The embedding step of `cmd_code_reindex` embeds `CODE_EMBED_BATCH` (128) chunks at
   a time and commits after each batch (vectors, the fingerprint, and `embedding_mode`), so a killed
   worker keeps its progress and a first run over thousands of chunks never holds one multi-minute
@@ -2251,13 +2260,18 @@ lock/marker/loop skeleton, `_run_embed_worker_loop`.
   or hybrid mode prints one stderr line when chunks lack a vector (`N of M chunks have no vector;
   the background embed worker fills them`) and ranks over the vectors present: `code_hits_vector`
   only reads rows at the current fingerprint, so an FTS-only chunk still ranks through the FTS
-  channel of the fusion. `code-search` never spawns the worker.
-- **Spawn sites.** `spawn_code_embed_worker` raises the marker (create or bump its mtime, so a
-  running worker loops again) and starts the worker with a detached python `subprocess.Popen`
-  (`start_new_session=True`, stdin `DEVNULL`, stdout and stderr to the worker log, `close_fds`) —
-  the snippet `post-commit-reindex.sh` uses, never bash `&` or `setsid`. It returns `spawned`,
-  `pending` (the lock is held, a worker is already running), `off` (`MEMCONTINUUM_EMBED_WORKER=0`:
-  the marker is still raised) or `failed`. Callers: `scripts/repo-init.sh` runs
+  channel of the fusion in `hybrid` mode, while pure `vector` mode ranks vectors only and cannot
+  reach it (its notice says `use --mode hybrid to reach them`). `code-search` never spawns the
+  worker.
+- **Spawn sites.** `spawn_code_embed_worker` and the store's `spawn_embed_worker` (reached by
+  `post-commit-reindex.sh` as `embed-worker --spawn`) both go through `_spawn_embed_worker`, the
+  repo's one `Popen` site: raise the marker (create or bump its mtime, so a running worker loops
+  again) and start the worker with a detached python `subprocess.Popen` (`start_new_session=True`,
+  stdin `DEVNULL`, stdout and stderr to the worker log, `close_fds`), never bash `&` or `setsid`.
+  It ALWAYS spawns when the marker is raised (a worker that finds the lock held exits 0 at once;
+  probing the lock first could leave a request waiting while a worker was finishing). It returns
+  `spawned`, `off` (`MEMCONTINUUM_EMBED_WORKER=0`: the marker is still raised) or `failed
+  reason=<marker|log|spawn>`. Callers: `scripts/repo-init.sh` runs
   `code-embed-worker --project P --spawn` once after its last `--no-embed` code-reindex, and
   `code-refresh` calls it on BOTH events whenever `awaiting_embedding > 0`, after the preflight and
   independent of the drift check (a current index with zero vectors is filled too); on `Stop` it
@@ -3054,9 +3068,9 @@ of the line to decide `embed=pending|clean` (see the embed-worker section
 below); it is `0` on a fully-embedded store, never omitted.
 
 **The background embed-worker** (`memidx.py embed-worker`): when the
-post-commit hook's content pass leaves `N > 0`, it touches
-`$MEMCONTINUUM_HOME/<project>.embed-pending` and spawns
-`embed-worker --root … --project … --db …` detached
+post-commit hook's content pass leaves `N > 0`, it calls
+`embed-worker --spawn --python "$PY" --root … --project … --db …`, which touches
+`$MEMCONTINUUM_HOME/<project>.embed-pending` and spawns the worker detached
 (`subprocess.Popen(start_new_session=True)` from Python -- never bash `&`,
 never a `setsid` binary, which macOS does not ship; stdio redirected to
 `<project>.embed.log`, never the shared `hook.log`). `embed-worker` takes a

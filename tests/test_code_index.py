@@ -5727,10 +5727,14 @@ class TestCodeEmbedWorker(unittest.TestCase):
             report = memidx.code_index_report(conn, self.PROJECT)
             self.assertEqual(report["embedding_mode"], "full")
             out = {}
-            with mock.patch.object(memidx, "compute_embeddings", side_effect=AssertionError("heal embedded")), \
-                 mock.patch.object(memidx, "load_embedding_model", side_effect=AssertionError("heal loaded a model")):
+            compute, loader = mock.Mock(), mock.Mock()
+            with mock.patch.object(memidx, "compute_embeddings", compute), \
+                 mock.patch.object(memidx, "load_embedding_model", loader):
                 after, conn = memidx.heal_code_index(conn, db, self.PROJECT, report, limit=500, result=out)
             conn.close()
+            # recorded, not raised: try_compute_embeddings swallows exceptions
+            compute.assert_not_called()
+            loader.assert_not_called()
             self.assertEqual(out["outcome"], "healed")
             self.assertEqual(after["embedding_mode"], "partial")
             self.assertEqual(after["awaiting_embedding"], 1)
@@ -5760,7 +5764,13 @@ class TestCodeEmbedWorker(unittest.TestCase):
                 self.assertEqual(data["awaiting_embedding"], 1)
                 self.assertIn("1 of 4 chunks have no vector; the background embed worker fills them", err)
             data, err = self._search(db, "zebra_unique", mode="hybrid")
+            self.assertNotIn("use --mode hybrid", err)
+            # hybrid REACHES the FTS-only chunk; pure vector mode ranks vectors only and cannot
+            self.assertIn("zebra_unique", [r["qualified_name"] for r in data["results"]])
             self.assertEqual(data["results"][0]["qualified_name"], "zebra_unique", data["results"])
+            data, err = self._search(db, "zebra_unique", mode="vector")
+            self.assertNotIn("zebra_unique", [r["qualified_name"] for r in data["results"]])
+            self.assertIn("; use --mode hybrid to reach them", err)
             # nothing awaiting -> no notice
             self.assertEqual(self._worker(db), 0)
             data, err = self._search(db, "zebra_unique")
@@ -5787,13 +5797,314 @@ class TestCodeEmbedWorker(unittest.TestCase):
                 self.assertIs(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
                 self.assertTrue(popen.call_args.kwargs["close_fds"])
                 popen.reset_mock()
+                # a held lock no longer suppresses the spawn: the worker that
+                # finds it held exits 0 itself (MAJOR 1)
                 fd = os.open(str(memidx._code_embed_lock_path(db, self.PROJECT)), os.O_CREAT | os.O_RDWR, 0o644)
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    self.assertEqual(memidx.spawn_code_embed_worker(db, self.PROJECT), "pending")
+                    self.assertEqual(memidx.spawn_code_embed_worker(db, self.PROJECT), "spawned")
                 finally:
                     os.close(fd)
+                popen.assert_called_once()
+
+
+class TestEmbedWorkerFixRound1(unittest.TestCase):
+    """Embeddings-on fix round 1 (TOP-0137 L2 step 5): shutdown race in the
+    shared worker loop, atomic batch writes, no write lock across a model
+    load, write-safe companion files, one spawn helper."""
+
+    PROJECT = memidx.DEFAULT_PROJECT
+
+    def _index(self, td, n=3, embed=False):
+        return TestCodeEmbedWorker._index(self, td, n=n, embed=embed)
+
+    # -- MAJOR 1: no request is lost at worker shutdown ----------------------
+
+    def _loop_with_marker(self, td, hook):
+        """Run the shared loop with a marker Path whose removal (unlink OR the
+        claim-rename) fires `hook(marker)` right after it happened -- a producer
+        racing the shutdown."""
+        calls = []
+
+        class RacyPath(type(Path())):
+            def _fire(self_, before):
+                hook(self_, before)
+
+            def unlink(self_, *a, **kw):
+                self_._fire(True)
+                r = super().unlink(*a, **kw)
+                self_._fire(False)
+                return r
+
+            def replace(self_, target):
+                self_._fire(True)
+                r = super().replace(target)
+                self_._fire(False)
+                return r
+
+        marker = RacyPath(td) / "p.embed-pending"
+        marker.touch()
+        os.utime(marker, ns=(1_000_000_000, 1_000_000_000))
+        rc = memidx._run_embed_worker_loop(
+            Path(td) / "p.lock", marker, Path(td) / "p.log", "t-worker", lambda: calls.append(1),
+        )
+        return rc, calls, marker
+
+    def test_marker_recreated_right_after_removal_is_processed_by_the_same_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            fired = []
+
+            def hook(marker, before):
+                if not before and not fired and not Path(str(marker)).exists():
+                    fired.append(1)
+                    Path(str(marker)).touch()
+                    os.utime(str(marker), ns=(2_000_000_000, 2_000_000_000))
+
+            rc, calls, marker = self._loop_with_marker(td, hook)
+            self.assertEqual((rc, len(calls)), (0, 2), "the recreated marker must get a second pass")
+            self.assertFalse(Path(str(marker)).exists())
+
+    def test_marker_touched_between_the_stat_and_the_removal_is_not_deleted_unseen(self):
+        with tempfile.TemporaryDirectory() as td:
+            fired = []
+
+            def hook(marker, before):
+                if before and not fired and Path(str(marker)).exists():
+                    fired.append(1)
+                    os.utime(str(marker), ns=(3_000_000_000, 3_000_000_000))
+
+            rc, calls, marker = self._loop_with_marker(td, hook)
+            self.assertEqual((rc, len(calls)), (0, 2))
+            self.assertFalse(Path(str(marker)).exists())
+
+    def test_store_spawn_helper_spawns_even_while_the_lock_is_held(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "p.sqlite"
+            popen = mock.Mock()
+            fd = os.open(str(memidx._embed_lock_path(db, "p")), os.O_CREAT | os.O_RDWR, 0o644)
+            env = {k: v for k, v in os.environ.items() if k != "MEMCONTINUUM_EMBED_WORKER"}
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(memidx.subprocess, "Popen", popen):
+                    self.assertEqual(memidx.spawn_embed_worker(db, "p", td), "spawned")
+            finally:
+                os.close(fd)
+            popen.assert_called_once()
+            self.assertEqual(popen.call_args.args[0][2:4], ["embed-worker", "--root"])
+            self.assertTrue(memidx._embed_marker_path(db, "p").exists())
+
+    # -- MAJOR 2: atomic existence check + orphan sweep ----------------------
+
+    def test_a_chunk_deleted_by_another_connection_mid_batch_leaves_no_orphan_vector(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._index(td, n=3)
+            attempts = []
+            real_open = memidx.open_code_db
+
+            def trace_open(path, *a, **kw):
+                conn = real_open(path, *a, **kw)
+                seen = []
+
+                def tracer(sql):
+                    # the SECOND batch's insert: the first batch's commit has released the
+                    # file-walk transaction, so only the batch's own transaction can serialise
+                    if sql.startswith("INSERT OR REPLACE INTO embeddings"):
+                        seen.append(1)
+                    if sql.startswith("INSERT OR REPLACE INTO embeddings") and len(seen) == 2:
+                        c2 = sqlite3.connect(str(db), timeout=0.2)
+                        try:
+                            c2.execute("DELETE FROM chunks WHERE id NOT IN (SELECT chunk_id FROM embeddings)")
+                            c2.commit()
+                            attempts.append("deleted")
+                        except sqlite3.OperationalError:
+                            attempts.append("blocked")
+                        finally:
+                            c2.close()
+                conn.set_trace_callback(tracer)
+                return conn
+
+            with _fake_model_patch(), mock.patch.object(memidx, "open_code_db", trace_open), \
+                 mock.patch.object(memidx, "CODE_EMBED_BATCH", 1), contextlib.redirect_stdout(io.StringIO()):
+                code_reindex(root, db, lang="python", no_embed=False)
+            conn = sqlite3.connect(str(db))
+            orphans = conn.execute(
+                "SELECT COUNT(*) FROM embeddings WHERE chunk_id NOT IN (SELECT id FROM chunks)"
+            ).fetchone()[0]
+            conn.close()
+            self.assertEqual(attempts, ["blocked"], "the concurrent delete must be serialised out")
+            self.assertEqual(orphans, 0, f"orphan vector left behind (concurrent delete: {attempts})")
+
+    def test_orphan_sweep_removes_planted_rows_and_vector_search_never_ranks_them(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._index(td, n=3, embed=True)
+            query = "func_1"
+            qvec = _FakeEmbedModel._vec(query)
+            fp = memidx.embedding_fingerprint(_FakeEmbedModel())
+            conn = sqlite3.connect(str(db))
+            conn.execute(
+                "INSERT INTO embeddings (chunk_id, project, dim, vector, embed_fp) VALUES (?,?,?,?,?)",
+                (999999, self.PROJECT, memidx.EMBED_DIM, memidx.pack_vector(qvec), fp),
+            )
+            conn.commit()
+            conn.close()
+            out, err = io.StringIO(), io.StringIO()
+            args = SimpleNamespace(
+                db=str(db), project=self.PROJECT, query=query, mode="vector", limit=1, json=True,
+                decision_db=None, no_heal=True, heal_limit=500, verify_content=False,
+            )
+            with _fake_model_patch(), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertEqual(memidx.cmd_code_search(args), 0, err.getvalue())
+            self.assertEqual(len(json.loads(out.getvalue())["results"]), 1, "an orphan consumed the result slot")
+            marker = memidx._code_embed_marker_path(db, self.PROJECT)
+            marker.touch()
+            with _fake_model_patch(), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(memidx.cmd_code_embed_worker(
+                    SimpleNamespace(project=self.PROJECT, db=str(db), spawn=False)), 0)
+            conn = sqlite3.connect(str(db))
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM embeddings WHERE chunk_id=999999").fetchone()[0], 0)
+            conn.close()
+            self.assertIn("removed 1 orphan vector(s)",
+                          memidx._code_embed_log_path(db, self.PROJECT).read_text())
+
+    # -- MAJOR 3: no write lock across a model load or an embed call ---------
+
+    def test_no_write_lock_is_held_while_the_model_loads_or_embeds(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._index(td, n=3)
+            probes = []
+
+            def probe(label):
+                c2 = sqlite3.connect(str(db), timeout=0.2)
+                try:
+                    c2.execute("BEGIN IMMEDIATE")
+                    c2.execute("ROLLBACK")
+                    probes.append((label, "free"))
+                except sqlite3.OperationalError:
+                    probes.append((label, "LOCKED"))
+                finally:
+                    c2.close()
+
+            model = _FakeEmbedModel()
+            real_embed = model.embed
+
+            def embed(texts):
+                probe("embed")
+                return real_embed(texts)
+
+            model.embed = embed
+
+            def load():
+                probe("load")
+                return model, memidx.embedding_fingerprint(model)
+
+            with mock.patch.object(memidx, "load_embedding_model", side_effect=load), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(code_reindex(root, db, lang="python", no_embed=False), 0)
+            self.assertEqual(probes[0], ("load", "free"), probes)
+            self.assertTrue(any(l == "embed" for l, _ in probes), probes)
+            self.assertEqual([p for p in probes if p[1] != "free"], [], probes)
+
+    # -- MAJOR 4: write-safe companion files ----------------------------------
+
+    def _spawn_env(self):
+        return {k: v for k, v in os.environ.items() if k != "MEMCONTINUUM_EMBED_WORKER"}
+
+    def _spawners(self, td):
+        db = Path(td) / "p.sqlite"
+        return [
+            ("code", db, lambda: memidx.spawn_code_embed_worker(db, "p"),
+             memidx._code_embed_marker_path(db, "p"), memidx._code_embed_log_path(db, "p")),
+            ("store", db, lambda: memidx.spawn_embed_worker(db, "p", td),
+             memidx._embed_marker_path(db, "p"), memidx._embed_log_path(db, "p")),
+        ]
+
+    def test_a_symlinked_log_is_refused_by_both_spawn_paths(self):
+        for kind in ("code", "store"):
+            with tempfile.TemporaryDirectory() as td:
+                _, db, spawn, marker, log = [s for s in self._spawners(td) if s[0] == kind][0]
+                target = Path(td) / "victim.txt"
+                target.write_text("keep")
+                log.symlink_to(target)
+                popen = mock.Mock()
+                with mock.patch.dict(os.environ, self._spawn_env(), clear=True), \
+                     mock.patch.object(memidx.subprocess, "Popen", popen):
+                    self.assertEqual(spawn(), "failed reason=log", kind)
                 popen.assert_not_called()
+                self.assertEqual(target.read_text(), "keep")
+
+    def test_a_fifo_marker_is_refused_without_blocking_by_both_spawn_paths(self):
+        import signal
+        for kind in ("code", "store"):
+            with tempfile.TemporaryDirectory() as td:
+                _, db, spawn, marker, log = [s for s in self._spawners(td) if s[0] == kind][0]
+                os.mkfifo(str(marker))
+                popen = mock.Mock()
+                signal.alarm(10)  # a blocking open would hang the suite; fail instead
+                try:
+                    with mock.patch.dict(os.environ, self._spawn_env(), clear=True), \
+                         mock.patch.object(memidx.subprocess, "Popen", popen):
+                        self.assertEqual(spawn(), "failed reason=marker", kind)
+                finally:
+                    signal.alarm(0)
+                popen.assert_not_called()
+
+    def test_a_symlinked_marker_is_refused_by_both_spawn_paths(self):
+        for kind in ("code", "store"):
+            with tempfile.TemporaryDirectory() as td:
+                _, db, spawn, marker, log = [s for s in self._spawners(td) if s[0] == kind][0]
+                target = Path(td) / "victim.txt"
+                target.write_text("keep")
+                marker.symlink_to(target)
+                mtime = target.stat().st_mtime_ns
+                with mock.patch.dict(os.environ, self._spawn_env(), clear=True), \
+                     mock.patch.object(memidx.subprocess, "Popen", mock.Mock()):
+                    self.assertEqual(spawn(), "failed reason=marker", kind)
+                self.assertEqual(target.stat().st_mtime_ns, mtime)
+
+    def test_a_symlinked_lock_is_refused_by_both_workers(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._index(td, n=1)
+            store_root = Path(td) / "store"
+            store_root.mkdir()
+            target = Path(td) / "victim.txt"
+            target.write_text("keep")
+            cases = [
+                (memidx._code_embed_lock_path(db, self.PROJECT), memidx._code_embed_marker_path(db, self.PROJECT),
+                 lambda: memidx.cmd_code_embed_worker(SimpleNamespace(project=self.PROJECT, db=str(db), spawn=False))),
+                (memidx._embed_lock_path(db, self.PROJECT), memidx._embed_marker_path(db, self.PROJECT),
+                 lambda: memidx.cmd_embed_worker(SimpleNamespace(project=self.PROJECT, db=str(db), root=str(store_root)))),
+            ]
+            for lock, marker, run in cases:
+                lock.symlink_to(target)
+                marker.touch()
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(run(), 3, lock.name)
+                self.assertIn("embed=failed reason=lock", err.getvalue())
+                self.assertEqual(target.read_text(), "keep")
+                self.assertTrue(marker.exists(), "a refused worker leaves the marker for a healthy one")
+
+    def test_a_symlinked_log_is_not_followed_by_a_failing_worker(self):
+        with tempfile.TemporaryDirectory() as td:
+            marker, log, lock = Path(td) / "m", Path(td) / "l", Path(td) / "k"
+            target = Path(td) / "victim.txt"
+            target.write_text("keep")
+            log.symlink_to(target)
+            marker.touch()
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = memidx._run_embed_worker_loop(lock, marker, log, "t-worker", lambda: "boom")
+            self.assertEqual(rc, 3)
+            self.assertEqual(target.read_text(), "keep")
+            self.assertIn("embed=failed reason=log", err.getvalue())
+
+    def test_one_popen_site_for_the_embed_workers(self):
+        root = Path(memidx.__file__).resolve().parent
+        self.assertNotIn("Popen(", (root / "hooks" / "post-commit-reindex.sh").read_text())
+        src = Path(memidx.__file__).read_text()
+        self.assertEqual(src.count("start_new_session=True, stdin=subprocess.DEVNULL"), 1)
+        self.assertEqual(src.count("Path(__file__).resolve()), *argv_tail"), 1)
 
 
 if __name__ == "__main__":

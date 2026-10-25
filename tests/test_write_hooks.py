@@ -6463,7 +6463,7 @@ class TestCodeRefreshHook(HookTestBase):
         self.assertFalse(rec.exists(), "MEMCONTINUUM_EMBED_WORKER=0 must not spawn")
         self.assertTrue(self.embed_marker().exists())
 
-    def test_no_second_spawn_while_the_worker_lock_is_held(self):
+    def test_spawn_happens_even_while_the_worker_lock_is_held(self):
         self.build_chunky_index()
         py, rec = self.record_popen_python()
         fd = os.open(str(self.home / f"{self.project}.code-embed.lock"), os.O_CREAT | os.O_RDWR, 0o644)
@@ -6472,8 +6472,11 @@ class TestCodeRefreshHook(HookTestBase):
             line, _ = self.run_hook("Stop", env=self.refresh_env(MEMCONTINUUM_PYTHON=py, MEMCONTINUUM_EMBED_WORKER="1"))
         finally:
             os.close(fd)
-        self.assertTrue(line.endswith("embed=pending"), line)
-        self.assertFalse(rec.exists())
+        # the lock-probe `pending` answer is gone: a worker finding the lock
+        # held exits 0 itself, so a worker finishing right now cannot swallow
+        # the request
+        self.assertTrue(line.endswith("embed=spawned"), line)
+        self.assertEqual(len(rec.read_text().splitlines()), 1)
 
     def test_nothing_awaiting_is_clean_and_spawns_nothing(self):
         self.build_chunky_index()

@@ -217,41 +217,20 @@ if [ "$RC" -eq 0 ]; then
 fi
 
 if [ "$EMBED_STATE" = "pending" ]; then
-    MARKER="$MEMCONTINUUM_HOME/$PROJECT.embed-pending"
-    touch "$MARKER" 2>/dev/null || true
-    if [ "${MEMCONTINUUM_EMBED_WORKER:-1}" != "0" ]; then
-        LOGF="$MEMCONTINUUM_HOME/$PROJECT.embed.log"
-        # Design R8: spawned from Python (subprocess.Popen with a new
-        # session), never bash `&` and never a `setsid` binary (macOS
-        # ships neither `setsid` nor `flock`/`timeout` -- see
-        # docs/INTERNALS.md's watchdog section). The watchdog launcher
-        # above kills the WHOLE process group of its guarded child on
-        # timeout (or its own death) via `os.killpg` -- a plain `bash foo
-        # &` job stays inside that same group and would die with it,
-        # before ever getting to run. `start_new_session=True` puts this
-        # worker in a brand-new process group/session that `killpg`
-        # cannot reach, so a watchdog kill (or the launcher's own
-        # unconditional post-success group sweep) can never take the
-        # worker down with it. Uses "$PY" (this hook's own resolved
-        # python, not sys.executable) as the WORKER's interpreter too, so
-        # a test that points MEMCONTINUUM_PYTHON at a stub keeps that
-        # same stub in the spawned worker.
-        "$PY" -c '
-import subprocess
-import sys
-
-py, memidx_path, root, project, db, log_path = sys.argv[1:7]
-log = open(log_path, "ab")
-subprocess.Popen(
-    [py, memidx_path, "embed-worker", "--root", root, "--project", project, "--db", db],
-    start_new_session=True,
-    stdin=subprocess.DEVNULL,
-    stdout=log,
-    stderr=log,
-    close_fds=True,
-)
-' "$PY" "$MEMIDX" "$MEMCONTINUUM_ROOT" "$PROJECT" "$DB_PATH" "$LOGF" >/dev/null 2>&1 || true
-    fi
+    # Design R8: the marker is raised and the detached worker started by
+    # memidx's ONE shared spawn helper (`embed-worker --spawn`): a Python
+    # subprocess.Popen with a new session, never bash `&` and never a
+    # `setsid` binary (macOS ships neither `setsid` nor `flock`/`timeout` --
+    # see docs/INTERNALS.md's watchdog section). The watchdog launcher above
+    # kills the WHOLE process group of its guarded child on timeout, and a
+    # plain `bash foo &` job would die with it; `start_new_session=True`
+    # puts the worker in a group `killpg` cannot reach. The helper opens the
+    # marker and the worker log O_NOFOLLOW + regular-file-only (write-safety
+    # checklist), always spawns (a worker that finds the lock held exits 0),
+    # and honours MEMCONTINUUM_EMBED_WORKER=0 itself (marker raised, nothing
+    # started). "$PY" is this hook's own resolved python, so a test that
+    # points MEMCONTINUUM_PYTHON at a stub keeps that stub in the worker.
+    "$PY" "$MEMIDX" embed-worker --spawn --python "$PY" --root "$MEMCONTINUUM_ROOT" --project "$PROJECT" --db "$DB_PATH" >/dev/null 2>&1 || true
 fi
 
 # --- 3. post-commit re-lint (INC-0128) --------------------------------------

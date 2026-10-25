@@ -10,7 +10,7 @@
   installer starts it after the first index, and `code-refresh.sh` starts it on
   `Stop` and `SessionStart` whenever chunks lack a vector, so an existing index
   fills itself the first time you open or finish a session after upgrading;
-  `embed=spawned|pending|clean|off` in the `code-refresh` `hook.log` line says
+  `embed=spawned|clean|off` in the `code-refresh` `hook.log` line says
   which. Vectors are committed in batches of 128, so a killed worker keeps its
   progress. `embedding_mode` is now `none`, `partial` or `full`, recomputed from
   what is really embedded after every pass; the `code-reindex` summary ends with

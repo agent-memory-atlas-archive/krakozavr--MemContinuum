@@ -5738,6 +5738,8 @@ class TestEmbedModelParity(unittest.TestCase):
             self.assertEqual(len(a), len(b))
             for text, va, vb in zip(self.TEXTS, a, b):
                 self.assertEqual(len(vb), memidx.EMBED_DIM)
+                # cosine is scale-free: only the norm shows normalisation is on
+                self.assertAlmostEqual(sum(x * x for x in vb) ** 0.5, 1.0, places=3, msg=f"{fn} norm: {text!r}")
                 self.assertGreaterEqual(self._cos(va, vb), 0.9999, f"{fn}: {text!r}")
 
     def test_registration_is_idempotent_and_fingerprint_names_the_pipeline(self):
@@ -5770,7 +5772,7 @@ class TestSingleEmbeddingConstructionSite(unittest.TestCase):
             "construct models only through memidx._text_embedding()",
         )
         in_memidx = [o for o in offenders if o.startswith("memidx.py:")]
-        self.assertEqual(len(in_memidx), 2, in_memidx)  # the two branches of _text_embedding
+        self.assertEqual(len(in_memidx), 1, in_memidx)  # the single kwargs-based construction in _text_embedding
 
 
 class TestStoreMismatchedFingerprintIsAwaiting(unittest.TestCase):

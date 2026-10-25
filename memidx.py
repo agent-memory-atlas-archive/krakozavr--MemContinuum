@@ -2327,6 +2327,100 @@ def _embed_log_path(db_path: Path, project: str) -> Path:
     return Path(db_path).parent / f"{project}.embed.log"
 
 
+class AuxFileRefused(Exception):
+    """An embed-worker companion file (log, marker, lock) is not a plain
+    regular file we may open: a symlink, a FIFO, a device, ... `what` names
+    which one (`log` | `marker` | `lock`)."""
+
+    def __init__(self, what: str):
+        super().__init__(what)
+        self.what = what
+
+
+def _open_aux_file(path: Path, flags: int, what: str) -> int:
+    """The ONE opener for the embed workers' companion files (write-safety
+    checklist, docs/INTERNALS.md): O_NOFOLLOW (a symlink is refused, never
+    followed), O_NONBLOCK (a FIFO with no reader can never hang the open),
+    O_CLOEXEC, then `fstat` and a refusal of anything that is not a regular
+    file. Returns the fd; raises AuxFileRefused(what) otherwise."""
+    try:
+        fd = os.open(
+            str(path),
+            flags | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0),
+            0o644,
+        )
+    except (OSError, NotImplementedError) as exc:
+        raise AuxFileRefused(what) from exc
+    try:
+        if not S_ISREG(os.fstat(fd).st_mode):
+            raise AuxFileRefused(what)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _touch_aux_marker(marker: Path) -> None:
+    """Create the marker or bump its mtime (so a RUNNING worker loops again).
+    Raises AuxFileRefused("marker")."""
+    fd = _open_aux_file(marker, os.O_CREAT | os.O_WRONLY, "marker")
+    try:
+        os.utime(fd)
+    except OSError as exc:
+        raise AuxFileRefused("marker") from exc
+    finally:
+        os.close(fd)
+
+
+def _append_aux_log(log_path: Path, text: str) -> bool:
+    """Append `text` to the worker log through _open_aux_file. Best effort:
+    False (nothing written) on a refused or unwritable log."""
+    try:
+        fd = _open_aux_file(log_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, "log")
+    except AuxFileRefused:
+        return False
+    try:
+        os.write(fd, text.encode("utf-8", errors="replace"))
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _spawn_embed_worker(marker: Path, log_path: Path, argv_tail: list, python: str | None = None) -> str:
+    """The ONE spawn site for both background embed workers (store and
+    code): raise `marker`, then -- unless MEMCONTINUUM_EMBED_WORKER=0 --
+    ALWAYS start a detached worker (`python memidx.py <argv_tail>`,
+    start_new_session, stdin DEVNULL, stdout/stderr -> the log, close_fds;
+    never bash `&`/`setsid`: the watchdog kills its guarded child's whole
+    process group, and the worker must outlive it). A worker that finds the
+    lock already held exits 0 at once, so a producer never has to probe the
+    lock (probing is what left a request waiting when a worker was just
+    finishing). Returns `spawned` | `off` (marker raised, nothing started)
+    | `failed reason=<marker|log|spawn>`. Never raises."""
+    try:
+        _touch_aux_marker(marker)
+    except AuxFileRefused as exc:
+        return f"failed reason={exc.what}"
+    if os.environ.get("MEMCONTINUUM_EMBED_WORKER", "1") == "0":
+        return "off"
+    try:
+        log_fd = _open_aux_file(log_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, "log")
+    except AuxFileRefused as exc:
+        return f"failed reason={exc.what}"
+    try:
+        subprocess.Popen(
+            [python or sys.executable, str(Path(__file__).resolve()), *argv_tail],
+            start_new_session=True, stdin=subprocess.DEVNULL, stdout=log_fd, stderr=log_fd, close_fds=True,
+        )
+    except OSError:
+        return "failed reason=spawn"
+    finally:
+        os.close(log_fd)
+    return "spawned"
+
+
 def _run_embed_worker_loop(lock_path: Path, marker_path: Path, log_path: Path, label: str, run_pass) -> int:
     """The lock/marker/loop skeleton shared by `embed-worker` (the store) and
     `code-embed-worker` (the code index) -- TOP-0137 L2 step 5 extracted it
@@ -2335,29 +2429,35 @@ def _run_embed_worker_loop(lock_path: Path, marker_path: Path, log_path: Path, l
     Lock: `fcntl.flock(LOCK_EX | LOCK_NB)` on `lock_path`; `BlockingIOError`
     means another worker owns the marker -> exit 0 at once. Loop: while the
     marker exists, note its `mtime_ns`, call `run_pass()` (returns None on a
-    clean pass, or a message when it failed open without raising), then, if
-    the marker's mtime_ns is unchanged, unlink it and stop; if a producer
-    retouched it mid-pass, go round again. An exception or a failure message
+    clean pass, or a message when it failed open without raising), then
+    CLAIM the marker by renaming it aside: a touch before the rename shows
+    in the claimed file's mtime (-> raise the marker again and go round), a
+    touch after it makes a fresh marker (-> the loop's own `exists()` sees it).
+    So no request can be deleted unseen. After the lock is released the
+    marker is checked once more and, if a producer raised it around the
+    release, the lock is taken again. An exception or a failure message
     leaves the marker, appends the traceback/message to `log_path` under a
-    `--- <ts> <label> ---` header and returns 3."""
-    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    `--- <ts> <label> ---` header and returns 3. A log, marker or lock that
+    is not a plain regular file (symlink, FIFO, ...) is refused: reason on
+    stderr, exit 3."""
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        # Another worker already owns the marker -- nothing to do here.
-        os.close(lock_fd)
-        return 0
+        lock_fd = _open_aux_file(lock_path, os.O_CREAT | os.O_RDWR, "lock")
+    except AuxFileRefused as exc:
+        print(f"{label}: embed=failed reason={exc.what}", file=sys.stderr)
+        return 3
 
     def log(body: str) -> None:
+        ts = datetime.now(timezone.utc).isoformat()
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now(timezone.utc).isoformat()
-            with log_path.open("a", encoding="utf-8") as fh:
-                fh.write(f"--- {ts} {label} ---\n{body}\n")
-        except Exception:
+        except OSError:
             pass
+        if not _append_aux_log(log_path, f"--- {ts} {label} ---\n{body}\n"):
+            print(f"{label}: embed=failed reason=log", file=sys.stderr)
 
-    try:
+    claim_path = marker_path.with_name(marker_path.name + ".claim")
+
+    def drain() -> int:
         while marker_path.exists():
             try:
                 m0 = marker_path.stat().st_mtime_ns
@@ -2374,23 +2474,47 @@ def _run_embed_worker_loop(lock_path: Path, marker_path: Path, log_path: Path, l
                 log(failure)
                 return 3
             try:
-                still = marker_path.stat().st_mtime_ns
+                marker_path.replace(claim_path)
             except OSError:
-                still = None
-            if still == m0:
+                break  # vanished -- cleared by someone else
+            try:
+                claimed = claim_path.stat().st_mtime_ns
+            except OSError:
+                claimed = None
+            try:
+                claim_path.unlink()
+            except OSError:
+                pass
+            if claimed != m0:
+                # Retouched between the pass and the claim: that request is
+                # in the pass-start state of the claimed file only -- raise
+                # the marker again so the next round picks it up.
                 try:
-                    marker_path.unlink()
+                    _touch_aux_marker(marker_path)
+                except AuxFileRefused:
+                    pass
+            # loop: `exists()` also catches a marker recreated after the rename
+        return 0
+
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                # Another worker already owns the marker -- nothing to do here.
+                return 0
+            try:
+                rc = drain()
+            finally:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 except OSError:
                     pass
-                break
-            # else: retouched mid-pass (a commit landed while this one
-            # ran) -- loop again, no sleep needed.
-        return 0
+            if rc != 0 or not marker_path.exists():
+                return rc
+            # A producer raised the marker around the lock release (its
+            # spawned worker may have exited on our lock): take the lock again.
     finally:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
         os.close(lock_fd)
 
 
@@ -2454,6 +2578,28 @@ def cmd_embed_worker(args) -> int:
         _embed_lock_path(db_path, args.project), _embed_marker_path(db_path, args.project),
         _embed_log_path(db_path, args.project), "embed-worker", run_pass,
     )
+
+
+def spawn_embed_worker(db_path: Path, project: str, root, python: str | None = None) -> str:
+    """The store's spawn: raise `<project>.embed-pending` and start a
+    detached `embed-worker` (see _spawn_embed_worker -- the one shared Popen
+    site). Called by hooks/post-commit-reindex.sh through
+    `embed-worker --spawn`."""
+    return _spawn_embed_worker(
+        _embed_marker_path(db_path, project), _embed_log_path(db_path, project),
+        ["embed-worker", "--root", str(root), "--project", project, "--db", str(db_path)], python,
+    )
+
+
+def cmd_embed_worker_entry(args) -> int:
+    """`embed-worker` entry: --spawn only raises the marker and starts the
+    detached worker (the form the post-commit hook calls); without it, this
+    process IS the worker."""
+    if getattr(args, "spawn", False):
+        state = spawn_embed_worker(resolve_db_path(args), args.project, args.root, getattr(args, "python", None))
+        print(f"embed-worker: {state}")
+        return 1 if state.startswith("failed") else 0
+    return cmd_embed_worker(args)
 
 
 def embedding_backlog(db_path: Path, project: str) -> dict:
@@ -2553,9 +2699,8 @@ def _text_embedding(cache_dir: str | None = None):
         )
     except ValueError:
         pass  # already registered in this process
-    if cache_dir is None:
-        return TextEmbedding(model_name=EMBED_MODEL_NAME)
-    return TextEmbedding(model_name=EMBED_MODEL_NAME, cache_dir=str(cache_dir))
+    kwargs = {} if cache_dir is None else {"cache_dir": str(cache_dir)}
+    return TextEmbedding(model_name=EMBED_MODEL_NAME, **kwargs)
 
 
 def compute_embeddings(texts: list[str], model=None):
@@ -6654,12 +6799,6 @@ def cmd_code_reindex(args) -> int:
         conn.close()
         return 1
 
-    conn.execute(
-        "INSERT INTO code_project (project, langs, embedding_mode) VALUES (?,?,'none') "
-        "ON CONFLICT(project) DO UPDATE SET langs=excluded.langs",
-        (args.project, ",".join(langs)),
-    )
-
     existing = {
         row["path"]: (row["sha256"], row["chunker_version"], row["status"], row["attempt_key"])
         for row in conn.execute(
@@ -6700,6 +6839,14 @@ def cmd_code_reindex(args) -> int:
             _last_code_embedding_backend_failed = True
         else:
             model, current_fp = loaded
+
+    # The model is loaded ABOVE: no write transaction (this UPSERT opens
+    # one) is ever held across a model load.
+    conn.execute(
+        "INSERT INTO code_project (project, langs, embedding_mode) VALUES (?,?,'none') "
+        "ON CONFLICT(project) DO UPDATE SET langs=excluded.langs",
+        (args.project, ",".join(langs)),
+    )
 
     skipped_unknown: Counter = Counter()
     files = list(iter_code_source_files(root, langs, skipped_unknown))
@@ -7016,6 +7163,9 @@ def cmd_code_reindex(args) -> int:
         # next pass's unchanged-file top-up finds only the rest). The first
         # commit also publishes the file/chunk writes made so far, which is
         # safe: a chunk without a vector is exactly an "awaiting" chunk.
+        # The text pass is committed BEFORE the first model.embed call: no
+        # write lock is held while a batch is being computed.
+        conn.commit()
         for off in range(0, len(pending_texts), CODE_EMBED_BATCH):
             batch_texts = pending_texts[off:off + CODE_EMBED_BATCH]
             batch_ids = pending_ids[off:off + CODE_EMBED_BATCH]
@@ -7037,24 +7187,22 @@ def cmd_code_reindex(args) -> int:
                 )
                 _last_code_embedding_backend_failed = True
                 break
-            # A concurrent writer (a heal) may have replaced a file's chunks
-            # while this batch was being computed; ids are AUTOINCREMENT, so
-            # an id that no longer exists is simply dropped, never reused.
-            alive = {
-                r["id"] for r in conn.execute(
-                    f"SELECT id FROM chunks WHERE id IN ({','.join('?' * len(batch_ids))})", batch_ids
-                )
-            }
+            # One short write transaction per batch. The existence check is
+            # part of each INSERT (INSERT ... SELECT ... WHERE EXISTS), so a
+            # concurrent heal that replaced a file's chunks while the batch
+            # was being computed -- ids are AUTOINCREMENT, never reused --
+            # is serialised by the write lock: the vector is either written
+            # for a chunk that exists or not written at all.
+            conn.execute("BEGIN IMMEDIATE")
             written = 0
             for cid, v in zip(batch_ids, vecs):
-                if cid not in alive:
-                    continue
                 packed = pack_vector(v)
-                conn.execute(
-                    "INSERT OR REPLACE INTO embeddings (chunk_id, project, dim, vector, embed_fp) VALUES (?,?,?,?,?)",
-                    (cid, args.project, len(unpack_vector(packed)), packed, current_fp),
+                cur = conn.execute(
+                    "INSERT OR REPLACE INTO embeddings (chunk_id, project, dim, vector, embed_fp) "
+                    "SELECT ?,?,?,?,? WHERE EXISTS (SELECT 1 FROM chunks WHERE id=?)",
+                    (cid, args.project, len(unpack_vector(packed)), packed, current_fp, cid),
                 )
-                written += 1
+                written += max(cur.rowcount, 0)
             reembeds += written
             if written and current_fp is not None:
                 # Design R4: the fingerprint lands in the SAME transaction as
@@ -7444,7 +7592,8 @@ def code_hits_vector(conn: sqlite3.Connection, query: str, project: str, *, mode
     `stats["dimension_mismatch_rows"]` when given."""
     model, current_fp, qvec = _embed_qvec(query, model)
     rows = conn.execute(
-        "SELECT chunk_id, vector FROM embeddings WHERE project=? AND embed_fp=? AND dim=?",
+        "SELECT e.chunk_id, e.vector FROM embeddings e JOIN chunks c ON c.id = e.chunk_id "
+        "WHERE e.project=? AND e.embed_fp=? AND e.dim=?",
         (project, current_fp, len(qvec)),
     ).fetchall()
     return _score_rows_by_cosine(rows, qvec, "chunk_id", stats=stats)
@@ -8211,8 +8360,8 @@ _CODE_STATES_CURRENT = ("current", "metadata-current")
 
 def _kick_code_embed(db_path: Path, project: str, report: dict) -> str:
     """The refresh hook's embed field: `clean` (nothing awaits a vector), else
-    spawn_code_embed_worker's verdict (`spawned` | `pending` | `off` |
-    `failed`)."""
+    spawn_code_embed_worker's verdict (`spawned` | `off` |
+    `failed reason=<file>`)."""
     if report.get("awaiting_embedding", 0) <= 0:
         return "clean"
     return spawn_code_embed_worker(db_path, project)
@@ -8349,6 +8498,30 @@ def _code_embed_log_path(db_path: Path, project: str) -> Path:
     return Path(db_path).parent / f"{project}.code-embed.log"
 
 
+def _sweep_orphan_code_vectors(db_path: Path, project: str) -> int:
+    """Belt and braces for the batch write's in-transaction existence guard:
+    drop any vector whose chunk no longer exists and count it in the worker
+    log. Fail-open (returns 0 on any database error)."""
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=30)
+        try:
+            cur = conn.execute(
+                "DELETE FROM embeddings WHERE project=? AND chunk_id NOT IN (SELECT id FROM chunks)", (project,)
+            )
+            conn.commit()
+            n = cur.rowcount
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError:
+        return 0
+    if n:
+        _append_aux_log(
+            _code_embed_log_path(db_path, project),
+            f"--- {datetime.now(timezone.utc).isoformat()} code-embed-worker orphan sweep: removed {n} orphan vector(s) ---\n",
+        )
+    return n
+
+
 def cmd_code_embed_worker(args) -> int:
     """Fills the missing (and stale-fingerprint) vectors of a project's code
     index in the background; safe to run twice. Spawned detached by
@@ -8366,11 +8539,12 @@ def cmd_code_embed_worker(args) -> int:
     Exit 0 on a clean pass (or a held lock), 3 with the traceback (or a
     failed-open embedding backend) in the log and the marker left in place.
 
-    It does NOT take the code-refresh lock: with batched commits the worker
-    holds the write lock only for the initial stat walk and for each short
-    batch write, and a concurrent heal that replaced chunks mid-batch is
-    handled by the batch write dropping vectors for chunk ids that no longer
-    exist."""
+    It does NOT take the code-refresh lock: the model loads before any write,
+    the text pass commits before embedding starts, and each batch is its own
+    short BEGIN IMMEDIATE ... COMMIT whose INSERT checks the chunk still
+    exists in the same transaction (a concurrent heal that replaced chunks
+    mid-batch cannot leave an orphan vector); a final sweep removes any
+    orphan that still got through."""
     db_path = resolve_code_db_path(args)
     project = args.project
 
@@ -8403,15 +8577,15 @@ def cmd_code_embed_worker(args) -> int:
                     no_embed=False, full=False, retry_not_indexed=False,
                 ))
             out = buf.getvalue().strip()
-            try:
-                with _code_embed_log_path(db_path, project).open("a", encoding="utf-8") as fh:
-                    fh.write(f"--- {datetime.now(timezone.utc).isoformat()} code-embed-worker pass {root} rc={rc} ---\n{out}\n")
-            except OSError:
-                pass
+            _append_aux_log(
+                _code_embed_log_path(db_path, project),
+                f"--- {datetime.now(timezone.utc).isoformat()} code-embed-worker pass {root} rc={rc} ---\n{out}\n",
+            )
             if rc in (1, 2):
                 return f"code-reindex of {root} failed (rc={rc}); marker left in place for retry"
             if code_embedding_backend_failed():
                 return "embedding backend failed (code-reindex reported no exception but could not embed); marker left in place for retry"
+        _sweep_orphan_code_vectors(db_path, project)
         return None
 
     return _run_embed_worker_loop(
@@ -8421,56 +8595,16 @@ def cmd_code_embed_worker(args) -> int:
 
 
 def spawn_code_embed_worker(db_path: Path, project: str) -> str:
-    """Raise the `<project>.code-embed-pending` marker (create it, or bump its
-    mtime so a RUNNING worker loops again) and, unless one already holds the
-    lock or MEMCONTINUUM_EMBED_WORKER=0, start a detached `code-embed-worker`
-    -- the same python `subprocess.Popen(start_new_session=True, stdin
-    DEVNULL, stdout/stderr -> the worker log, close_fds)` shape as
-    hooks/post-commit-reindex.sh uses for the store (never bash `&`/`setsid`:
-    the watchdog kills its guarded child's whole process group, and the
-    worker must outlive it). Costs milliseconds. Returns `spawned` | `pending`
-    (a worker is already running and will see the marker) | `off` (spawning
-    disabled; the marker is still raised) | `failed` (marker or spawn
-    error). Fail-open: never raises."""
-    marker = _code_embed_marker_path(db_path, project)
-    try:
-        fd = os.open(str(marker), os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o644)
-        try:
-            os.utime(fd)
-        finally:
-            os.close(fd)
-    except (OSError, NotImplementedError):
-        return "failed"
-    if os.environ.get("MEMCONTINUUM_EMBED_WORKER", "1") == "0":
-        return "off"
-    lock = _code_embed_lock_path(db_path, project)
-    try:
-        lfd = os.open(str(lock), os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o644)
-    except OSError:
-        return "failed"
-    try:
-        try:
-            fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return "pending"
-        fcntl.flock(lfd, fcntl.LOCK_UN)
-    except OSError:
-        return "failed"
-    finally:
-        os.close(lfd)
-    try:
-        log = open(_code_embed_log_path(db_path, project), "ab")
-        try:
-            subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), "code-embed-worker",
-                 "--project", project, "--db", str(db_path)],
-                start_new_session=True, stdin=subprocess.DEVNULL, stdout=log, stderr=log, close_fds=True,
-            )
-        finally:
-            log.close()
-    except OSError:
-        return "failed"
-    return "spawned"
+    """Raise the `<project>.code-embed-pending` marker and start a detached
+    `code-embed-worker` through the shared _spawn_embed_worker (the repo's
+    one Popen site). Always spawns when the marker is raised -- a worker that
+    finds the lock held exits 0 at once. Returns `spawned` | `off` (spawning
+    disabled; the marker is still raised) | `failed reason=<file>`.
+    Fail-open: never raises."""
+    return _spawn_embed_worker(
+        _code_embed_marker_path(db_path, project), _code_embed_log_path(db_path, project),
+        ["code-embed-worker", "--project", project, "--db", str(db_path)],
+    )
 
 
 def cmd_code_embed_worker_entry(args) -> int:
@@ -8481,7 +8615,7 @@ def cmd_code_embed_worker_entry(args) -> int:
         db_path = resolve_code_db_path(args)
         state = spawn_code_embed_worker(db_path, args.project)
         print(f"code-embed-worker: {state}")
-        return 0 if state != "failed" else 1
+        return 1 if state.startswith("failed") else 0
     return cmd_code_embed_worker(args)
 
 
@@ -8659,9 +8793,10 @@ def cmd_code_search(args) -> int:
     # ranks through the FTS channel); this only says so. code-search never
     # spawns the worker -- the refresh hook and repo-init do.
     if args.mode in ("vector", "hybrid") and not embed_state and report["awaiting_embedding"] > 0:
+        tail = "; use --mode hybrid to reach them" if args.mode == "vector" else ""
         print(
             f"code-search: {report['awaiting_embedding']} of {report['chunk_total']} chunks have no "
-            "vector; the background embed worker fills them",
+            f"vector; the background embed worker fills them{tail}",
             file=sys.stderr,
         )
 
@@ -10127,7 +10262,17 @@ def main(argv=None) -> int:
         help="backfill embeddings for a store in the background; coalesces commits; safe to run twice",
     )
     add_common_args(p_embed_worker, need_root=True)
-    p_embed_worker.set_defaults(func=cmd_embed_worker)
+    p_embed_worker.add_argument(
+        "--spawn", action="store_true",
+        help="raise the pending marker and start the worker detached (honours "
+             "MEMCONTINUUM_EMBED_WORKER=0), then return at once",
+    )
+    p_embed_worker.add_argument(
+        "--python", default=None,
+        help="with --spawn: the interpreter that runs the detached worker (default: this one); "
+             "the post-commit hook passes its own resolved python",
+    )
+    p_embed_worker.set_defaults(func=cmd_embed_worker_entry)
 
     p_code_embed_worker = sub.add_parser(
         "code-embed-worker",
