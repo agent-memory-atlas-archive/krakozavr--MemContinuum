@@ -7015,7 +7015,8 @@ def cmd_code_reindex(args) -> int:
     # INC-0129 (confirmation gate round 3, H1): the snapshot is loaded HERE, after
     # the recorded-root guard has canonicalized an alias key, so an alias-only
     # root sees its migrated rows (removed-file cleanup, unchanged-file skip).
-    # Nothing between the model load and this point reads or writes file_sha.
+    # The guard above is the only file_sha writer in that span (alias UPDATE,
+    # duplicate-alias drop) and must stay above this load; nothing reads `existing` earlier.
     existing = {
         row["path"]: (row["sha256"], row["chunker_version"], row["status"], row["attempt_key"])
         for row in conn.execute(
