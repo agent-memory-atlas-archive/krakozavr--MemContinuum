@@ -3054,7 +3054,8 @@ def _score_rows_by_cosine(rows, qvec, id_key: str, *, stats: dict | None = None)
     one. Returns `(id, score)` pairs, best score first.
 
     Vectorised with numpy when it imports (one matrix product instead of
-    a per-row Python loop -- 104 ms -> 10 ms on a 3,459-vector code index,
+    a per-row Python loop -- 104 ms -> 5 to 10 ms on a 3,459-vector code index
+    (5.3 ms measured with a real query embedding, 10.0 ms with a random query),
     measured on the scorer alone; the earlier 0.33 s figure was taken
     through the eval harness on a loaded machine). Without numpy, or if the
     matrix block raises anything (a MemoryError, say), it falls back to
