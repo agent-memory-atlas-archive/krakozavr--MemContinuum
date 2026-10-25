@@ -8443,29 +8443,39 @@ def _resolved_root_set(roots) -> set:
 
 
 def _resolve_roots_checked(roots) -> tuple:
-    """(resolved set, unresolvable raw roots). `Path.resolve()` raises OSError
-    or, on a symlink loop, RuntimeError; such a root stays in the set in its
-    raw form and is reported, so a caller that would act destructively on the
-    set can refuse."""
+    """(resolved set, unresolvable raw roots). Resolution is strict first, so a
+    symlink loop or a missing path is reported on every Python: 3.12's lax
+    `resolve()` raises RuntimeError on a loop, 3.13's returns it unresolved. An
+    unresolvable root stays in the set in its lax-resolved form (filters use
+    it) and is listed, so a caller that would act destructively can refuse."""
     out, bad = set(), []
     for r in roots:
+        try:
+            out.add(str(Path(r).resolve(strict=True)))
+            continue
+        except (OSError, RuntimeError):
+            pass
+        bad.append(str(r))
         try:
             out.add(str(Path(r).resolve()))
         except (OSError, RuntimeError):
             out.add(str(r))
-            bad.append(str(r))
     return out, bad
 
 
 def _wired_roots_unsafe_for_drop(wired_list) -> str | None:
     """Why the stale-root drop must not run for this wiring, else None: a
-    relative root resolves against the hook's cwd (not the repo), and an
-    unresolvable one has no trustworthy identity -- either could mark a real
-    root stale (INC-0129, gate round 1 F1/F6)."""
+    relative root resolves against the hook's cwd (not the repo), and one that
+    does not strictly resolve to a directory has no trustworthy identity --
+    either could mark a real root stale (INC-0129, gate round 1 F1/F6; CI 3.13
+    round 4)."""
     if any(not os.path.isabs(str(r)) for r in wired_list):
         return "relative-wired-root"
     if _resolve_roots_checked(wired_list)[1]:
         return "unresolvable-wired-root"
+    for r in wired_list:
+        if not Path(r).resolve(strict=True).is_dir():
+            return "unresolvable-wired-root"
     return None
 
 
@@ -8645,6 +8655,11 @@ def _refresh_code_index_locked(args, project, db_path, marker, is_stop, res, ext
         wired = _resolved_root_set(wired_list) if wired_list else None
         stale = _stale_code_roots(conn, project, wired)
         unsafe = _wired_roots_unsafe_for_drop(_env_code_roots_raw()) if wired_list else None
+        if stale and not unsafe:
+            # Second guard: wiring and index must agree on at least one root.
+            n_recorded = conn.execute("SELECT COUNT(*) FROM code_meta WHERE project=?", (project,)).fetchone()[0]
+            if len(stale) >= n_recorded:
+                unsafe = "no-wired-root-recorded"
         if stale and unsafe:
             # The filters (heal, worker) still use the resolved set; only the
             # destructive step is withheld, and the marker is not a lie.

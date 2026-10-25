@@ -6719,18 +6719,41 @@ class TestCodeRefreshHook(HookTestBase):
         self.assertEqual(self.rows_of(old_s, ids=ids), before)
         self.assertEqual(self.rows_of(str(self.code_root.resolve())), a_before)
 
-    def test_an_unresolvable_wired_root_disables_the_drop_without_crashing(self):
+    def assert_drop_withheld(self, wired_root, detail):
         old_s = self.stale_state()
+        a_s = str(self.code_root.resolve())
         ids = self.chunk_ids(old_s)
         before = self.rows_of(old_s, ids=ids)
-        loop = Path(self.td) / "loop"
-        os.symlink(loop, loop)  # a symlink loop: Path.resolve() raises
-        env = self.refresh_env(MEMCONTINUUM_CODE_ROOTS=json.dumps([str(loop)]))
+        a_ids = self.chunk_ids(a_s)
+        a_before = self.rows_of(a_s, ids=a_ids)
+        self.assertTrue(a_ids)
+        env = self.refresh_env(MEMCONTINUUM_CODE_ROOTS=json.dumps([str(wired_root)]))
         line, _ = self.run_hook("Stop", env=env)
         self.assertNotIn("crash", line)
         self.assertIn("dropped=0", line)
-        self.assertIn("detail=stale-check-skipped:unresolvable-wired-root", line)
+        self.assertIn(f"detail=stale-check-skipped:{detail}", line)
         self.assertEqual(self.rows_of(old_s, ids=ids), before)
+        self.assertEqual(self.rows_of(a_s, ids=a_ids), a_before)
+        return line
+
+    def test_an_unresolvable_wired_root_disables_the_drop_without_crashing(self):
+        loop = Path(self.td) / "loop"
+        os.symlink(loop, loop)  # a symlink loop: 3.12 raises, 3.13 resolves lax
+        self.assert_drop_withheld(loop, "unresolvable-wired-root")
+
+    def test_a_missing_wired_root_disables_the_drop(self):
+        self.assert_drop_withheld(Path(self.td) / "does-not-exist", "unresolvable-wired-root")
+
+    def test_a_wired_root_that_is_a_file_disables_the_drop(self):
+        f = Path(self.td) / "plain-file"
+        f.write_text("x")
+        self.assert_drop_withheld(f, "unresolvable-wired-root")
+
+    def test_a_wired_root_recorded_nowhere_disables_the_drop(self):
+        other = Path(self.td) / "unrecorded-root"
+        other.mkdir()
+        line = self.assert_drop_withheld(other, "no-wired-root-recorded")
+        self.assertIn("unrecorded=1", line)
 
     def test_lock_held_skips_and_leaves_the_marker_untouched(self):
         self.build_code_index()

@@ -9,7 +9,7 @@
   now requires `--root DIR` (repeatable; the installer and the refresh hook pass
   the wired roots) and skips any recorded root not named; the heal skips them
   too; `code-refresh.sh` drops them on `Stop` (`dropped=<n>` in `hook.log`) and
-  only marks them on `SessionStart` (`stale-root=<n>`). A relative or unresolvable wired root disables the
+  only marks them on `SessionStart` (`stale-root=<n>`). A relative or unresolvable wired root, or a wiring that names no recorded root, disables the
   drop (`detail=stale-check-skipped:...`), and the worker's text pass refuses a
   root that is no longer recorded.
 - Code embeddings now get built, in the background. Until now every code index
