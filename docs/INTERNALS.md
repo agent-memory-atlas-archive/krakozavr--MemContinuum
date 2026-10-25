@@ -2235,9 +2235,13 @@ lock/marker/loop skeleton, `_run_embed_worker_loop`.
   next `lstat` sees, a producer's path-based `utime` that loses the race to the rename fails and
   recreates the marker, and after the lock is released the marker is checked once more (taking
   the lock again if it reappeared), so no request is deleted unseen. A clean pass deletes the
-  claim; a failed pass renames it back; a worker killed mid-pass leaves `<marker>.claim.<pid>`,
-  swept when older than an hour (exact name grammar, regular files only), and the next hook
-  preflight recomputes the awaiting count and raises the marker again. A claim rename error other
+  claim; a failed pass re-raises the request by touching a fresh marker (never by renaming the claim
+  back: nothing is ever renamed onto the marker path, which is only created or touched through the
+  O_NOFOLLOW touch or renamed away to the claim) and deletes its verified claim; an inspection
+  failure or a non-regular claim also re-raises the request but leaves the claim; a worker killed
+  mid-pass leaves `<marker>.claim.<pid>`, swept when older than an hour (exact name grammar,
+  regular files only), and the next hook preflight recomputes the awaiting count and raises the
+  marker again. A claim rename error other
   than ENOENT exits 3 at once instead of spinning. An exception, a failed-open embedding backend
   (`code_embedding_backend_failed()`) or a code-reindex rc of 1 or 2 leaves the marker, appends the
   traceback or reason to `<project>.code-embed.log` and exits 3; each pass also logs its summary
@@ -3090,9 +3094,10 @@ on success delete the claim -- a commit landing mid-pass raises a NEW marker
 (the producer's touch is path-based, so it can never land on the claimed
 file unnoticed) and the loop runs again rather than declaring victory over
 content it never saw. On any exception from the backfill (a locked db,
-a genuine bug), the claim is renamed back to the marker, the traceback is appended to
+a genuine bug), the request is re-raised by touching a fresh marker (nothing is ever renamed
+onto the marker path) and the verified claim is deleted, the traceback is appended to
 `<project>.embed.log`, and the process exits 3 -- a caught exception
-therefore always puts the request back. A hard kill leaves
+therefore always puts the request back. A hard kill or a claim that cannot be inspected leaves
 `<project>.embed-pending.claim.<pid>` (swept after an hour); the request is
 re-raised by the next store commit's awaiting count
 (`hooks/post-commit-reindex.sh`) or, for code, by the next `code-refresh`

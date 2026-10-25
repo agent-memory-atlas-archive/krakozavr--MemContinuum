@@ -34,6 +34,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from stat import S_ISLNK, S_ISREG
 from types import SimpleNamespace
 from unittest import mock
 
@@ -6196,6 +6197,7 @@ class TestEmbedWorkerFixRound2(unittest.TestCase):
             marker.touch()
             self.assertEqual(memidx._run_embed_worker_loop(lock, marker, log, "t", lambda: "boom"), 3)
             self.assertTrue(marker.is_file())
+            self.assertTrue(S_ISREG(os.lstat(marker).st_mode))
             self.assertFalse(self._claim(marker).exists())
             self.assertIn("boom", log.read_text())
             # an exception, with a producer having raised a fresh marker mid-pass
@@ -6270,11 +6272,10 @@ class TestEmbedWorkerFixRound2(unittest.TestCase):
 
         return flaky, state
 
-    def test_a_transient_lstat_error_on_the_claim_puts_the_request_back(self):
+    def test_a_transient_lstat_error_on_the_claim_reraises_the_request_and_leaves_the_claim(self):
         with tempfile.TemporaryDirectory() as td:
             lock, marker, log = self._paths(td)
             marker.write_text("req")
-            ino = marker.stat().st_ino
             claim = self._claim(marker)
             flaky, state = self._lstat_eio_on_claim(claim)
             calls = []
@@ -6284,9 +6285,9 @@ class TestEmbedWorkerFixRound2(unittest.TestCase):
             self.assertEqual(rc, 3)
             self.assertEqual(calls, [])
             self.assertTrue(marker.is_file())
-            self.assertEqual(marker.stat().st_ino, ino)
-            self.assertEqual(marker.read_text(), "req")
-            self.assertFalse(claim.exists())
+            self.assertTrue(S_ISREG(os.lstat(marker).st_mode))
+            self.assertTrue(claim.is_file(), "an unverified claim is left for the age sweep")
+            self.assertEqual(claim.read_text(), "req")
             self.assertIn("claim-inspect-failed", log.read_text())
 
     def test_a_transient_lstat_error_with_a_fresh_marker_leaves_the_claim(self):
@@ -6479,6 +6480,148 @@ class TestEmbedWorkerFixRound2(unittest.TestCase):
             self.assertFalse(home.exists(), "the logger must not recreate the directory")
             self.assertIn("reason=log", err.getvalue())
 
+
+
+class TestEmbedWorkerFixRound5(unittest.TestCase):
+    """Embeddings-on fix round 5 (TOP-0137 L2 step 5): nothing is ever renamed
+    onto the marker path; a request is re-raised by `_touch_aux_marker`."""
+
+    def _paths(self, td):
+        return TestEmbedWorkerFixRound2._paths(self, td)
+
+    def _claim(self, marker):
+        return Path(f"{marker}.claim.{os.getpid()}")
+
+    def _run(self, lock, marker, log, run_pass):
+        return memidx._run_embed_worker_loop(lock, marker, log, "t", run_pass)
+
+    def _eio_once(self, claim, hook=None):
+        real_lstat = os.lstat
+        state = {"hit": 0}
+
+        def flaky(path, *a, **k):
+            if Path(path) == claim and not state["hit"] and claim.exists():
+                state["hit"] = 1
+                if hook:
+                    hook()
+                raise OSError(errno.EIO, "Input/output error")
+            return real_lstat(path, *a, **k)
+
+        return flaky, state
+
+    def test_inspection_failure_with_a_symlink_installed_at_the_marker_leaves_it_alone(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock, marker, log = self._paths(td)
+            victim = Path(td) / "victim.txt"
+            victim.write_text("keep")
+            marker.write_text("req")
+            claim = self._claim(marker)
+            flaky, state = self._eio_once(claim, hook=lambda: marker.symlink_to(victim))
+            calls = []
+            with mock.patch.object(memidx.os, "lstat", flaky):
+                rc = self._run(lock, marker, log, lambda: calls.append(1))
+            self.assertEqual((rc, state["hit"], calls), (3, 1, []))
+            self.assertTrue(S_ISLNK(os.lstat(marker).st_mode))
+            self.assertEqual(victim.read_text(), "keep")
+            self.assertTrue(claim.is_file())
+            self.assertIn("request-reraise-refused", log.read_text())
+
+    def test_inspection_failure_on_a_symlink_claim_never_overwrites_a_fresh_regular_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock, marker, log = self._paths(td)
+            victim = Path(td) / "victim.txt"
+            victim.write_text("keep")
+            marker.write_text("req")
+            claim = self._claim(marker)
+            real_rename = os.rename
+
+            def swapping_rename(src, dst):
+                if Path(src) == marker:
+                    marker.unlink()
+                    marker.symlink_to(victim)
+                return real_rename(src, dst)
+
+            fresh_ino = []
+
+            def raise_fresh():
+                # a producer wins the race and raises a new request, just after
+                # the worker's last look at the marker path
+                if not fresh_ino:
+                    marker.write_text("fresh")
+                    fresh_ino.append(marker.stat().st_ino)
+
+            real_lexists = os.path.lexists
+            real_touch = memidx._touch_aux_marker
+
+            def lexists(path):
+                found = real_lexists(path)
+                if Path(path) == marker and not found and Path(claim).is_symlink():
+                    raise_fresh()
+                return found
+
+            def touch(path):
+                raise_fresh()
+                return real_touch(path)
+
+            flaky, state = self._eio_once(claim)
+            calls = []
+            with mock.patch.object(memidx.os, "rename", swapping_rename), \
+                 mock.patch.object(memidx.os, "lstat", flaky), \
+                 mock.patch.object(memidx.os.path, "lexists", lexists), \
+                 mock.patch.object(memidx, "_touch_aux_marker", touch):
+                rc = self._run(lock, marker, log, lambda: calls.append(1))
+            self.assertEqual((rc, state["hit"], calls), (3, 1, []))
+            self.assertTrue(S_ISREG(os.lstat(marker).st_mode))
+            self.assertEqual(marker.stat().st_ino, fresh_ino[0])
+            self.assertEqual(marker.read_text(), "fresh")
+            self.assertTrue(S_ISLNK(os.lstat(claim).st_mode))
+            self.assertEqual(victim.read_text(), "keep")
+
+    def test_a_failed_pass_reraises_a_regular_marker_and_removes_the_claim(self):
+        for run_pass in (lambda: "boom", lambda: (_ for _ in ()).throw(RuntimeError("kaput"))):
+            with tempfile.TemporaryDirectory() as td:
+                lock, marker, log = self._paths(td)
+                marker.touch()
+                self.assertEqual(self._run(lock, marker, log, run_pass), 3)
+                self.assertTrue(marker.is_file())
+                self.assertTrue(S_ISREG(os.lstat(marker).st_mode))
+                self.assertFalse(self._claim(marker).exists())
+
+    def test_a_failed_pass_with_a_symlink_planted_at_the_marker_leaves_it_and_the_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock, marker, log = self._paths(td)
+            victim = Path(td) / "victim.txt"
+            victim.write_text("keep")
+            marker.touch()
+
+            def run_pass():
+                marker.symlink_to(victim)  # planted mid-pass (the claim moved the marker away)
+                return "boom"
+
+            self.assertEqual(self._run(lock, marker, log, run_pass), 3)
+            self.assertTrue(S_ISLNK(os.lstat(marker).st_mode))
+            self.assertEqual(victim.read_text(), "keep")
+            self.assertTrue(self._claim(marker).is_file())
+            self.assertIn("request-reraise-refused", log.read_text())
+
+    def test_a_non_regular_claim_also_reraises_the_request(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock, marker, log = self._paths(td)
+            marker.touch()
+            real_rename = os.rename
+
+            def swapping_rename(src, dst):
+                if Path(src) == marker:
+                    marker.unlink()
+                    marker.mkdir()
+                return real_rename(src, dst)
+
+            with mock.patch.object(memidx.os, "rename", swapping_rename):
+                rc = self._run(lock, marker, log, lambda: None)
+            self.assertEqual(rc, 3)
+            self.assertTrue(marker.is_file())
+            self.assertTrue(self._claim(marker).is_dir())
+            self.assertIn("claimed-not-regular", log.read_text())
 
 if __name__ == "__main__":
     unittest.main()

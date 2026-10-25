@@ -2494,14 +2494,24 @@ def _run_embed_worker_loop(lock_path: Path, marker_path: Path, log_path: Path, l
     the pass. From then on any producer touch creates a NEW marker inode,
     which the next `lstat` sees; a touch before the rename is covered by the
     pass that follows (a pass derives its work from coverage, not from the
-    marker). A clean pass deletes the claim; a failed pass (message or
-    exception) puts the request back (the claim is renamed to the marker if
-    none was raised meanwhile) and returns 3. A rename error other than
-    ENOENT returns 3 at once (never a spin). A worker killed mid-pass leaves
-    its claim, swept after an hour; the next hook preflight recomputes the
-    awaiting count and raises the marker again. After the lock is released
-    the marker is checked once more and, if a producer raised it around the
-    release, the lock is taken again. Failures append the traceback/message to
+    marker). INVARIANT: nothing is ever renamed ONTO the marker path. The
+    marker is only (1) created or touched through `_touch_aux_marker`
+    (O_CREAT|O_NOFOLLOW, regular file, path-based utime, retry) or (2) renamed
+    AWAY to the claim. A request is re-raised by touching the marker, never
+    by moving a claim back (a rename onto the path would replace a symlink or
+    a fresh producer marker, and would move an unverified inode there). A
+    clean pass deletes the claim; a failed pass (message or exception)
+    re-raises the request and deletes its verified-regular claim, returning
+    3; an inspection failure of the claim, or a claim that is not a regular
+    file, re-raises the request and LEAVES the claim (the age sweep removes a
+    regular one; a non-regular one stays as evidence) and returns 3. If the
+    re-raising touch is refused (a non-regular object at the marker path)
+    `request-reraise-refused: <reason>` is logged and the claim is left. A
+    rename error other than ENOENT returns 3 at once (never a spin). A worker
+    killed mid-pass leaves its claim, swept after an hour; the next hook
+    preflight recomputes the awaiting count and raises the marker again.
+    After the lock is released the marker is checked once more and, if a
+    producer raised it around the release, the lock is taken again. Failures append the traceback/message to
     `log_path` under a `--- <ts> <label> ---` header. A log, marker or lock
     that is not a plain regular file is refused: reason on stderr, exit 3."""
     try:
@@ -2518,6 +2528,16 @@ def _run_embed_worker_loop(lock_path: Path, marker_path: Path, log_path: Path, l
             print(f"{label}: embed=failed reason=log", file=sys.stderr)
 
     claim_path = marker_path.with_name(f"{marker_path.name}.claim.{os.getpid()}")
+
+    def reraise() -> bool:
+        # The ONLY way a request is put back: raise a fresh marker through
+        # _touch_aux_marker. Nothing is ever renamed onto the marker path.
+        try:
+            _touch_aux_marker(marker_path)
+            return True
+        except AuxFileRefused as exc:
+            log(f"request-reraise-refused: {exc.what}")
+            return False
 
     def drain() -> int:
         while True:
@@ -2546,23 +2566,18 @@ def _run_embed_worker_loop(lock_path: Path, marker_path: Path, log_path: Path, l
             # Re-validate the inode we actually moved: an object swapped in at
             # the marker path between the lstat and the rename (a directory, a
             # symlink) now sits at the claim path. It is not ours: never run the
-            # pass, follow or remove it (the age sweep refuses non-regular files).
+            # pass, follow, rename or remove it (the age sweep refuses non-regular
+            # files). Either way the request itself is re-raised as a fresh marker.
             try:
                 claimed_regular = S_ISREG(os.lstat(claim_path).st_mode)
             except OSError as exc:
-                # Unverified, not known-bad: the claim may be a perfectly regular
-                # request. Never run the pass or open it, but put the request back
-                # (a rename neither follows nor opens the object) so it is not
-                # stranded. A fresh marker already carries the request: then the
-                # claim is left for the age sweep.
-                try:
-                    if not os.path.lexists(marker_path):
-                        os.replace(claim_path, marker_path)
-                except OSError as exc2:
-                    log(f"claim-restore-failed: {exc2.errno}")
+                # Unverified, not known-bad: the claim stays where it is (the age
+                # sweep removes a regular one; a non-regular one stays as evidence).
+                reraise()
                 log(f"claim-inspect-failed: {exc.errno} {exc.strerror}")
                 return 3
             if not claimed_regular:
+                reraise()
                 log("claimed-not-regular: leaving the claimed object untouched")
                 return 3
             try:
@@ -2572,15 +2587,14 @@ def _run_embed_worker_loop(lock_path: Path, marker_path: Path, log_path: Path, l
                 failure = None
                 exc_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
             if failure or exc_text:
-                # Request preserved: back to the marker unless a producer
-                # already raised a fresh one.
-                try:
-                    if os.path.lexists(marker_path):
+                # Request preserved by raising a fresh marker; the claim is a
+                # verified regular file we renamed ourselves, so it is removed
+                # once the marker is safely raised (else left for the sweep).
+                if reraise():
+                    try:
                         os.unlink(claim_path)
-                    else:
-                        os.replace(claim_path, marker_path)
-                except OSError:
-                    pass
+                    except OSError:
+                        pass
                 log(exc_text or failure)
                 return 3
             try:
@@ -2629,11 +2643,16 @@ def cmd_embed_worker(args) -> int:
     auto=False, full=False`, the same shape a real `reindex` call without
     `--no-embed`/`--auto` builds). On success the claim is deleted; a commit
     that lands mid-pass creates a NEW marker, which the next round picks up
-    (no sleep needed). On ANY exception from the backfill, or a failed-open
-    embedding backend: the claim is renamed back to the marker (so the next
-    commit's awaiting count retries it; a manual worker run with no marker does nothing), the traceback is logged to
-    `<project>.embed.log` (never stdout -- this process has no terminal, its
-    whole point is running off the clock), and the exit is 3.
+    (no sleep needed). Invariant: nothing is ever renamed onto the marker
+    path -- it is only created/touched through `_touch_aux_marker` or renamed
+    away to the claim. On ANY exception from the backfill, or a failed-open
+    embedding backend: the request is re-raised by touching a fresh marker
+    (so the next commit's awaiting count retries it; a manual worker run with
+    no marker does nothing) and the verified claim is deleted; the traceback
+    is logged to `<project>.embed.log` (never stdout -- this process has no
+    terminal, its whole point is running off the clock), and the exit is 3. A
+    claim that cannot be inspected is left for the age sweep, and the request
+    is likewise re-raised as a fresh marker.
     """
     global _last_reindex_embedding_backend_failed
     if not _valid_project_name(args.project):
