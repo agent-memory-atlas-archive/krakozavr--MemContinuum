@@ -2549,8 +2549,19 @@ def _run_embed_worker_loop(lock_path: Path, marker_path: Path, log_path: Path, l
             # pass, follow or remove it (the age sweep refuses non-regular files).
             try:
                 claimed_regular = S_ISREG(os.lstat(claim_path).st_mode)
-            except OSError:
-                claimed_regular = False
+            except OSError as exc:
+                # Unverified, not known-bad: the claim may be a perfectly regular
+                # request. Never run the pass or open it, but put the request back
+                # (a rename neither follows nor opens the object) so it is not
+                # stranded. A fresh marker already carries the request: then the
+                # claim is left for the age sweep.
+                try:
+                    if not os.path.lexists(marker_path):
+                        os.replace(claim_path, marker_path)
+                except OSError as exc2:
+                    log(f"claim-restore-failed: {exc2.errno}")
+                log(f"claim-inspect-failed: {exc.errno} {exc.strerror}")
+                return 3
             if not claimed_regular:
                 log("claimed-not-regular: leaving the claimed object untouched")
                 return 3

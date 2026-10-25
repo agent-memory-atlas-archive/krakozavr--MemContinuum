@@ -19,6 +19,7 @@ running this file; see README.md "Requirements" / "Running the tests".
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import importlib.metadata
 import io
@@ -6254,6 +6255,63 @@ class TestEmbedWorkerFixRound2(unittest.TestCase):
             self.assertTrue(self._claim(marker).is_dir())
             self.assertEqual((self._claim(marker) / "inner").read_text(), "x")
             self.assertIn("claimed-not-regular", log.read_text())
+
+    def _lstat_eio_on_claim(self, claim):
+        real_lstat = os.lstat
+        state = {"hit": 0}
+
+        def flaky(path, *a, **k):
+            # Only the call after the rename (the claim exists); the earlier
+            # `lexists(claim)` probe must see "absent", not the injected error.
+            if Path(path) == claim and not state["hit"] and claim.exists():
+                state["hit"] = 1
+                raise OSError(errno.EIO, "Input/output error")
+            return real_lstat(path, *a, **k)
+
+        return flaky, state
+
+    def test_a_transient_lstat_error_on_the_claim_puts_the_request_back(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock, marker, log = self._paths(td)
+            marker.write_text("req")
+            ino = marker.stat().st_ino
+            claim = self._claim(marker)
+            flaky, state = self._lstat_eio_on_claim(claim)
+            calls = []
+            with mock.patch.object(memidx.os, "lstat", flaky):
+                rc = memidx._run_embed_worker_loop(lock, marker, log, "t", lambda: calls.append(1))
+            self.assertEqual(state["hit"], 1)
+            self.assertEqual(rc, 3)
+            self.assertEqual(calls, [])
+            self.assertTrue(marker.is_file())
+            self.assertEqual(marker.stat().st_ino, ino)
+            self.assertEqual(marker.read_text(), "req")
+            self.assertFalse(claim.exists())
+            self.assertIn("claim-inspect-failed", log.read_text())
+
+    def test_a_transient_lstat_error_with_a_fresh_marker_leaves_the_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock, marker, log = self._paths(td)
+            marker.write_text("req")
+            claim = self._claim(marker)
+            real_lstat = os.lstat
+            state = {"hit": 0}
+
+            def flaky(path, *a, **k):
+                if Path(path) == claim and not state["hit"] and Path(path).exists():
+                    state["hit"] = 1
+                    marker.write_text("fresh")  # a producer raised a new request
+                    raise OSError(errno.EIO, "Input/output error")
+                return real_lstat(path, *a, **k)
+
+            calls = []
+            with mock.patch.object(memidx.os, "lstat", flaky):
+                rc = memidx._run_embed_worker_loop(lock, marker, log, "t", lambda: calls.append(1))
+            self.assertEqual(rc, 3)
+            self.assertEqual(calls, [])
+            self.assertEqual(marker.read_text(), "fresh")
+            self.assertEqual(claim.read_text(), "req")
+            self.assertIn("claim-inspect-failed", log.read_text())
 
     def test_a_symlinked_marker_is_refused_and_never_followed(self):
         with tempfile.TemporaryDirectory() as td:
