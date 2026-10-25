@@ -453,8 +453,7 @@ Rendered from `templates/code-refresh-hook.json.tmpl` for a project that has at 
   model fingerprint) and, when it is above 0, raises `$MEMCONTINUUM_HOME/<project>.code-embed-pending`
   and starts a detached `memidx.py code-embed-worker` (python `subprocess.Popen` in a new session,
   stdio to `<project>.code-embed.log`; milliseconds, no change to the hook's budget), independent of
-  whether the index is current. `embed=spawned` started one, `pending` means a worker already holds
-  `<project>.code-embed.lock`, `clean` nothing awaits a vector, `off` is `MEMCONTINUUM_EMBED_WORKER=0`
+  whether the index is current. `embed=spawned` started one, `clean` nothing awaits a vector, `off` is `MEMCONTINUUM_EMBED_WORKER=0`
   (the marker is still raised), `failed` a marker or spawn error, `unknown` a run that ended earlier. The worker is handed the hook's wired roots (`--root` each); a hook that names none spawns nothing (`embed=off reason=no-wired-roots`). On `Stop`, a recorded root the wiring no longer names is dropped (`dropped=<n>`, `detail=dropped-roots:…`); `SessionStart` only writes the marker `stale-root=<n>`.
   On `Stop` it looks again after the heal, which adds unembedded chunks. The worker fills them in
   batches of 128; `code-search` ranks over the vectors present meanwhile and says how many are missing.
