@@ -5,6 +5,14 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  # One fastembed cache path on every runner (fastembed honours this
+  # variable; its default is tempfile.gettempdir()/fastembed_cache, which
+  # is not /tmp on macOS). The per-job "Cache fastembed model" steps cache
+  # this path. v2 key (TOP-0137 L2 step 5): the engine loads the plain fp32
+  # ONNX of BAAI/bge-small-en-v1.5, not fastembed's quantised default.
+  FASTEMBED_CACHE_PATH: /tmp/fastembed_cache
+
 jobs:
   unittest:
     strategy:
@@ -44,20 +52,13 @@ jobs:
       - name: Cache fastembed model
         uses: actions/cache@v4
         with:
-          # fastembed 0.8.0's own default (fastembed.common.utils.
-          # define_cache_dir): tempfile.gettempdir()/fastembed_cache, i.e.
-          # /tmp/fastembed_cache on a standard Linux runner -- NOT
-          # ~/.cache/fastembed, which this package never uses unless
-          # FASTEMBED_CACHE_PATH is set (this repo doesn't set it). Keyed
-          # per Python version so the two matrix legs don't race to write
-          # the same cache key. v2 (TOP-0137 L2 step 5): the engine now loads
-          # the plain fp32 ONNX of BAAI/bge-small-en-v1.5 (registered as a
-          # custom model, snapshot models--BAAI--bge-small-en-v1.5 in this
-          # same directory) instead of fastembed's quantised default
-          # (models--qdrant--bge-small-en-v1.5-onnx-q), so the old key's
-          # cache lacks it.
           path: /tmp/fastembed_cache
-          key: fastembed-model-v2-${{ matrix.python-version }}
+          key: fastembed-model-v2-${{ runner.os }}-${{ matrix.python-version || '3.12' }}
+      - name: Warm embedding model
+        # Downloads through the engine's single construction site exactly
+        # what the engine uses, before any test runs, so no test pays (or
+        # times out on) the download.
+        run: PYTHONPATH= python -c "import memidx; memidx.load_embedding_model()"
       - name: Run unittest suite
         # Same shell step resolves `python` for BOTH the interpreter that
         # just received `pip install -r requirements.lock` and the one
@@ -83,6 +84,16 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: pip install -r requirements.lock
+      - name: Cache fastembed model
+        uses: actions/cache@v4
+        with:
+          path: /tmp/fastembed_cache
+          key: fastembed-model-v2-${{ runner.os }}-${{ matrix.python-version || '3.12' }}
+      - name: Warm embedding model
+        # Downloads through the engine's single construction site exactly
+        # what the engine uses, before any test runs, so no test pays (or
+        # times out on) the download.
+        run: PYTHONPATH= python -c "import memidx; memidx.load_embedding_model()"
       - name: Cache bash 3.2 build
         uses: actions/cache@v4
         with:
@@ -115,12 +126,17 @@ jobs:
         # version (verified by download simulation before this job was
         # added) -- no build toolchain required.
         run: pip install -r requirements.lock
+      - name: Cache fastembed model
+        uses: actions/cache@v4
+        with:
+          path: /tmp/fastembed_cache
+          key: fastembed-model-v2-${{ runner.os }}-${{ matrix.python-version || '3.12' }}
+      - name: Warm embedding model
+        # Downloads through the engine's single construction site exactly
+        # what the engine uses, before any test runs, so no test pays (or
+        # times out on) the download.
+        run: PYTHONPATH= python -c "import memidx; memidx.load_embedding_model()"
       - name: Run unittest suite
-        # No fastembed-model cache here: GitHub's macOS runner image
-        # randomizes TMPDIR (and so fastembed's default cache dir) per VM
-        # boot, so a path-keyed cache would never hit -- the model
-        # downloads fresh each run instead, same as a cold cache-miss run
-        # on the Ubuntu leg.
         run: |
           MEMCONTINUUM_PYTHON="$(command -v python)" PYTHONPATH= python -m unittest discover -s tests
       - name: Run bash 3.2 verification harness
