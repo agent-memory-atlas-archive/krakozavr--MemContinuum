@@ -6516,9 +6516,13 @@ class TestCodeRefreshHook(HookTestBase):
             MEMCONTINUUM_EMBED_WORKER="1", FASTEMBED_CACHE_PATH=cache))
         self.assertTrue(line.endswith("embed=spawned"), line)
         deadline = time.monotonic() + 120
-        while time.monotonic() < deadline and self.embed_marker().exists():
+        # claim-first protocol: the marker is renamed to <marker>.claim.<pid> when the
+        # pass STARTS, so "finished" means neither the marker nor a claim remains
+        def in_flight():
+            return self.embed_marker().exists() or list(self.home.glob(f"{self.embed_marker().name}.claim.*"))
+        while time.monotonic() < deadline and in_flight():
             time.sleep(0.5)
-        self.assertFalse(self.embed_marker().exists(), "the worker never finished")
+        self.assertFalse(in_flight(), "the worker never finished")
         conn = memidx.open_code_db(self.db)
         try:
             report = memidx.code_index_report(conn, self.project)

@@ -230,7 +230,12 @@ if [ "$EMBED_STATE" = "pending" ]; then
     # and honours MEMCONTINUUM_EMBED_WORKER=0 itself (marker raised, nothing
     # started). "$PY" is this hook's own resolved python, so a test that
     # points MEMCONTINUUM_PYTHON at a stub keeps that stub in the worker.
-    "$PY" "$MEMIDX" embed-worker --spawn --python "$PY" --root "$MEMCONTINUUM_ROOT" --project "$PROJECT" --db "$DB_PATH" >/dev/null 2>&1 || true
+    # The helper's last stdout line says `failed reason=<marker|log|spawn|
+    # bad-project>` when it refused; that is surfaced as embed=failed:<reason>.
+    SPAWN_OUT="$("$PY" "$MEMIDX" embed-worker --spawn --python "$PY" --root "$MEMCONTINUUM_ROOT" --project "$PROJECT" --db "$DB_PATH" 2>/dev/null | tail -n 1)" || true
+    case "$SPAWN_OUT" in
+        *"failed reason="*) EMBED_STATE="failed:${SPAWN_OUT##*failed reason=}"; EMBED_STATE="${EMBED_STATE%% *}" ;;
+    esac
 fi
 
 # --- 3. post-commit re-lint (INC-0128) --------------------------------------

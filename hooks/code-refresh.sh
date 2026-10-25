@@ -31,16 +31,18 @@
 #
 # hook.log: <ts> code-refresh outcome=<refreshed|skip|failed> reason=...
 #   project=P roots=N unrecorded=N changed=N removed=N healed=N elapsed=Xs
-#   event=E session=S embed=<spawned|pending|clean|off|failed|unknown>
+#   event=E session=S embed=<spawned|clean|off|failed|unknown>
 #   [marker=write-failed] [detail=...]
 # embed= is the background embedding worker's state (TOP-0137 L2 step 5):
 # on BOTH events, whenever the index has chunks awaiting a vector,
 # memidx.py raises <project>.code-embed-pending and starts a detached
 # `code-embed-worker` (python subprocess.Popen in a new session -- never
 # bash & or setsid; milliseconds, independent of the drift check):
-# spawned = started now, pending = a worker already holds the lock,
-# clean = nothing awaits, off = MEMCONTINUUM_EMBED_WORKER=0, failed =
-# marker or spawn error, unknown = the run ended before it was evaluated.
+# spawned = marker raised and a worker started (a worker that finds the
+# lock held exits 0 itself, so there is no separate "pending" state),
+# clean = nothing awaits, off = MEMCONTINUUM_EMBED_WORKER=0 (marker still
+# raised), failed = marker, log or spawn refused, unknown = the run ended
+# before it was evaluated.
 #
 # bash 3.2 discipline: no arrays, no [[ ]], no process substitution, no
 # mapfile, no namerefs; no $(( )) on any env value (the budget is checked with

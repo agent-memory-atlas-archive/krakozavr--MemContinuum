@@ -2361,15 +2361,38 @@ def _open_aux_file(path: Path, flags: int, what: str) -> int:
 
 
 def _touch_aux_marker(marker: Path) -> None:
-    """Create the marker or bump its mtime (so a RUNNING worker loops again).
-    Raises AuxFileRefused("marker")."""
-    fd = _open_aux_file(marker, os.O_CREAT | os.O_WRONLY, "marker")
-    try:
-        os.utime(fd)
-    except OSError as exc:
-        raise AuxFileRefused("marker") from exc
-    finally:
+    """Create the marker or bump its mtime. The bump is PATH-based
+    (`os.utime(marker)`), never through the open fd: a worker that claims the
+    marker by renaming it between our open and our utime makes the utime fail
+    with FileNotFoundError, and we simply recreate and retry (at most 3
+    times) -- a touch can therefore never land on an already-claimed inode
+    unnoticed. Raises AuxFileRefused("marker") for a symlink/FIFO/... or an
+    unusable marker; after 3 lost races it returns quietly (the caller still
+    spawns, and the marker the last open created exists)."""
+    for _ in range(3):
+        fd = _open_aux_file(marker, os.O_CREAT | os.O_WRONLY, "marker")
         os.close(fd)
+        try:
+            if os.utime in os.supports_follow_symlinks:
+                os.utime(marker, None, follow_symlinks=False)
+            else:
+                os.utime(marker, None)
+            return
+        except FileNotFoundError:
+            continue  # claimed (renamed) under us: recreate it
+        except OSError as exc:
+            raise AuxFileRefused("marker") from exc
+
+
+def _valid_project_name(project) -> bool:
+    """A project name is interpolated into companion-file names
+    (`<project>.embed-pending`, ...): refuse "", ".", "..", anything with a
+    path separator or a control character (write-safety checklist rule 1)."""
+    return (
+        isinstance(project, str) and project not in ("", ".", "..")
+        and "/" not in project and "\\" not in project
+        and not any(ord(ch) < 32 or ord(ch) == 127 for ch in project)
+    )
 
 
 def _append_aux_log(log_path: Path, text: str) -> bool:
@@ -2398,7 +2421,8 @@ def _spawn_embed_worker(marker: Path, log_path: Path, argv_tail: list, python: s
     lock already held exits 0 at once, so a producer never has to probe the
     lock (probing is what left a request waiting when a worker was just
     finishing). Returns `spawned` | `off` (marker raised, nothing started)
-    | `failed reason=<marker|log|spawn>`. Never raises."""
+    | `failed reason=<marker|log|spawn|bad-project>`. Never raises. (Callers validate
+    the project name first -- `failed reason=bad-project`.)"""
     try:
         _touch_aux_marker(marker)
     except AuxFileRefused as exc:
@@ -2421,25 +2445,65 @@ def _spawn_embed_worker(marker: Path, log_path: Path, argv_tail: list, python: s
     return "spawned"
 
 
+_CLAIM_SWEEP_AGE = 3600.0
+
+
+def _sweep_aged_files(marker: Path, infix: str, min_age: float) -> int:
+    """Remove `<marker>.<infix>.<digits>` leftovers of a killed run: exact
+    name grammar, regular files only (never a directory, symlink or
+    look-alike), older than `min_age` (a fresh file of an overlapping run is
+    never a candidate). Returns how many were removed. The one sweeper behind
+    both `.new.` temps (code-refresh) and `.claim.` files (embed workers)."""
+    pat = re.compile(re.escape(marker.name) + r"\." + re.escape(infix) + r"\.[0-9]+$")
+    try:
+        names = os.listdir(marker.parent)
+    except OSError:
+        return 0
+    now = time.time()
+    n = 0
+    for name in names:
+        if not pat.match(name):
+            continue
+        path = marker.parent / name
+        try:
+            st = os.lstat(path)
+            if S_ISREG(st.st_mode) and now - st.st_mtime > min_age:
+                path.unlink()
+                n += 1
+        except OSError:
+            pass
+    return n
+
+
+def _sweep_stale_claims(marker: Path, min_age: float = _CLAIM_SWEEP_AGE) -> int:
+    """Sweep `<marker>.claim.<digits>` files older than an hour."""
+    return _sweep_aged_files(marker, "claim", min_age)
+
+
 def _run_embed_worker_loop(lock_path: Path, marker_path: Path, log_path: Path, label: str, run_pass) -> int:
     """The lock/marker/loop skeleton shared by `embed-worker` (the store) and
     `code-embed-worker` (the code index) -- TOP-0137 L2 step 5 extracted it
     from cmd_embed_worker so the two cannot drift.
 
     Lock: `fcntl.flock(LOCK_EX | LOCK_NB)` on `lock_path`; `BlockingIOError`
-    means another worker owns the marker -> exit 0 at once. Loop: while the
-    marker exists, note its `mtime_ns`, call `run_pass()` (returns None on a
-    clean pass, or a message when it failed open without raising), then
-    CLAIM the marker by renaming it aside: a touch before the rename shows
-    in the claimed file's mtime (-> raise the marker again and go round), a
-    touch after it makes a fresh marker (-> the loop's own `exists()` sees it).
-    So no request can be deleted unseen. After the lock is released the
-    marker is checked once more and, if a producer raised it around the
-    release, the lock is taken again. An exception or a failure message
-    leaves the marker, appends the traceback/message to `log_path` under a
-    `--- <ts> <label> ---` header and returns 3. A log, marker or lock that
-    is not a plain regular file (symlink, FIFO, ...) is refused: reason on
-    stderr, exit 3."""
+    means another worker owns the marker -> exit 0 at once.
+
+    Marker protocol (CLAIM FIRST): while the marker exists, `lstat` it (a
+    symlink / non-regular marker is refused: return 3, nothing touched), then
+    CLAIM it by renaming it to the per-run name `<marker>.claim.<pid>` BEFORE
+    the pass. From then on any producer touch creates a NEW marker inode,
+    which the next `lstat` sees; a touch before the rename is covered by the
+    pass that follows (a pass derives its work from coverage, not from the
+    marker). A clean pass deletes the claim; a failed pass (message or
+    exception) puts the request back (the claim is renamed to the marker if
+    none was raised meanwhile) and returns 3. A rename error other than
+    ENOENT returns 3 at once (never a spin). A worker killed mid-pass leaves
+    its claim, swept after an hour; the next hook preflight recomputes the
+    awaiting count and raises the marker again. After the lock is released
+    the marker is checked once more and, if a producer raised it around the
+    release, the lock is taken again. Failures append the traceback/message to
+    `log_path` under a `--- <ts> <label> ---` header. A log, marker or lock
+    that is not a plain regular file is refused: reason on stderr, exit 3."""
     try:
         lock_fd = _open_aux_file(lock_path, os.O_CREAT | os.O_RDWR, "lock")
     except AuxFileRefused as exc:
@@ -2447,54 +2511,61 @@ def _run_embed_worker_loop(lock_path: Path, marker_path: Path, log_path: Path, l
         return 3
 
     def log(body: str) -> None:
+        # Never creates the directory (write-safety rule 2): a missing home
+        # means nothing is written.
         ts = datetime.now(timezone.utc).isoformat()
-        try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
         if not _append_aux_log(log_path, f"--- {ts} {label} ---\n{body}\n"):
             print(f"{label}: embed=failed reason=log", file=sys.stderr)
 
-    claim_path = marker_path.with_name(marker_path.name + ".claim")
+    claim_path = marker_path.with_name(f"{marker_path.name}.claim.{os.getpid()}")
 
     def drain() -> int:
-        while marker_path.exists():
+        while True:
             try:
-                m0 = marker_path.stat().st_mtime_ns
-            except OSError:
-                # Vanished between exists() and stat() -- another process
-                # (a worker run by hand, concurrently) already cleared it.
-                break
+                st = os.lstat(marker_path)
+            except FileNotFoundError:
+                return 0
+            except OSError as exc:
+                log(f"marker unreadable: errno {exc.errno}")
+                return 3
+            if not S_ISREG(st.st_mode):
+                log("marker-not-regular: refusing to touch it")
+                return 3
+            swept = _sweep_stale_claims(marker_path)
+            if swept:
+                log(f"swept {swept} stale claim file(s)")
+            try:
+                if os.path.lexists(claim_path):
+                    os.unlink(claim_path)  # our own pid's leftover only
+                os.rename(marker_path, claim_path)
+            except FileNotFoundError:
+                continue  # a racing producer/worker moved it: the lstat decides
+            except OSError as exc:
+                log(f"claim-failed:{exc.errno}")
+                return 3  # marker stays; never spin
             try:
                 failure = run_pass()
+                exc_text = None
             except Exception as exc:
-                log("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+                failure = None
+                exc_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            if failure or exc_text:
+                # Request preserved: back to the marker unless a producer
+                # already raised a fresh one.
+                try:
+                    if os.path.lexists(marker_path):
+                        os.unlink(claim_path)
+                    else:
+                        os.replace(claim_path, marker_path)
+                except OSError:
+                    pass
+                log(exc_text or failure)
                 return 3
-            if failure:
-                log(failure)
-                return 3
             try:
-                marker_path.replace(claim_path)
-            except OSError:
-                break  # vanished -- cleared by someone else
-            try:
-                claimed = claim_path.stat().st_mtime_ns
-            except OSError:
-                claimed = None
-            try:
-                claim_path.unlink()
+                os.unlink(claim_path)
             except OSError:
                 pass
-            if claimed != m0:
-                # Retouched between the pass and the claim: that request is
-                # in the pass-start state of the claimed file only -- raise
-                # the marker again so the next round picks it up.
-                try:
-                    _touch_aux_marker(marker_path)
-                except AuxFileRefused:
-                    pass
-            # loop: `exists()` also catches a marker recreated after the rename
-        return 0
+            # loop: the next lstat finds a marker a mid-pass producer created
 
     try:
         while True:
@@ -2510,7 +2581,7 @@ def _run_embed_worker_loop(lock_path: Path, marker_path: Path, log_path: Path, l
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 except OSError:
                     pass
-            if rc != 0 or not marker_path.exists():
+            if rc != 0 or not os.path.lexists(marker_path):
                 return rc
             # A producer raised the marker around the lock release (its
             # spawned worker may have exited on our lock): take the lock again.
@@ -2530,20 +2601,22 @@ def cmd_embed_worker(args) -> int:
     `BlockingIOError` means another worker already owns the marker; this
     process exits 0 immediately (never blocks, never errors).
 
-    Loop: while the marker exists, note its `mtime_ns`, then run the
-    embedding backfill in-process (`cmd_reindex` with embedding enabled --
-    `no_embed=False, auto=False, full=False`, the same shape a real
-    `reindex` call without `--no-embed`/`--auto` builds). On success:
-    if the marker's mtime_ns is STILL what was noted before the pass, this
-    pass's own content is exactly what the marker was raised for -- unlink
-    it and stop. If it changed (a commit landed mid-pass and retouched
-    it), loop again -- no sleep needed, the next pass picks up whatever is
-    now stale. On ANY exception from the backfill: leave the marker (so a
-    later commit or a manual worker run retries it), log the exception's
-    traceback to `<project>.embed.log` (never stdout -- this process has
-    no terminal, its whole point is running off the clock), and exit 3.
+    Loop (_run_embed_worker_loop): while the marker exists, CLAIM it by
+    renaming it to `<marker>.claim.<pid>`, then run the embedding backfill
+    in-process (`cmd_reindex` with embedding enabled -- `no_embed=False,
+    auto=False, full=False`, the same shape a real `reindex` call without
+    `--no-embed`/`--auto` builds). On success the claim is deleted; a commit
+    that lands mid-pass creates a NEW marker, which the next round picks up
+    (no sleep needed). On ANY exception from the backfill, or a failed-open
+    embedding backend: the claim is renamed back to the marker (so a later
+    commit or a manual worker run retries it), the traceback is logged to
+    `<project>.embed.log` (never stdout -- this process has no terminal, its
+    whole point is running off the clock), and the exit is 3.
     """
     global _last_reindex_embedding_backend_failed
+    if not _valid_project_name(args.project):
+        print("embed-worker: embed=failed reason=bad-project", file=sys.stderr)
+        return 2
     db_path = resolve_db_path(args)
 
     def run_pass():
@@ -2585,6 +2658,8 @@ def spawn_embed_worker(db_path: Path, project: str, root, python: str | None = N
     detached `embed-worker` (see _spawn_embed_worker -- the one shared Popen
     site). Called by hooks/post-commit-reindex.sh through
     `embed-worker --spawn`."""
+    if not _valid_project_name(project):
+        return "failed reason=bad-project"
     return _spawn_embed_worker(
         _embed_marker_path(db_path, project), _embed_log_path(db_path, project),
         ["embed-worker", "--root", str(root), "--project", project, "--db", str(db_path)], python,
@@ -6696,6 +6771,15 @@ def _store_code_embedding_mode(conn: sqlite3.Connection, project: str, current_f
     return mode, total, fresh
 
 
+# One vector row, written only if its chunk still exists -- the existence check
+# is part of the INSERT, so inside the batch's BEGIN IMMEDIATE it is atomic
+# with the write (parameters: chunk_id, project, dim, vector, embed_fp, chunk_id).
+CODE_VECTOR_GUARDED_INSERT = (
+    "INSERT OR REPLACE INTO embeddings (chunk_id, project, dim, vector, embed_fp) "
+    "SELECT ?,?,?,?,? WHERE EXISTS (SELECT 1 FROM chunks WHERE id=?)"
+)
+
+
 def cmd_code_reindex(args) -> int:
     global _last_code_embedding_backend_failed
     _last_code_embedding_backend_failed = False
@@ -7149,6 +7233,45 @@ def cmd_code_reindex(args) -> int:
                 )
             continue
 
+    # TOP-0137 L2 step 5 (fix round 2): everything that is text-pass
+    # bookkeeping -- removed-file cleanup, the code_meta root row, the
+    # embedding_mode/coverage recompute -- is committed COMPLETE before the
+    # first model.embed call, so a pass killed during inference leaves a
+    # truthful, initialised index (mode partial/none, chunks awaiting), never
+    # a rolled-back half or a `full` claimed over vector-less chunks.
+    removed = set(existing.keys()) - seen
+    for rel in removed:
+        delete_code_chunks_for_path(conn, args.project, root_s, rel)
+        conn.execute(
+            "DELETE FROM file_sha WHERE project=? AND code_root=? AND path=?", (args.project, root_s, rel)
+        )
+
+    # Task 7: the "swift" fallback here is gone -- `langs` is always a
+    # non-empty, resolved list by this point (explicit --lang, or reused
+    # code_project.langs; the no-langs-yet case already returned 1 above),
+    # so a fallback here would just be dead code hiding a real bug if one
+    # of those guarantees ever broke.
+    conn.execute(
+        "INSERT OR REPLACE INTO code_meta (project, code_root, last_indexed_at, head_sha) "
+        "VALUES (?,?,?,?)",
+        (args.project, root_s, time.time(), _git_head_sha(root)),
+    )
+
+    # Anatomy M2a binding point 2, in its TOP-0137 L2 step 5 form:
+    # embedding_mode never lies. It is recomputed from REAL project-wide
+    # coverage at the end of EVERY pass, embedded or not: full = every chunk
+    # has a vector at the current fingerprint, none = no chunk has one,
+    # partial = some. (A --no-embed pass that adds chunks to a `full` project
+    # therefore reports `partial`, not `none`, and the background worker's
+    # next pass restores `full`.) A chunk elsewhere in the project -- another
+    # root, a stale-model vector -- counts as awaiting, so `full` is never
+    # claimed over it.
+    mode_now = conn.execute(
+        "SELECT embedding_mode FROM code_project WHERE project=?", (args.project,)
+    ).fetchone()["embedding_mode"]
+    _store_code_embedding_mode(conn, args.project, current_fp)
+    conn.commit()
+
     reembeds = 0
     if pending_texts:
         # Ruling 80: same fail-open shape as cmd_reindex -- on a backend
@@ -7163,9 +7286,8 @@ def cmd_code_reindex(args) -> int:
         # next pass's unchanged-file top-up finds only the rest). The first
         # commit also publishes the file/chunk writes made so far, which is
         # safe: a chunk without a vector is exactly an "awaiting" chunk.
-        # The text pass is committed BEFORE the first model.embed call: no
-        # write lock is held while a batch is being computed.
-        conn.commit()
+        # The text pass is committed (see above) BEFORE the first model.embed
+        # call: no write lock is held while a batch is being computed.
         for off in range(0, len(pending_texts), CODE_EMBED_BATCH):
             batch_texts = pending_texts[off:off + CODE_EMBED_BATCH]
             batch_ids = pending_ids[off:off + CODE_EMBED_BATCH]
@@ -7198,8 +7320,7 @@ def cmd_code_reindex(args) -> int:
             for cid, v in zip(batch_ids, vecs):
                 packed = pack_vector(v)
                 cur = conn.execute(
-                    "INSERT OR REPLACE INTO embeddings (chunk_id, project, dim, vector, embed_fp) "
-                    "SELECT ?,?,?,?,? WHERE EXISTS (SELECT 1 FROM chunks WHERE id=?)",
+                    CODE_VECTOR_GUARDED_INSERT,
                     (cid, args.project, len(unpack_vector(packed)), packed, current_fp, cid),
                 )
                 written += max(cur.rowcount, 0)
@@ -7214,36 +7335,8 @@ def cmd_code_reindex(args) -> int:
             _store_code_embedding_mode(conn, args.project, current_fp)
             conn.commit()
 
-    removed = set(existing.keys()) - seen
-    for rel in removed:
-        delete_code_chunks_for_path(conn, args.project, root_s, rel)
-        conn.execute(
-            "DELETE FROM file_sha WHERE project=? AND code_root=? AND path=?", (args.project, root_s, rel)
-        )
-
-    # Task 7: the "swift" fallback here is gone -- `langs` is always a
-    # non-empty, resolved list by this point (explicit --lang, or reused
-    # code_project.langs; the no-langs-yet case already returned 1 above),
-    # so a fallback here would just be dead code hiding a real bug if one
-    # of those guarantees ever broke.
-    conn.execute(
-        "INSERT OR REPLACE INTO code_meta (project, code_root, last_indexed_at, head_sha) "
-        "VALUES (?,?,?,?)",
-        (args.project, root_s, time.time(), _git_head_sha(root)),
-    )
-
-    # Anatomy M2a binding point 2, in its TOP-0137 L2 step 5 form:
-    # embedding_mode never lies. It is recomputed from REAL project-wide
-    # coverage at the end of EVERY pass, embedded or not: full = every chunk
-    # has a vector at the current fingerprint, none = no chunk has one,
-    # partial = some. (A --no-embed pass that adds chunks to a `full` project
-    # therefore reports `partial`, not `none`, and the background worker's
-    # next pass restores `full`.) A chunk elsewhere in the project -- another
-    # root, a stale-model vector -- counts as awaiting, so `full` is never
-    # claimed over it.
-    mode_now = conn.execute(
-        "SELECT embedding_mode FROM code_project WHERE project=?", (args.project,)
-    ).fetchone()["embedding_mode"]
+    # Final recompute from REAL coverage (the per-batch recomputes already
+    # kept the mode truthful if the pass died).
     new_mode, total_chunks, fresh_chunks = _store_code_embedding_mode(conn, args.project, current_fp)
     awaiting = max(total_chunks - fresh_chunks, 0)
     downgraded = mode_now == "full" and new_mode != "full"
@@ -8228,25 +8321,9 @@ def _clear_code_stale_marker(marker: Path) -> None:
 
 
 def _sweep_code_stale_temps(marker: Path, min_age: float) -> None:
-    """Remove `<marker>.new.<digits>` leftovers of a killed run: exact name
-    grammar, regular files only, older than `min_age` (a fresh file of an
-    overlapping run is never a candidate)."""
-    pat = re.compile(re.escape(marker.name) + r"\.new\.[0-9]+$")
-    try:
-        names = os.listdir(marker.parent)
-    except OSError:
-        return
-    now = time.time()
-    for name in names:
-        if not pat.match(name):
-            continue
-        path = marker.parent / name
-        try:
-            st = os.lstat(path)
-            if S_ISREG(st.st_mode) and now - st.st_mtime > min_age:
-                path.unlink()
-        except OSError:
-            pass
+    """Remove `<marker>.new.<digits>` leftovers of a killed run (see
+    _sweep_aged_files)."""
+    _sweep_aged_files(marker, "new", min_age)
 
 
 def _env_code_roots() -> list:
@@ -8545,8 +8622,11 @@ def cmd_code_embed_worker(args) -> int:
     exists in the same transaction (a concurrent heal that replaced chunks
     mid-batch cannot leave an orphan vector); a final sweep removes any
     orphan that still got through."""
-    db_path = resolve_code_db_path(args)
     project = args.project
+    if not _valid_project_name(project):
+        print("code-embed-worker: embed=failed reason=bad-project", file=sys.stderr)
+        return 2
+    db_path = resolve_code_db_path(args)
 
     def run_pass():
         ro = None
@@ -8601,6 +8681,8 @@ def spawn_code_embed_worker(db_path: Path, project: str) -> str:
     finds the lock held exits 0 at once. Returns `spawned` | `off` (spawning
     disabled; the marker is still raised) | `failed reason=<file>`.
     Fail-open: never raises."""
+    if not _valid_project_name(project):
+        return "failed reason=bad-project"
     return _spawn_embed_worker(
         _code_embed_marker_path(db_path, project), _code_embed_log_path(db_path, project),
         ["code-embed-worker", "--project", project, "--db", str(db_path)],

@@ -1725,7 +1725,7 @@ if [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ] && [ -n "$CHOSEN_LANGS" ]; then
     if [ "$DRY_RUN" -eq 0 ] && [ "$CODE_REINDEX_RC" -eq 0 ]; then
         embed_out="$(PYTHONPATH= "${CODE_EMBED_CMD[@]}" 2>&1)" || true
         case "$embed_out" in
-            *": spawned"|*": pending")
+            *": spawned")
                 echo "Code embeddings: filling in the background (${embed_out}); code-search is text-only until the vectors land" ;;
             *)
                 echo "Code embeddings: not started (${embed_out:-no answer}); code-search is text-only, the code-refresh hook starts the worker later" ;;

@@ -2228,11 +2228,17 @@ lock/marker/loop skeleton, `_run_embed_worker_loop`.
   exists, and per pass calls `cmd_code_reindex(no_embed=False, full=False, retry_not_indexed=False)`
   for every root in `code_meta` that exists on disk. That call's unchanged-file top-up already
   finds every chunk without a vector at the current fingerprint (a missing vector and a stale one
-  look the same), so nothing else looks for stranded chunks. The marker is claimed by renaming it
-  aside once the pass is done: a touch before the rename shows in the claimed file's mtime (the
-  marker is raised again), a touch after it makes a fresh marker, and after the lock is released
-  the marker is checked once more (taking the lock again if it reappeared), so no request is
-  deleted unseen. An exception, a failed-open embedding backend
+  look the same), so nothing else looks for stranded chunks. The marker is claimed FIRST, by
+  renaming it to the per-run name `<marker>.claim.<pid>` (after an `lstat` that refuses a symlink
+  or any non-regular marker): a touch before the rename is inside the claimed request (the pass
+  derives its work from coverage), a touch during or after the pass creates a new marker inode the
+  next `lstat` sees, a producer's path-based `utime` that loses the race to the rename fails and
+  recreates the marker, and after the lock is released the marker is checked once more (taking
+  the lock again if it reappeared), so no request is deleted unseen. A clean pass deletes the
+  claim; a failed pass renames it back; a worker killed mid-pass leaves `<marker>.claim.<pid>`,
+  swept when older than an hour (exact name grammar, regular files only), and the next hook
+  preflight recomputes the awaiting count and raises the marker again. A claim rename error other
+  than ENOENT exits 3 at once instead of spinning. An exception, a failed-open embedding backend
   (`code_embedding_backend_failed()`) or a code-reindex rc of 1 or 2 leaves the marker, appends the
   traceback or reason to `<project>.code-embed.log` and exits 3; each pass also logs its summary
   line there. It does not take the code-refresh lock: the model loads before any write, the text
@@ -2265,13 +2271,14 @@ lock/marker/loop skeleton, `_run_embed_worker_loop`.
   worker.
 - **Spawn sites.** `spawn_code_embed_worker` and the store's `spawn_embed_worker` (reached by
   `post-commit-reindex.sh` as `embed-worker --spawn`) both go through `_spawn_embed_worker`, the
-  repo's one `Popen` site: raise the marker (create or bump its mtime, so a running worker loops
-  again) and start the worker with a detached python `subprocess.Popen` (`start_new_session=True`,
+  repo's one `Popen` site: raise the marker (create it, then `utime` it BY PATH, retried up to 3
+  times if a worker claimed it in between, so a running worker loops again) and start the worker with a detached python `subprocess.Popen` (`start_new_session=True`,
   stdin `DEVNULL`, stdout and stderr to the worker log, `close_fds`), never bash `&` or `setsid`.
   It ALWAYS spawns when the marker is raised (a worker that finds the lock held exits 0 at once;
   probing the lock first could leave a request waiting while a worker was finishing). It returns
   `spawned`, `off` (`MEMCONTINUUM_EMBED_WORKER=0`: the marker is still raised) or `failed
-  reason=<marker|log|spawn>`. Callers: `scripts/repo-init.sh` runs
+  reason=<marker|log|spawn|bad-project>` (`bad-project`: the name is empty, `.`, `..`, or holds a
+  `/` or a control character; the workers exit 2 on it). Callers: `scripts/repo-init.sh` runs
   `code-embed-worker --project P --spawn` once after its last `--no-embed` code-reindex, and
   `code-refresh` calls it on BOTH events whenever `awaiting_embedding > 0`, after the preflight and
   independent of the drift check (a current index with zero vectors is filled too); on `Stop` it
@@ -3077,12 +3084,13 @@ never a `setsid` binary, which macOS does not ship; stdio redirected to
 non-blocking `fcntl.flock` on `<project>.embed.lock` first -- a second
 worker finding it already held exits 0 immediately, so two quick commits
 never run two overlapping embedding passes. It then loops: while the marker
-exists, note its mtime, run the embedding backfill in-process (`cmd_reindex`
-with embedding enabled), and on success remove the marker ONLY if its mtime
-is still what was noted before the pass -- a commit landing mid-pass
-retouches the marker, and the loop runs again rather than declaring victory
-over content it never saw. On any exception from the backfill (a locked db,
-a genuine bug), the marker is left in place, the traceback is appended to
+exists, claim it by renaming it to `<project>.embed-pending.claim.<pid>`, run
+the embedding backfill in-process (`cmd_reindex` with embedding enabled), and
+on success delete the claim -- a commit landing mid-pass raises a NEW marker
+(the producer's touch is path-based, so it can never land on the claimed
+file unnoticed) and the loop runs again rather than declaring victory over
+content it never saw. On any exception from the backfill (a locked db,
+a genuine bug), the claim is renamed back to the marker, the traceback is appended to
 `<project>.embed.log`, and the process exits 3 -- a crash is therefore
 always retriable: the next commit, or a manual `embed-worker` run, picks the
 marker back up. `check --json` and `stats --json` both report

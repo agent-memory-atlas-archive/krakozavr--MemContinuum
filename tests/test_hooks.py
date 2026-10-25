@@ -2956,6 +2956,21 @@ class TestPostCommitReindexEmbedWorker(unittest.TestCase):
         log_text = (self.home / "hook.log").read_text()
         self.assertIn("embed=clean", log_text, log_text)
 
+    def test_a_refused_marker_is_logged_as_embed_failed_not_pending(self):
+        root = self._store_with_one_unembedded_topic("pc-refused")
+        victim = Path(self.td) / "victim.txt"
+        victim.write_text("keep")
+        (self.home / "pc-refused.embed-pending").symlink_to(victim)
+        env = clean_env(MEMCONTINUUM_HOME=str(self.home), MEMCONTINUUM_PYTHON=VENV_PYTHON,
+                         MEMCONTINUUM_PROJECT="pc-refused", MEMCONTINUUM_ROOT=str(root),
+                         MEMCONTINUUM_EMBED_WORKER="0")
+        proc = self._run(env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = [l for l in (self.home / "hook.log").read_text().splitlines() if "post-commit-reindex" in l][-1]
+        self.assertIn(" embed=failed:marker ", line)
+        self.assertNotIn("embed=pending", line)
+        self.assertEqual(victim.read_text(), "keep")
+
     # -- 7 (existing pins) is covered by TestPostCommitReindexHook's own
     # tests above (test_r2_resolves_..., unchanged assertions plus the
     # MEMCONTINUUM_EMBED_WORKER=0 addition).
@@ -2973,15 +2988,19 @@ class TestPostCommitReindexEmbedWorker(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         marker = self.home / "pc-spawn.embed-pending"
         log_path = self.home / "pc-spawn.embed.log"
-        self.assertTrue(marker.is_file(), "content pass alone must not clear the marker")
+        self.assertIn("embed=pending", (self.home / "hook.log").read_text())
 
+        # claim-first protocol: the worker renames the marker to <marker>.claim.<pid> when
+        # its pass STARTS, so "done" means neither the marker nor a claim remains
+        def in_flight():
+            return marker.exists() or list(self.home.glob("pc-spawn.embed-pending.claim.*"))
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
-            if log_path.exists() and not marker.exists():
+            if log_path.exists() and not in_flight():
                 break
             time.sleep(0.2)
         self.assertTrue(log_path.exists(), "the detached worker must have written its own log file")
-        self.assertFalse(marker.exists(), "the detached worker must clear the marker within 30s")
+        self.assertFalse(in_flight(), "the detached worker must clear the marker within 30s")
 
         # tearDown asserts the lock is free -- give the worker a moment to
         # release it after clearing the marker.
