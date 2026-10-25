@@ -3054,15 +3054,43 @@ def _score_rows_by_cosine(rows, qvec, id_key: str, *, stats: dict | None = None)
     one. Returns `(id, score)` pairs, best score first.
 
     Vectorised with numpy when it imports (one matrix product instead of
-    a per-row Python loop -- 0.33 s -> milliseconds on a 3,300-chunk code
-    index); without numpy it falls back to `_score_rows_by_cosine_loop`,
-    the original per-row loop. Both are contract-identical: same pairs,
-    same order, same `dimension_mismatch_rows` count."""
+    a per-row Python loop -- 104 ms -> 10 ms on a 3,459-vector code index,
+    measured on the scorer alone; the earlier 0.33 s figure was taken
+    through the eval harness on a loaded machine). Without numpy, or if the
+    matrix block raises anything (a MemoryError, say), it falls back to
+    `_score_rows_by_cosine_loop`, the original per-row loop, recording
+    `stats['vector_scoring_fallback']` (the exception's type name) in the
+    latter case. Both are contract-identical: same pairs, same order, same
+    `dimension_mismatch_rows` count. The query is cast to plain Python
+    floats first, so a float32 numpy query (what `query_embed` yields)
+    accumulates in float64 on both paths.
+
+    Memory: the matrix is N x 384 float64, ~3 KiB per row (~300 MiB at
+    100k rows); the multiply is milliseconds, so chunking is not warranted
+    at today's index sizes."""
     rows = list(rows)
+    qvec = [float(x) for x in qvec]
     try:
         import numpy as np
     except ImportError:
         return _score_rows_by_cosine_loop(rows, qvec, id_key, stats=stats)
+    local_stats: dict = {}
+    try:
+        scored = _score_rows_numpy(np, rows, qvec, id_key, local_stats)
+    except Exception as exc:
+        if stats is not None:
+            stats["vector_scoring_fallback"] = type(exc).__name__
+        return _score_rows_by_cosine_loop(rows, qvec, id_key, stats=stats)
+    if stats is not None and local_stats.get("dimension_mismatch_rows"):
+        stats["dimension_mismatch_rows"] = (
+            stats.get("dimension_mismatch_rows", 0) + local_stats["dimension_mismatch_rows"])
+    return scored
+
+
+def _score_rows_numpy(np, rows, qvec, id_key: str, out_stats: dict) -> list[tuple]:
+    """The matrix block of `_score_rows_by_cosine`; writes its
+    `dimension_mismatch_rows` into `out_stats` only on success, so a
+    failure part-way leaves the caller's stats untouched for the loop."""
     dim = len(qvec)
     # Float64 throughout, like cosine()'s Python-float arithmetic: a float32
     # dot product could overflow where the loop's does not.
@@ -3098,8 +3126,8 @@ def _score_rows_by_cosine(rows, qvec, id_key: str, *, stats: dict | None = None)
             for i, ok, sc in zip(range(len(ids)), finite.tolist(), sims.tolist()):
                 if ok:
                     scored.append((ids[i], sc))
-    if stats is not None and dim_mismatch:
-        stats["dimension_mismatch_rows"] = stats.get("dimension_mismatch_rows", 0) + dim_mismatch
+    if dim_mismatch:
+        out_stats["dimension_mismatch_rows"] = dim_mismatch
     scored.sort(key=lambda t: t[1], reverse=True)
     return scored
 
@@ -3108,6 +3136,7 @@ def _score_rows_by_cosine_loop(rows, qvec, id_key: str, *, stats: dict | None = 
     """The per-row pure-Python scoring loop: the numpy-less fallback of
     `_score_rows_by_cosine`, and the reference its equivalence test checks
     the vectorised path against."""
+    qvec = [float(x) for x in qvec]
     scored = []
     dim_mismatch = 0
     for r in rows:

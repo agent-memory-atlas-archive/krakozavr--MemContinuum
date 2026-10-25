@@ -6425,6 +6425,33 @@ class TestScoreRowsByCosineNumpy(unittest.TestCase):
         self.assertEqual(s_np["dimension_mismatch_rows"], 3)
         self.assertIn(0.0, [sc for _, sc in got])
 
+    def test_numpy_array_queries_match_loop(self):
+        import numpy as np
+        import random
+        rnd = random.Random(13)
+        base = [rnd.uniform(-1, 1) for _ in range(self.DIM)]
+        rows = self._rows(self._blobs())
+        for dtype in (np.float32, np.float64):
+            q = np.asarray(base, dtype=dtype)
+            got = memidx._score_rows_by_cosine(rows, q, "id")
+            want = memidx._score_rows_by_cosine_loop(rows, q, "id")
+            self.assertEqual([i for i, _ in got], [i for i, _ in want])
+            for (_, a), (_, b) in zip(got, want):
+                self.assertAlmostEqual(a, b, delta=1e-9)
+                self.assertIs(type(a), float)
+
+    def test_numpy_failure_falls_back_to_loop(self):
+        import numpy as np
+        rows = self._rows(self._blobs())
+        q = [0.1] * self.DIM
+        s_np, s_loop = {}, {}
+        with mock.patch.object(np, "vstack", side_effect=MemoryError("boom")):
+            got = memidx._score_rows_by_cosine(rows, q, "id", stats=s_np)
+        want = memidx._score_rows_by_cosine_loop(rows, q, "id", stats=s_loop)
+        self.assertEqual(got, want)
+        self.assertEqual(s_np["vector_scoring_fallback"], "MemoryError")
+        self.assertEqual(s_np["dimension_mismatch_rows"], s_loop["dimension_mismatch_rows"])
+
     def test_zero_query_scores_zero_like_loop(self):
         rows = self._rows(self._blobs())
         q = [0.0] * self.DIM
