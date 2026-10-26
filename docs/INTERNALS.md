@@ -3177,7 +3177,9 @@ therefore retrievable through vector search too, not only through the FTS
 mode, since a link row is an ordinary candidate on both the FTS and vector
 sides.
 
-**RRF, not score blending**, for hybrid search (`k=60`): bm25 scores and cosine
+**RRF, not score blending**, for hybrid search (the store search uses `k=60`; code-search uses
+`CODE_RRF_K` = 30, provisional, chosen on the graded intent set and re-measured
+at the next relevance re-check): bm25 scores and cosine
 similarities live on incomparable scales, so any weighted sum of the two is
 arbitrary.
 
@@ -3624,7 +3626,9 @@ down:
   in `revalidate` (plain output: `revalidate (provisional): <topic>/<link>
   <kind>`) for a human to re-confirm against live source — never a failure,
   even under `--strict-holds`.
-- **`code-search`** — same RRF fusion as `search`. Each hit optionally carries a
+- **`code-search`** — the same RRF formula as `search`, but with its own
+  constant `CODE_RRF_K` (30, provisional) where the store `search` uses k=60.
+  Each hit optionally carries a
   `concept_id` when a concept's `implemented_by`/`tested_by` claims that exact
   symbol (preferred) or its containing file; attachment always reads the
   *decision* db, overridable with `--decision-db`, and only for a hit whose
