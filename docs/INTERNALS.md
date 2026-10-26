@@ -3620,7 +3620,9 @@ down:
   in `revalidate` (plain output: `revalidate (provisional): <topic>/<link>
   <kind>`) for a human to re-confirm against live source — never a failure,
   even under `--strict-holds`.
-- **`code-search`** — same RRF fusion as `search`. Each hit optionally carries a
+- **`code-search`** — the same RRF formula as `search`, but with its own
+  constant `CODE_RRF_K` (30, provisional) where the store `search` uses k=60.
+  Each hit optionally carries a
   `concept_id` when a concept's `implemented_by`/`tested_by` claims that exact
   symbol (preferred) or its containing file; attachment always reads the
   *decision* db, overridable with `--decision-db`, and only for a hit whose

@@ -5793,6 +5793,36 @@ class TestCodeEmbedWorker(unittest.TestCase):
             self.assertEqual((data["embedding_mode"], data["awaiting_embedding"]), ("full", 0))
             self.assertNotIn("have no vector", err)
 
+    def test_cmd_code_search_hybrid_fusion_uses_k30_not_k60(self):
+        # The real cmd_code_search hybrid fusion (only the two rank lists are
+        # canned; filler ids match no chunk row and drop out of the output). A = fts rank 1 only; B = rank 40 in BOTH lists. Fused:
+        # A = 1/(k+1); B = 2/(k+40). A beats B iff 40 > k+2, i.e. k < 38:
+        # k=30 -> A (0.03226 vs 0.02857); k=60 -> B (0.01639 vs 0.02000).
+        with tempfile.TemporaryDirectory() as td:
+            root, db = self._index(td, embed=True)
+            conn = memidx.open_code_db(db)
+            ids = {r["qualified_name"]: r["id"] for r in conn.execute("SELECT id, qualified_name FROM chunks")}
+            conn.close()
+            a, b = ids["func_0"], ids["func_1"]
+            fts = [a] + [-i for i in range(1, 39)] + [b]
+            vec = [-(100 + i) for i in range(1, 40)] + [b]
+            self.assertEqual((fts.index(b), vec.index(b)), (39, 39))
+            out, err = io.StringIO(), io.StringIO()
+            args = SimpleNamespace(
+                db=str(db), project=self.PROJECT, query="anything", mode="hybrid", limit=200, json=True,
+                decision_db=None, no_heal=True, heal_limit=500, verify_content=False,
+            )
+            with _fake_model_patch(), \
+                 mock.patch.object(memidx, "code_hits_fts", return_value=fts), \
+                 mock.patch.object(memidx, "code_hits_vector", return_value=[(c, 0.5) for c in vec]), \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = memidx.cmd_code_search(args)
+            self.assertEqual(rc, 0, err.getvalue())
+            data = json.loads(out.getvalue())
+            self.assertEqual([r["qualified_name"] for r in data["results"]], ["func_0", "func_1"], data)
+            self.assertAlmostEqual(data["results"][0]["score"], 1 / 31)
+            self.assertAlmostEqual(data["results"][1]["score"], 2 / 70)
+
     def test_spawn_states(self):
         import fcntl
         with tempfile.TemporaryDirectory() as td:
