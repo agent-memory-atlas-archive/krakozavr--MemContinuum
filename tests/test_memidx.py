@@ -6440,6 +6440,35 @@ class TestScoreRowsByCosineNumpy(unittest.TestCase):
                 self.assertAlmostEqual(a, b, delta=1e-9)
                 self.assertIs(type(a), float)
 
+    def test_ulp_level_ties_keep_input_order_on_both_paths(self):
+        import struct
+        dim = 32
+        q = [1.0] * dim
+        a = struct.pack(f"{dim}f", *([2.0 ** -27] * 31 + [1.0]))
+        b = struct.pack(f"{dim}f", *([1.0] + [2.0 ** -27] * 31))
+        for blobs, order in (([a, b], ["r0", "r1"]), ([b, a], ["r0", "r1"])):
+            rows = self._rows(blobs)
+            got = memidx._score_rows_by_cosine(rows, q, "id")
+            want = memidx._score_rows_by_cosine_loop(rows, q, "id")
+            self.assertEqual([i for i, _ in got], order)
+            self.assertEqual([i for i, _ in got], [i for i, _ in want])
+
+    def test_batch_boundaries_match_loop(self):
+        import random
+        rnd = random.Random(5)
+        q = [rnd.uniform(-1, 1) for _ in range(self.DIM)]
+        blobs = [memidx.pack_vector([rnd.uniform(-1, 1) for _ in range(self.DIM)]) for _ in range(20)]
+        blobs.insert(8, b"\x00")  # bad row straddling a batch boundary
+        rows = self._rows(blobs)
+        s_np, s_loop = {}, {}
+        with mock.patch.object(memidx, "_SCORE_BATCH_ROWS", 7):
+            got = memidx._score_rows_by_cosine(rows, q, "id", stats=s_np)
+        want = memidx._score_rows_by_cosine_loop(rows, q, "id", stats=s_loop)
+        self.assertEqual([i for i, _ in got], [i for i, _ in want])
+        for (_, x), (_, y) in zip(got, want):
+            self.assertAlmostEqual(x, y, delta=1e-9)
+        self.assertEqual(s_np, s_loop)
+
     def test_numpy_failure_falls_back_to_loop(self):
         import numpy as np
         rows = self._rows(self._blobs())

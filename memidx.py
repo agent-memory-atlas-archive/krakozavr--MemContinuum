@@ -3042,6 +3042,19 @@ def _embed_qvec(query: str, model=None):
     return model, current_fp, qvec
 
 
+# Rows scored per numpy batch: bounds the float64 matrix to ~150 MiB.
+_SCORE_BATCH_ROWS = 50_000
+
+
+def _sort_scored(scored: list[tuple]) -> list[tuple]:
+    """Best score first, shared by the numpy path and the loop so both order
+    identically. Two scores within 1e-12 are a tie and keep input order
+    (stable sort on the score rounded to 12 places): numpy and Python `sum`
+    reduce in different orders, so the same mathematical tie can differ by
+    an ulp. The reported score stays the unrounded float."""
+    return sorted(scored, key=lambda t: round(t[1], 12), reverse=True)
+
+
 def _score_rows_by_cosine(rows, qvec, id_key: str, *, stats: dict | None = None) -> list[tuple]:
     """Task 4 review finding L1 (carried into Task 5's commit per brief):
     shared per-row scoring loop -- `vector_ranked` and `code_hits_vector`
@@ -3066,9 +3079,10 @@ def _score_rows_by_cosine(rows, qvec, id_key: str, *, stats: dict | None = None)
     floats first, so a float32 numpy query (what `query_embed` yields)
     accumulates in float64 on both paths.
 
-    Memory: the matrix is N x 384 float64, ~3 KiB per row (~300 MiB at
-    100k rows); the multiply is milliseconds, so chunking is not warranted
-    at today's index sizes."""
+    Memory: rows are scored in batches of 50,000; the float64 matrix is
+    ~3 KiB per row (~150 MiB per batch), and the squared norms use einsum,
+    so there is no second N x dim temporary. Scores within 1e-12 are a tie
+    and keep input order (`_sort_scored`)."""
     rows = list(rows)
     qvec = [float(x) for x in qvec]
     try:
@@ -3112,25 +3126,26 @@ def _score_rows_numpy(np, rows, qvec, id_key: str, out_stats: dict) -> list[tupl
             # cosine() raises ValueError for every row against a non-finite query.
             dim_mismatch += len(vecs)
         else:
-            m = np.vstack(vecs).astype(np.float64)
-            finite = np.isfinite(m).all(axis=1)
-            dots = m @ q
-            na = np.sqrt((m * m).sum(axis=1))
             nb = float(np.sqrt((q * q).sum()))
-            zero = (na == 0) | (nb == 0)
-            with np.errstate(all="ignore"):
-                sims = dots / (na * nb)
-            sims = np.where(zero, 0.0, sims)
-            dim_mismatch += int((~finite).sum())
-            # .tolist() yields plain Python floats, never numpy scalars
-            # (cosine()'s docstring: --json cannot serialise float32).
-            for i, ok, sc in zip(range(len(ids)), finite.tolist(), sims.tolist()):
-                if ok:
-                    scored.append((ids[i], sc))
+            for start in range(0, len(vecs), _SCORE_BATCH_ROWS):
+                batch = vecs[start:start + _SCORE_BATCH_ROWS]
+                m = np.vstack(batch).astype(np.float64)
+                finite = np.isfinite(m).all(axis=1)
+                dots = m @ q
+                na = np.sqrt(np.einsum("ij,ij->i", m, m))  # no N x dim temporary
+                zero = (na == 0) | (nb == 0)
+                with np.errstate(all="ignore"):
+                    sims = dots / (na * nb)
+                sims = np.where(zero, 0.0, sims)
+                dim_mismatch += int((~finite).sum())
+                # .tolist() yields plain Python floats, never numpy scalars
+                # (cosine()'s docstring: --json cannot serialise float32).
+                for i, ok, sc in zip(range(start, start + len(batch)), finite.tolist(), sims.tolist()):
+                    if ok:
+                        scored.append((ids[i], sc))
     if dim_mismatch:
         out_stats["dimension_mismatch_rows"] = dim_mismatch
-    scored.sort(key=lambda t: t[1], reverse=True)
-    return scored
+    return _sort_scored(scored)
 
 
 def _score_rows_by_cosine_loop(rows, qvec, id_key: str, *, stats: dict | None = None) -> list[tuple]:
@@ -3147,8 +3162,7 @@ def _score_rows_by_cosine_loop(rows, qvec, id_key: str, *, stats: dict | None = 
             dim_mismatch += 1
     if stats is not None and dim_mismatch:
         stats["dimension_mismatch_rows"] = stats.get("dimension_mismatch_rows", 0) + dim_mismatch
-    scored.sort(key=lambda t: t[1], reverse=True)
-    return scored
+    return _sort_scored(scored)
 
 
 def _fingerprint_mismatch_check(conn, project: str, stored_fp: str | None, current_fp: str | None) -> bool:
