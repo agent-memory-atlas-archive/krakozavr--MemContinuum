@@ -1720,7 +1720,12 @@ if [ "${#CODE_ROOTS_ABS[@]}" -gt 0 ] && [ -n "$CHOSEN_LANGS" ]; then
     # code-embed-worker (memidx.py spawns it: python subprocess.Popen in a new
     # session, MEMCONTINUUM_EMBED_WORKER=0 disables it). Spawned once for the
     # project, after every root is indexed, and only when they all succeeded.
+    # INC-0129: the worker is handed the wiring (every --code-root indexed
+    # above, as --root DIR each) and never discovers roots in the database.
     CODE_EMBED_CMD=("$PYTHON_BIN" "$MEMIDX" code-embed-worker --project "$PROJECT" --spawn)
+    for i in "${!CODE_ROOTS_ABS[@]}"; do
+        CODE_EMBED_CMD+=(--root "${CODE_ROOTS_ABS[$i]}")
+    done
     step "code-embed-worker: PYTHONPATH= ${CODE_EMBED_CMD[*]}"
     if [ "$DRY_RUN" -eq 0 ] && [ "$CODE_REINDEX_RC" -eq 0 ]; then
         embed_out="$(PYTHONPATH= "${CODE_EMBED_CMD[@]}" 2>&1)" || true

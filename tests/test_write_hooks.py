@@ -6443,7 +6443,8 @@ class TestCodeRefreshHook(HookTestBase):
         self.assertTrue(line.endswith("embed=spawned"), line)
         calls = [json.loads(l) for l in rec.read_text().splitlines()]
         self.assertEqual(len(calls), 1, calls)
-        self.assertEqual(calls[0]["argv"][2:], ["code-embed-worker", "--project", self.project, "--db", str(self.db)])
+        self.assertEqual(calls[0]["argv"][2:], ["code-embed-worker", "--project", self.project, "--db", str(self.db),
+                                               "--root", str(self.code_root.resolve())])
         self.assertTrue(calls[0]["new_session"])
         self.assertTrue(self.embed_marker().exists())
 
@@ -6614,6 +6615,158 @@ class TestCodeRefreshHook(HookTestBase):
         self.assertIn("unrecorded=1", line)
         self.assertIn("roots=1", line)
         self.assertNotIn("o", self.chunk_symbols())
+
+    # -- INC-0129: a recorded root the wiring does not name is stale --------
+
+    def stale_state(self):
+        """A recorded A (wired) plus a recorded, still-on-disk B (not wired);
+        B's chunks carry a fake vector and the project claims mode `full`."""
+        self.build_chunky_index()
+        old = Path(self.td) / "old-root"
+        old.mkdir()
+        (old / "o.py").write_text("def old_symbol():\n    return 0\n")
+        self.build_code_index(old)
+        old_s = str(old.resolve())
+        conn = memidx.open_code_db(self.db)
+        try:
+            cid = conn.execute("SELECT id FROM chunks WHERE code_root=?", (old_s,)).fetchone()[0]
+            conn.execute(
+                "INSERT INTO embeddings (chunk_id, project, dim, vector, embed_fp) VALUES (?,?,?,?,?)",
+                (cid, self.project, 2, b"\x00" * 8, "fp"))
+            conn.execute("UPDATE code_project SET embedding_mode='full' WHERE project=?", (self.project,))
+            conn.commit()
+        finally:
+            conn.close()
+        return old_s
+
+    def chunk_ids(self, root_s):
+        conn = memidx.open_code_db(self.db)
+        try:
+            return [r[0] for r in conn.execute("SELECT id FROM chunks WHERE code_root=?", (root_s,))]
+        finally:
+            conn.close()
+
+    def rows_of(self, root_s, ids=None):
+        """Row counts for one root. `ids` are chunk ids captured BEFORE a
+        deletion: fts/embeddings are counted by those ids, so an orphan left
+        behind by a deletion that missed its shadows is still seen."""
+        conn = memidx.open_code_db(self.db)
+        try:
+            if ids is None:
+                ids = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE code_root=?", (root_s,))]
+            return {
+                "chunks": conn.execute("SELECT COUNT(*) FROM chunks WHERE code_root=?", (root_s,)).fetchone()[0],
+                "fts": sum(conn.execute("SELECT COUNT(*) FROM fts WHERE rowid=?", (i,)).fetchone()[0] for i in ids),
+                "emb": sum(conn.execute("SELECT COUNT(*) FROM embeddings WHERE chunk_id=?", (i,)).fetchone()[0] for i in ids),
+                "file_sha": conn.execute("SELECT COUNT(*) FROM file_sha WHERE code_root=?", (root_s,)).fetchone()[0],
+                "meta": conn.execute("SELECT COUNT(*) FROM code_meta WHERE code_root=?", (root_s,)).fetchone()[0],
+                "mode": conn.execute("SELECT embedding_mode FROM code_project").fetchone()[0],
+            }
+        finally:
+            conn.close()
+
+    def test_stop_drops_a_recorded_root_the_wiring_does_not_name(self):
+        old_s = self.stale_state()
+        a_s = str(self.code_root.resolve())
+        a_before = self.rows_of(a_s)
+        old_ids = self.chunk_ids(old_s)
+        self.assertTrue(old_ids)
+        self.assertEqual({k: v > 0 for k, v in self.rows_of(old_s).items() if k != "mode"},
+                         {"chunks": True, "fts": True, "emb": True, "file_sha": True, "meta": True})
+        line, _ = self.run_hook("Stop")
+        self.assertIn("dropped=1", line)
+        self.assertIn(f"detail=dropped-roots:{old_s}", line)
+        self.assertIn("roots=1", line)
+        gone = self.rows_of(old_s, ids=old_ids)
+        self.assertEqual({k: v for k, v in gone.items() if k != "mode"},
+                         {"chunks": 0, "fts": 0, "emb": 0, "file_sha": 0, "meta": 0})
+        a_after = self.rows_of(a_s)
+        self.assertEqual(a_after["mode"], "none", "embedding_mode recomputed from real coverage")
+        self.assertEqual({k: v for k, v in a_after.items() if k != "mode"},
+                         {k: v for k, v in a_before.items() if k != "mode"}, "the wired root is untouched")
+        line, _ = self.run_hook("Stop")
+        self.assertIn("dropped=0", line)
+        self.assertNotIn("dropped-roots", line)
+
+    def test_session_start_never_drops_and_marks_stale_root(self):
+        old_s = self.stale_state()
+        before = self.rows_of(old_s)
+        line, _ = self.run_hook("SessionStart")
+        self.assertIn("dropped=0", line)
+        self.assertEqual(self.rows_of(old_s), before, "SessionStart is preflight only")
+        self.assertRegex(self.marker.read_text(), r"^reason=stale-root=1 since=\S+ roots=2\n$")
+        line, _ = self.run_hook("Stop")
+        self.assertIn("dropped=1", line)
+        self.assertFalse(self.marker.exists(), "the Stop run clears the marker by dropping")
+
+    def test_a_hook_that_names_no_roots_drops_nothing(self):
+        old_s = self.stale_state()
+        before = self.rows_of(old_s)
+        env = self.refresh_env(MEMCONTINUUM_CODE_ROOTS="[]")
+        line, _ = self.run_hook("Stop", env=env)
+        self.assertIn("dropped=0", line)
+        self.assertEqual(self.rows_of(old_s), before)
+
+    def test_a_relative_wired_root_disables_the_drop(self):
+        old_s = self.stale_state()
+        ids = self.chunk_ids(old_s)
+        before = self.rows_of(old_s, ids=ids)
+        a_before = self.rows_of(str(self.code_root.resolve()))
+        env = self.refresh_env(MEMCONTINUUM_CODE_ROOTS=json.dumps(["Sources"]))
+        line, _ = self.run_hook("Stop", env=env)
+        self.assertIn("dropped=0", line)
+        self.assertIn("detail=stale-check-skipped:relative-wired-root", line)
+        self.assertEqual(self.rows_of(old_s, ids=ids), before)
+        self.assertEqual(self.rows_of(str(self.code_root.resolve())), a_before)
+
+    def assert_drop_withheld(self, wired_root, detail):
+        old_s = self.stale_state()
+        a_s = str(self.code_root.resolve())
+        ids = self.chunk_ids(old_s)
+        before = self.rows_of(old_s, ids=ids)
+        a_ids = self.chunk_ids(a_s)
+        a_before = self.rows_of(a_s, ids=a_ids)
+        self.assertTrue(a_ids)
+        wired = wired_root if isinstance(wired_root, list) else [wired_root]
+        env = self.refresh_env(MEMCONTINUUM_CODE_ROOTS=json.dumps([str(w) for w in wired]))
+        line, _ = self.run_hook("Stop", env=env)
+        self.assertNotIn("crash", line)
+        self.assertIn("dropped=0", line)
+        self.assertIn(f"detail=stale-check-skipped:{detail}", line)
+        self.assertEqual(self.rows_of(old_s, ids=ids), before)
+        self.assertEqual(self.rows_of(a_s, ids=a_ids), a_before)
+        return line
+
+    def test_an_unresolvable_wired_root_disables_the_drop_without_crashing(self):
+        loop = Path(self.td) / "loop"
+        os.symlink(loop, loop)  # a symlink loop: 3.12 raises, 3.13 resolves lax
+        self.assert_drop_withheld(loop, "unresolvable-wired-root")
+
+    def test_a_missing_wired_root_disables_the_drop(self):
+        self.assert_drop_withheld(Path(self.td) / "does-not-exist", "unresolvable-wired-root")
+
+    def test_a_wired_root_that_is_a_file_disables_the_drop(self):
+        f = Path(self.td) / "plain-file"
+        f.write_text("x")
+        self.assert_drop_withheld(f, "wired-root-not-a-directory")
+
+    def test_a_missing_wired_root_beside_a_good_one_withholds_the_drop(self):
+        # wired {A, B}, B's directory gone, recorded {A, B, C}: C is stale but
+        # the wiring is untrustworthy, so nothing is dropped.
+        b = Path(self.td) / "wired-b"
+        (b / "src").mkdir(parents=True)
+        (b / "src" / "b.py").write_text("def b_fn():\n    return 0\n")
+        git_init(b)
+        self.build_code_index(root=b)
+        b.rename(Path(self.td) / "wired-b-gone")
+        line = self.assert_drop_withheld([self.code_root.resolve(), b], "unresolvable-wired-root")
+        self.assertRegex(self.marker.read_text(), r"^reason=degraded missing-root=1 not-indexed=\d+ since=\S+ roots=3\n$")
+
+    def test_a_wired_root_recorded_nowhere_disables_the_drop(self):
+        other = Path(self.td) / "unrecorded-root"
+        other.mkdir()
+        line = self.assert_drop_withheld(other, "no-wired-root-recorded")
+        self.assertIn("unrecorded=1", line)
 
     def test_lock_held_skips_and_leaves_the_marker_untouched(self):
         self.build_code_index()

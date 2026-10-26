@@ -438,7 +438,7 @@ memidx.py drift --code-root DIR --project NAME                                  
 memidx.py reindex --root STORE --project NAME                                    # after editing the store by hand
 memidx.py embed-worker --root STORE --project NAME --db DB                       # run the background embed backfill by hand
 memidx.py code-reindex --code-root DIR --project NAME                            # after the code moved on
-memidx.py code-embed-worker --project NAME                                       # fill the code index's vectors by hand (normally a background job)
+memidx.py code-embed-worker --project NAME --root DIR [--root DIR ...]            # fill the code index's vectors by hand (normally a background job)
 memidx.py stats --project NAME [--days 7] [--store DIR]                          # is retrieval actually firing?
 memidx.py backend-preflight [--json]                                             # which backends import here, and do their versions match the pins?
 memlint.py STORE --code-root DIR                                                 # validate records
