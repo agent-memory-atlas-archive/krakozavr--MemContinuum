@@ -3044,15 +3044,21 @@ def _embed_qvec(query: str, model=None):
 
 # Rows scored per numpy batch: bounds the float64 matrix to ~150 MiB.
 _SCORE_BATCH_ROWS = 50_000
+# Scores closer than this are re-scored with the reference `cosine` (the
+# numpy-vs-loop difference is a few ulp, ~1e-16, so 1e-9 is a wide margin).
+_SCORE_TIE_WINDOW = 1e-9
+# More rows than this inside tie clusters in one query: use the loop instead.
+_SCORE_TIE_CLUSTER_LIMIT = 2_000
+
+
+class _TieClusterFallback(Exception):
+    """Too many near-tied rows for cheap reference re-scoring."""
 
 
 def _sort_scored(scored: list[tuple]) -> list[tuple]:
-    """Best score first, shared by the numpy path and the loop so both order
-    identically. Two scores within 1e-12 are a tie and keep input order
-    (stable sort on the score rounded to 12 places): numpy and Python `sum`
-    reduce in different orders, so the same mathematical tie can differ by
-    an ulp. The reported score stays the unrounded float."""
-    return sorted(scored, key=lambda t: round(t[1], 12), reverse=True)
+    """Best score first; a plain stable sort, so equal scores keep input
+    order. Shared by the numpy path and the loop."""
+    return sorted(scored, key=lambda t: t[1], reverse=True)
 
 
 def _score_rows_by_cosine(rows, qvec, id_key: str, *, stats: dict | None = None) -> list[tuple]:
@@ -3067,10 +3073,9 @@ def _score_rows_by_cosine(rows, qvec, id_key: str, *, stats: dict | None = None)
     one. Returns `(id, score)` pairs, best score first.
 
     Vectorised with numpy when it imports (one matrix product instead of
-    a per-row Python loop -- 104 ms -> 5 to 10 ms on a 3,459-vector code index
-    (5.3 ms measured with a real query embedding, 10.0 ms with a random query),
-    measured on the scorer alone; the earlier 0.33 s figure was taken
-    through the eval harness on a loaded machine). Without numpy, or if the
+    a per-row Python loop -- about 103 ms -> 5.5 ms on a 3,459-vector code index, medians of 20
+    calls on the scorer alone, measured on this version with a real query
+    embedding (102.7 -> 5.55 ms) and a random one (103.5 -> 5.49 ms)). Without numpy, or if the
     matrix block raises anything (a MemoryError, say), it falls back to
     `_score_rows_by_cosine_loop`, the original per-row loop, recording
     `stats['vector_scoring_fallback']` (the exception's type name) in the
@@ -3079,10 +3084,18 @@ def _score_rows_by_cosine(rows, qvec, id_key: str, *, stats: dict | None = None)
     floats first, so a float32 numpy query (what `query_embed` yields)
     accumulates in float64 on both paths.
 
-    Memory: rows are scored in batches of 50,000; the float64 matrix is
-    ~3 KiB per row (~150 MiB per batch), and the squared norms use einsum,
-    so there is no second N x dim temporary. Scores within 1e-12 are a tie
-    and keep input order (`_sort_scored`)."""
+    Ordering is exactly the loop's: numpy scores every row, rows whose
+    scores lie within 1e-9 of a neighbour are re-scored with the reference
+    `cosine` (the loop's own arithmetic), and the final stable sort runs
+    over input order. Rows outside any such cluster are too far apart for
+    the few-ulp numpy-vs-loop difference to swap them. If the clusters
+    cover more than 2,000 rows the whole query uses the loop and records
+    `stats['vector_scoring_fallback'] = 'tie-clusters'`.
+
+    Memory: rows are scored in batches of 50,000, each in one preallocated
+    float64 matrix (~3 KiB per row, ~150 MiB per batch, released before the
+    next batch) plus the blobs the caller already holds; the squared norms
+    use einsum, so there is no second N x dim temporary."""
     rows = list(rows)
     qvec = [float(x) for x in qvec]
     try:
@@ -3094,7 +3107,8 @@ def _score_rows_by_cosine(rows, qvec, id_key: str, *, stats: dict | None = None)
         scored = _score_rows_numpy(np, rows, qvec, id_key, local_stats)
     except Exception as exc:
         if stats is not None:
-            stats["vector_scoring_fallback"] = type(exc).__name__
+            stats["vector_scoring_fallback"] = (
+                "tie-clusters" if isinstance(exc, _TieClusterFallback) else type(exc).__name__)
         return _score_rows_by_cosine_loop(rows, qvec, id_key, stats=stats)
     if stats is not None and local_stats.get("dimension_mismatch_rows"):
         stats["dimension_mismatch_rows"] = (
@@ -3111,7 +3125,7 @@ def _score_rows_numpy(np, rows, qvec, id_key: str, out_stats: dict) -> list[tupl
     # dot product could overflow where the loop's does not.
     q = np.asarray(qvec, dtype=np.float64)
     ids = []
-    vecs = []
+    blobs = []
     dim_mismatch = 0
     for r in rows:
         blob = r["vector"]
@@ -3119,17 +3133,19 @@ def _score_rows_numpy(np, rows, qvec, id_key: str, out_stats: dict) -> list[tupl
             dim_mismatch += 1  # cosine()'s VectorDimensionMismatch / bad-length blob
             continue
         ids.append(r[id_key])
-        vecs.append(np.frombuffer(blob, dtype=np.float32))
-    scored = []
-    if vecs:
+        blobs.append(blob)
+    scored = []  # (id, score, blob), input order
+    if blobs:
         if not np.isfinite(q).all():
             # cosine() raises ValueError for every row against a non-finite query.
-            dim_mismatch += len(vecs)
+            dim_mismatch += len(blobs)
         else:
             nb = float(np.sqrt((q * q).sum()))
-            for start in range(0, len(vecs), _SCORE_BATCH_ROWS):
-                batch = vecs[start:start + _SCORE_BATCH_ROWS]
-                m = np.vstack(batch).astype(np.float64)
+            for start in range(0, len(blobs), _SCORE_BATCH_ROWS):
+                n = min(_SCORE_BATCH_ROWS, len(blobs) - start)
+                m = np.empty((n, dim), dtype=np.float64)  # the only big allocation
+                for i in range(n):
+                    m[i] = np.frombuffer(blobs[start + i], dtype=np.float32)
                 finite = np.isfinite(m).all(axis=1)
                 dots = m @ q
                 na = np.sqrt(np.einsum("ij,ij->i", m, m))  # no N x dim temporary
@@ -3140,12 +3156,33 @@ def _score_rows_numpy(np, rows, qvec, id_key: str, out_stats: dict) -> list[tupl
                 dim_mismatch += int((~finite).sum())
                 # .tolist() yields plain Python floats, never numpy scalars
                 # (cosine()'s docstring: --json cannot serialise float32).
-                for i, ok, sc in zip(range(start, start + len(batch)), finite.tolist(), sims.tolist()):
+                del m
+                for i, ok, sc in zip(range(start, start + n), finite.tolist(), sims.tolist()):
                     if ok:
-                        scored.append((ids[i], sc))
+                        scored.append((ids[i], sc, blobs[i]))
     if dim_mismatch:
         out_stats["dimension_mismatch_rows"] = dim_mismatch
-    return _sort_scored(scored)
+    # Re-score near-tie clusters with the loop's own arithmetic.
+    order = sorted(range(len(scored)), key=lambda i: scored[i][1], reverse=True)
+    clusters = []
+    run = [order[0]] if order else []
+    for prev, cur in zip(order, order[1:]):
+        if abs(scored[prev][1] - scored[cur][1]) < _SCORE_TIE_WINDOW:
+            run.append(cur)
+        else:
+            if len(run) > 1:
+                clusters.append(run)
+            run = [cur]
+    if len(run) > 1:
+        clusters.append(run)
+    if sum(len(c) for c in clusters) > _SCORE_TIE_CLUSTER_LIMIT:
+        raise _TieClusterFallback("tie-clusters")
+    qlist = q.tolist()
+    final = [(t[0], t[1]) for t in scored]
+    for c in clusters:
+        for i in c:
+            final[i] = (final[i][0], cosine(qlist, unpack_vector(scored[i][2])))
+    return _sort_scored(final)
 
 
 def _score_rows_by_cosine_loop(rows, qvec, id_key: str, *, stats: dict | None = None) -> list[tuple]:
