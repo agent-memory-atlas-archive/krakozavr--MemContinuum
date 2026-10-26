@@ -3171,7 +3171,9 @@ therefore retrievable through vector search too, not only through the FTS
 mode, since a link row is an ordinary candidate on both the FTS and vector
 sides.
 
-**RRF, not score blending**, for hybrid search (`k=60`): bm25 scores and cosine
+**RRF, not score blending**, for hybrid search (the store search uses `k=60`; code-search uses
+`CODE_RRF_K` = 30, provisional, chosen on the graded intent set and re-measured
+at the next relevance re-check): bm25 scores and cosine
 similarities live on incomparable scales, so any weighted sum of the two is
 arbitrary.
 

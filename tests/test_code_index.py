@@ -142,6 +142,13 @@ def code_reindex(code_root, db, project=memidx.DEFAULT_PROJECT, no_embed=True, f
     return memidx.cmd_code_reindex(args)
 
 
+class TestCodeRrfConstant(unittest.TestCase):
+    def test_code_rrf_k_is_30(self):
+        # Provisional value chosen on the graded intent set; a silent revert to
+        # the store search's 60 must fail here.
+        self.assertEqual(memidx.CODE_RRF_K, 30)
+
+
 class TestCodeSchemaV3(unittest.TestCase):
     """Design R3/R4 (audit MC-P1-02/MC-P1-06): renamed from the class's
     original TestCodeSchemaV2 name when CODE_SCHEMA_VERSION bumped 2->3
@@ -3846,7 +3853,7 @@ class TestGoldProbesRealCorpus(unittest.TestCase):
             conn = memidx.open_code_db(db)
             fts_ids = memidx.code_hits_fts(conn, query, "codanna-bench")
             vec_ids = [cid for cid, _ in memidx.code_hits_vector(conn, query, "codanna-bench")]
-            k = 60
+            k = memidx.CODE_RRF_K
             scores: dict = {}
             for i, cid in enumerate(fts_ids):
                 scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + i + 1)

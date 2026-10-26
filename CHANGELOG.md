@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Code-search hybrid ranking now fuses with RRF constant k=30 instead of 60 (provisional: on the 45 graded intent queries top-10 hits rose from 20 to 23 of 35 with no loss; it is re-measured at the next relevance re-check). The store search keeps k=60.
 - A code root you removed from a repo's wiring no longer comes back. The code
   index remembered every root it had ever indexed, and the new background
   worker (and the heal) processed all of them, so an old whole-repo root sat
