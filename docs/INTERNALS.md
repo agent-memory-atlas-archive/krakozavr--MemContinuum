@@ -3043,7 +3043,13 @@ unequal-length vectors and a plain `ValueError` on a non-finite component
 loops catch either, per row, skip it, and count it into the JSON envelope's
 `dimension_mismatch_rows` when > 0 — a defensive path (the SQL `dim` gate
 already excludes the common case), reached only by a corrupted blob whose
-stored `dim` column lies. Before either embedding zip (decision or code
+stored `dim` column lies. Scoring itself (`_score_rows_by_cosine`, the one site both
+searches share) is vectorised with numpy when it is installed — one matrix product
+instead of a per-row loop — and falls back to the original per-row loop
+(`_score_rows_by_cosine_loop`) when it is not, or when the matrix block raises
+anything (recorded as `vector_scoring_fallback` in the stats); the query is cast to
+plain floats first so both paths accumulate in float64; the two give the same ranking, scores
+and `dimension_mismatch_rows` count. Before either embedding zip (decision or code
 index), `len(vectors) != len(texts)` is treated as a full embedding failure —
 nothing is written, stderr names both counts — rather than silently
 mis-zipping a short/long/mis-ordered backend response; `reembeds` (code

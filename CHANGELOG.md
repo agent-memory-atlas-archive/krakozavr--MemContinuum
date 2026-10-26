@@ -12,6 +12,11 @@
   only marks them on `SessionStart` (`stale-root=<n>`). A relative or unresolvable wired root, or a wiring that names no recorded root, disables the
   drop (`detail=stale-check-skipped:...`), and the worker's text pass refuses a
   root that is no longer recorded.
+- Vector search scores faster. The cosine scoring that both `search` and
+  `code-search` share now runs as one numpy matrix product when numpy is
+  installed (it is, wherever embeddings work), about ten times faster on a
+  3,400-chunk code index; without numpy it uses the previous per-row loop.
+  Rankings and scores are unchanged.
 - Code embeddings now get built, in the background. Until now every code index
   had zero vectors: the first `code-reindex` at install is `--no-embed` to keep
   the install fast, and nothing ever filled them in afterwards, so `code-search`
